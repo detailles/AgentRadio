@@ -419,22 +419,6 @@ def find_named_session(provider: str, handle: str) -> dict | None:
     return None
 
 
-def gemini_session_file(session_id: str) -> str | None:
-    """Gemini stores chat sessions as JSON files under tmp/<project>/chats/;
-    the assigned UUID is in the file body (and usually the name)."""
-    home = Path(os.environ.get("GEMINI_CLI_HOME", "~/.gemini")).expanduser()
-    for path in home.glob("tmp/*/chats/*.json"):
-        if session_id in path.name:
-            return str(path)
-    for path in home.glob("tmp/*/chats/*.json"):
-        try:
-            if session_id in path.read_text(encoding="utf-8", errors="replace")[:4096]:
-                return str(path)
-        except OSError:
-            continue
-    return None
-
-
 def launch_argv(
     provider: str,
     handle: str,
@@ -471,7 +455,9 @@ def launch_argv(
     if provider == "pi":
         return ["pi"] + (["--session", session_id] if session_id else []) + ["--name", handle]
     if provider == "qwen":
-        argv = ["qwen", "--append-system-prompt", briefing]
+        # Radio-launched agents must answer messages unattended: auto-approve
+        # tool calls (qwen has no safe-classifier mode that covers shell).
+        argv = ["qwen", "--approval-mode", "yolo", "--append-system-prompt", briefing]
         if session_id:
             # join assigns the id itself (--session-id), so resume is exact.
             return argv + ["--session-id" if fresh else "--resume", session_id]
@@ -479,17 +465,12 @@ def launch_argv(
     if provider == "gemini":
         # No append-system-prompt flag; the briefing is injected by the
         # SessionStart hook (bin/radio-gemini-hook.sh, additionalContext JSON).
+        # --approval-mode yolo: radio agents must run `radio` without dialogs.
+        argv = ["gemini", "--approval-mode", "yolo"]
         if session_id:
-            if fresh:
-                return ["gemini", "--session-id", session_id]
-            found = gemini_session_file(session_id)
-            if not found:
-                raise SystemExit(
-                    f"gemini session file for {session_id[:8]} not found under "
-                    "~/.gemini/tmp — cannot resume"
-                )
-            return ["gemini", "--session-file", found]
-        return ["gemini"]
+            # join assigns the id itself (--session-id), so resume is exact.
+            return argv + ["--session-id" if fresh else "--resume", session_id]
+        return argv
     if provider == "opencode":
         # Briefing rides a per-handle OPENCODE_CONFIG file (instructions) —
         # see cmd_join. Session ids are server-generated; resume only.
