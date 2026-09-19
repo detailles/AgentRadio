@@ -52,7 +52,8 @@ radio join                       # same, adopting the pane's existing label
 radio pm bot2 'hello' --from bot-c
 radio pm bot2 'rapor hazir' --ref /tmp/rapor.md --from bot-c   # payload dosyada
 radio handles
-radio inbox bot2                 # pull path, for pane-less handles
+radio inbox                      # metadata index for this pane's handle (no bodies)
+radio show 42                    # one exact body; records delivery for the recipient
 radio log
 radio part bot-c
 ```
@@ -88,7 +89,8 @@ to the same ledger.
 
 Delivery to a pane uses `herdr agent prompt`, falling back to
 `pane send-text` + `pane send-keys enter` for plain shells. Handles without
-a live pane are marked `pull` and read via `radio inbox`.
+a live pane are marked `pull` — list them with `radio inbox`, read one with
+`radio show <id>` (which records the delivery).
 
 ## Demo
 

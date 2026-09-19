@@ -187,7 +187,10 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
+def resolve_current_handle(conn: sqlite3.Connection, explicit: str | None,
+                           what: str = "handle") -> str:
+    """Who is asking: explicit arg, else $RADIO_HANDLE, else the handle bound
+    to this pane (the pane label IS the handle)."""
     if explicit:
         return explicit
     env = os.environ.get("RADIO_HANDLE")
@@ -200,7 +203,13 @@ def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
         ).fetchone()
         if row:
             return row["name"]
-    raise SystemExit("sender unknown: pass --from, set RADIO_HANDLE, or join from this pane")
+    raise SystemExit(
+        f"{what} unknown: pass it explicitly, set RADIO_HANDLE, or join from this pane"
+    )
+
+
+def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
+    return resolve_current_handle(conn, explicit, what="sender")
 
 
 def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str) -> None:
@@ -673,7 +682,7 @@ def briefing_text(handle: str) -> str:
         'radio pm <handle> "<message>" (direct message) · '
         'radio pm <handle> "<message>" --reply-required (when you need an answer — '
         "asking for a reply inside the message text does NOT set the flag) · "
-        f"radio inbox {handle} (FALLBACK ONLY — see below). "
+        f"radio inbox {handle} · radio show <id> (FALLBACK ONLY — see below). "
         "Keep messages short: for long content (reports, logs, diffs) write "
         "it to a file and attach it as --ref <path> — the recipient reads "
         "the file itself, on demand. "
@@ -802,31 +811,67 @@ def cmd_log(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 
 def cmd_inbox(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Metadata-only index of incoming messages — bodies stay out of context
+    until the agent asks for one with `radio show <id>`. Listing consumes
+    nothing; delivery state is recorded by the relay (push) or by show."""
+    handle = resolve_current_handle(conn, args.handle, what="inbox handle")
+    clause = "" if args.status == "all" else " AND d.status = ?"
+    values: list[object] = [handle]
+    if args.status != "all":
+        values.append(args.status)
+    values.append(args.limit)
     rows = conn.execute(
-        """SELECT d.id AS delivery_id, d.status, m.*
-           FROM deliveries d JOIN messages m ON m.id = d.message_id
-           WHERE d.target = ? AND d.status IN ('pending', 'pull', 'failed')
-           ORDER BY d.id""",
-        (args.handle,),
+        f"""SELECT d.id AS delivery_id, d.status, m.*
+            FROM deliveries d JOIN messages m ON m.id = d.message_id
+            WHERE d.target = ?{clause}
+            ORDER BY m.id DESC LIMIT ?""",
+        values,
     ).fetchall()
     if not rows:
-        print("inbox empty")
+        print(f"inbox empty for {handle}")
         print(
             "(new messages are pushed to your pane automatically — "
             "do not poll this command waiting for a reply)"
         )
         return 0
+    print(f"inbox for {handle} (newest {len(rows)}):")
     for row in rows:
-        via = f"#{row['room']}" if row["kind"] == "room" else "pm"
-        flag = " [reply-required]" if row["reply_required"] else ""
-        ref = f" (ref: {row['ref']})" if "ref" in row.keys() and row["ref"] else ""
-        print(f"[{row['delivery_id']}] {row['ts']} {via}{flag}{ref} from {row['from_handle']}: {row['text']}")
-    conn.execute(
-        """UPDATE deliveries SET status='delivered', delivered_at=?
-           WHERE target = ? AND status IN ('pending', 'pull', 'failed')""",
-        (now(), args.handle),
-    )
-    conn.commit()
+        text = row["text"] or ""
+        snippet = text[:20] + ("…" if len(text) > 20 else "")
+        try:
+            stamp = datetime.fromisoformat(row["ts"]).astimezone().strftime("%m-%d %H:%M")
+        except ValueError:
+            stamp = row["ts"][:16]
+        flag = " ⚠reply" if row["reply_required"] else ""
+        ref = " ref" if "ref" in row.keys() and row["ref"] else ""
+        print(
+            f"  #{row['id']} {stamp} {row['from_handle']:<14} {row['status']:<10} "
+            f"{len(text)}c{flag}{ref}  {snippet}"
+        )
+    print("read one: radio show <id>")
+    return 0
+
+
+def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Print one message body (the exact envelope the pane received). Reading
+    as the addressed recipient records the delivery — that is the pull path's
+    acknowledgement."""
+    row = conn.execute("SELECT * FROM messages WHERE id = ?", (args.message_id,)).fetchone()
+    if row is None:
+        raise SystemExit(f"no message #{args.message_id}")
+    print(format_for_pane(row))
+    try:
+        viewer = resolve_current_handle(conn, args.by, what="reader")
+    except SystemExit:
+        return 0  # reading without an identity is fine; nothing to record
+    if viewer == row["to_handle"]:
+        conn.execute(
+            """UPDATE deliveries SET status='delivered', delivered_at=?
+               WHERE message_id = ? AND target = ?
+                 AND status IN ('pending', 'pull', 'failed')""",
+            (now(), args.message_id, viewer),
+        )
+        conn.commit()
     return 0
 
 
@@ -1011,8 +1056,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("log", help="recent messages")
     p.add_argument("--limit", type=int, default=20)
 
-    p = sub.add_parser("inbox", help="read and consume pending messages for a handle")
-    p.add_argument("handle")
+    p = sub.add_parser("inbox", help="metadata index of incoming messages "
+                                     "(bodies via `radio show <id>`)")
+    p.add_argument("handle", nargs="?", help="defaults to this pane's handle / $RADIO_HANDLE")
+    p.add_argument("--status", choices=("all", "pending", "delivered", "pull", "failed"),
+                   default="all", help="filter by delivery state; default: all")
+    p.add_argument("--limit", type=int, default=10, help="number of entries (default: 10)")
+
+    p = sub.add_parser("show", help="print one message body by id")
+    p.add_argument("message_id", type=int)
+    p.add_argument("--by", help="reader handle; reading as the recipient records delivery")
 
     p = sub.add_parser("relay", help="run the delivery relay daemon")
     p.add_argument("--interval", type=float, default=0.5)
@@ -1049,6 +1102,7 @@ def main() -> int:
             "briefing": cmd_briefing,
             "log": cmd_log,
             "inbox": cmd_inbox,
+            "show": cmd_show,
         }[args.command]
         return handler(conn, args)
 
