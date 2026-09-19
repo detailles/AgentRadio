@@ -18,22 +18,30 @@ fi
 # kimi-code briefing hook: kimi has no append-system-prompt flag, so the
 # briefing is injected by a UserPromptSubmit hook (stdout lands in context).
 # The hook no-ops unless RADIO_HANDLE is set (i.e. radio-launched sessions).
-KIMI_CONFIG="${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml"
-HOOK_LINE="command = \"$ROOT/bin/radio-kimi-hook.sh\""
-if [ -f "$KIMI_CONFIG" ] && grep -qF "radio-kimi-hook.sh" "$KIMI_CONFIG"; then
-  echo "kimi hook already installed"
+# Skipped entirely when kimi is not installed — no config files are created
+# for providers the user does not have.
+if command -v kimi >/dev/null 2>&1; then
+  KIMI_CONFIG="${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml"
+  HOOK_LINE="command = \"$ROOT/bin/radio-kimi-hook.sh\""
+  if [ -f "$KIMI_CONFIG" ] && grep -qF "radio-kimi-hook.sh" "$KIMI_CONFIG"; then
+    echo "kimi hook already installed"
+  else
+    mkdir -p "$(dirname "$KIMI_CONFIG")"
+    touch "$KIMI_CONFIG"
+    printf '\n[[hooks]]\nevent = "UserPromptSubmit"\n%s\n' "$HOOK_LINE" >> "$KIMI_CONFIG"
+    echo "kimi hook installed into $KIMI_CONFIG"
+  fi
 else
-  mkdir -p "$(dirname "$KIMI_CONFIG")"
-  touch "$KIMI_CONFIG"
-  printf '\n[[hooks]]\nevent = "UserPromptSubmit"\n%s\n' "$HOOK_LINE" >> "$KIMI_CONFIG"
-  echo "kimi hook installed into $KIMI_CONFIG"
+  echo "kimi not found; skipping kimi hook"
 fi
 
 # Gemini CLI briefing hook: SessionStart additionalContext (documented
 # injection channel). Merged into ~/.gemini/settings.json idempotently.
-GEMINI_SETTINGS="${GEMINI_CLI_HOME:-$HOME/.gemini}/settings.json"
-mkdir -p "$(dirname "$GEMINI_SETTINGS")"
-python3 - "$GEMINI_SETTINGS" "$ROOT/bin/radio-gemini-hook.sh" <<'PYEOF'
+# Skipped when gemini is not installed.
+if command -v gemini >/dev/null 2>&1; then
+  GEMINI_SETTINGS="${GEMINI_CLI_HOME:-$HOME/.gemini}/settings.json"
+  mkdir -p "$(dirname "$GEMINI_SETTINGS")"
+  python3 - "$GEMINI_SETTINGS" "$ROOT/bin/radio-gemini-hook.sh" <<'PYEOF'
 import json
 import sys
 
@@ -60,3 +68,6 @@ with open(path, "w", encoding="utf-8") as fh:
     fh.write("\n")
 print(f"gemini hook installed into {path}")
 PYEOF
+else
+  echo "gemini not found; skipping gemini hook"
+fi
