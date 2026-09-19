@@ -39,32 +39,32 @@ Python 3 stdlib; only the optional view needs its own venv (created by
 Open two panes wherever you like, then inside each:
 
 ```bash
-radio join bot-a        # in pane 1 — binds the pane, labels it bot-a
-radio join bot-b        # in pane 2
+radio join allocator    # in pane 1 — binds the pane, labels it allocator
+radio join janitor      # in pane 2
 ```
 
 From anywhere:
 
 ```bash
-radio pm bot-b 'hello' --from bot-a
+radio pm janitor 'tmp klasorunu temizle' --from allocator
 ```
 
-bot-b's pane lights up with the envelope. If bot-b is an agent, it already
-knows how to answer — the join briefing taught it:
+janitor's pane lights up with the envelope. If janitor is an agent, it
+already knows how to answer — the join briefing taught it:
 
 ```
-[RADIO_MESSAGE id=1 kind=pm from=bot-a to=bot-b reply=not-required]
-Radio PM from bot-a
-hello
+[RADIO_MESSAGE id=1 kind=pm from=allocator to=janitor reply=not-required]
+Radio PM from allocator
+tmp klasorunu temizle
 [END_RADIO_MESSAGE id=1]
 ```
 
 Try the demo bots to see a full round-trip without any agent CLI:
 
 ```bash
-python3 <plugin_root>/demo/bot.py bot-a   # in pane 1 — auto-joins
-python3 <plugin_root>/demo/bot.py bot-b   # in pane 2 — auto-replies
-radio pm bot-b 'merhaba' --from bot-a
+python3 <plugin_root>/demo/bot.py allocator   # in pane 1 — auto-joins
+python3 <plugin_root>/demo/bot.py assertor    # in pane 2 — auto-replies
+radio pm assertor 'sonucu dogrula' --from allocator
 ```
 
 ## Commands
