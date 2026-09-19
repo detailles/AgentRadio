@@ -1,0 +1,1112 @@
+#!/usr/bin/env python3
+"""Radio — local message bus for agents running in Herdr panes.
+
+A single-file, stdlib-only CLI. State lives in a SQLite ledger under the
+plugin state dir (when running as a Herdr plugin command), $RADIO_HOME, or
+~/.local/share/herdr-radio. Delivery to panes goes through the Herdr CLI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import termios
+import time
+import tty
+import uuid
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_ROOM = "general"
+HERDR_SEND_TIMEOUT = 15
+MAX_DELIVERY_ATTEMPTS = 5
+
+
+def state_dir() -> Path:
+    # One well-known ledger per machine. HERDR_PLUGIN_STATE_DIR is deliberately
+    # NOT used: the CLI runs from arbitrary panes and shells that never carry
+    # plugin env, so the ledger must resolve to the same path everywhere.
+    override = os.environ.get("RADIO_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".local" / "share" / "herdr-radio"
+
+
+STATE_DIR = state_dir()
+DB_PATH = STATE_DIR / "radio.db"
+LOCK_PATH = STATE_DIR / "relay.lock"
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS handles(
+  name TEXT PRIMARY KEY,
+  session_ref TEXT NOT NULL DEFAULT 'manual',
+  kind TEXT NOT NULL DEFAULT 'terminal',
+  agent TEXT,
+  agent_session TEXT,
+  briefed_at TEXT,
+  created_at TEXT NOT NULL,
+  last_seen TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memberships(
+  handle TEXT NOT NULL,
+  room TEXT NOT NULL,
+  PRIMARY KEY(handle, room)
+);
+CREATE TABLE IF NOT EXISTS messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  kind TEXT NOT NULL,            -- pm | room
+  from_handle TEXT NOT NULL,
+  to_handle TEXT,                -- pm target
+  room TEXT,                     -- room target
+  text TEXT NOT NULL,
+  reply_required INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS deliveries(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  target TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending|delivered|pull|failed
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
+CREATE INDEX IF NOT EXISTS idx_deliveries_target ON deliveries(target, status);
+"""
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(handles)").fetchall()}
+    for column in ("agent", "agent_session", "briefed_at"):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE handles ADD COLUMN {column} TEXT")
+    msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "reply_required" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+    return conn
+
+
+def herdr_bin() -> str:
+    return os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr") or "herdr"
+
+
+def herdr(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [herdr_bin(), *args], text=True, capture_output=True, timeout=HERDR_SEND_TIMEOUT
+    )
+
+
+def herdr_json(*args: str) -> dict | None:
+    try:
+        result = herdr(*args)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def fetch_pane(pane_id: str) -> dict | None:
+    data = herdr_json("pane", "get", pane_id)
+    if not data:
+        return None
+    return data.get("result", {}).get("pane")
+
+
+def current_session_ref() -> str:
+    if os.environ.get("HERDR_ENV") == "1" and os.environ.get("HERDR_PANE_ID"):
+        return f"herdr:{os.environ['HERDR_PANE_ID']}"
+    return "manual"
+
+
+def pane_id_of(session_ref: str) -> str | None:
+    if session_ref.startswith("herdr:"):
+        return session_ref.removeprefix("herdr:")
+    return None
+
+
+def pane_exists(pane_id: str) -> bool:
+    try:
+        return herdr("pane", "get", pane_id).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
+    """Deliver one line into a pane. Agent panes get a verified submission
+    (--wait: herdr confirms the agent actually started working, so a 'success'
+    can no longer mean text stranded in the composer); plain shells get literal
+    text + Enter."""
+    try:
+        prompted = herdr(
+            "agent", "prompt", pane_id, text,
+            "--wait", "--until", "working", "--until", "blocked",
+            "--timeout", "6000",
+        )
+        if prompted.returncode == 0:
+            return True, None
+        prompt_err = (prompted.stderr or prompted.stdout or "").strip()
+        if "blocked" in prompt_err:
+            # A modal dialog is up — never fall back to raw typing, the text
+            # would land in the dialog. Caller defers and retries next tick.
+            return False, "agent_blocked"
+        if "stalled" in prompt_err or "timeout" in prompt_err:
+            # Agent pane but the submission did not take (turn-boundary redraw
+            # race, booting, wedged TUI). Blind typing here is exactly what
+            # strands text in the composer — let the caller retry instead.
+            return False, "agent_not_accepting"
+        # Not an agent pane: type into the shell. Flatten newlines — an
+        # embedded newline submits the line early and drops the rest.
+        flat = " ".join(text.splitlines())
+        typed = herdr("pane", "send-text", pane_id, flat)
+        if typed.returncode != 0:
+            err = (prompt_err or typed.stderr or typed.stdout).strip()
+            return False, err or "pane rejected delivery"
+        time.sleep(0.4)  # let the paste land before Enter
+        entered = herdr("pane", "send-keys", pane_id, "enter")
+        if entered.returncode != 0:
+            return False, (entered.stderr or "enter key rejected").strip()
+        return True, None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+
+
+def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("RADIO_HANDLE")
+    if env:
+        return env
+    ref = current_session_ref()
+    if ref != "manual":
+        row = conn.execute(
+            "SELECT name FROM handles WHERE session_ref = ?", (ref,)
+        ).fetchone()
+        if row:
+            return row["name"]
+    raise SystemExit("sender unknown: pass --from, set RADIO_HANDLE, or join from this pane")
+
+
+def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str) -> None:
+    row = conn.execute(
+        "SELECT session_ref FROM handles WHERE name = ?", (target,)
+    ).fetchone()
+    has_pane = bool(row and pane_id_of(row["session_ref"]))
+    conn.execute(
+        "INSERT INTO deliveries(message_id, target, status, created_at) VALUES (?,?,?,?)",
+        (message_id, target, "pending" if has_pane else "pull", now()),
+    )
+
+
+# ------------------------------------------------------------ providers
+# Provider-specific knowledge lives here only: how to probe auth, how to find
+# a session named after a handle, and how to launch/resume. Radio itself only
+# records the user's choice on the handle row.
+
+PROVIDERS = ("claude", "codex", "kimi", "pi", "gemini", "qwen", "opencode")
+
+
+def auth_status(provider: str) -> str:
+    if provider == "claude":
+        home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+        if (home / ".credentials.json").exists():
+            return "logged in"
+        return "not logged in — ~/.claude/.credentials.json missing"
+    if provider == "codex":
+        home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+        if (home / "auth.json").exists():
+            return "logged in"
+        return "not logged in — ~/.codex/auth.json missing"
+    if provider == "kimi":
+        home = Path(os.environ.get("KIMI_HOME", "~/.kimi-code")).expanduser()
+        if (home / "config.toml").exists():
+            return "configured"
+        return "not configured — ~/.kimi-code/config.toml missing"
+    if provider == "gemini":
+        home = Path(os.environ.get("GEMINI_CLI_HOME", "~/.gemini")).expanduser()
+        if (home / "oauth_creds.json").exists():
+            return "logged in"
+        return "not logged in — ~/.gemini/oauth_creds.json missing"
+    if provider == "qwen":
+        home = Path(os.environ.get("QWEN_HOME", "~/.qwen")).expanduser()
+        if (home / "oauth_creds.json").exists():
+            return "logged in"
+        return "not logged in — ~/.qwen/oauth_creds.json missing"
+    if provider == "opencode":
+        auth = Path(
+            os.environ.get("XDG_DATA_HOME", "~/.local/share")
+        ).expanduser() / "opencode" / "auth.json"
+        if auth.exists():
+            return "logged in"
+        return "not logged in — run `opencode auth login`"
+    return "auth unknown"
+
+
+def choose(question: str, options: list[str], default: int = 0) -> int | None:
+    """Arrow-key menu on the tty. Returns the chosen index, or None if cancelled."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    idx = default
+    drawn = 0
+
+    def render() -> None:
+        nonlocal drawn
+        if drawn:
+            sys.stdout.write(f"\x1b[{drawn}A\x1b[J")  # up over the old block, clear it
+        lines = [f"\x1b[1m{question}\x1b[0m"]
+        for i, opt in enumerate(options):
+            if i == idx:
+                lines.append(f"  \x1b[36;1m❯ {opt}\x1b[0m")
+            else:
+                lines.append(f"    \x1b[2m{opt}\x1b[0m")
+        lines.append("  \x1b[2m↑/↓ move · Enter select · q cancel\x1b[0m")
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        drawn = len(lines)
+
+    # TCSANOW, not the 3.13+ TCSAFLUSH default: typed-ahead input must survive.
+    tty.setcbreak(fd, termios.TCSANOW)
+    try:
+        sys.stdout.write("\x1b[?25l")  # hide cursor while picking
+        render()
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "":  # stdin closed mid-pick
+                return None
+            if ch in ("\r", "\n"):
+                return idx
+            if ch in ("q", "Q", "\x03"):
+                return None
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A" and idx > 0:
+                    idx -= 1
+                    render()
+                elif seq == "[B" and idx < len(options) - 1:
+                    idx += 1
+                    render()
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+
+
+def _named(rows: list[dict]) -> dict | None:
+    best = None
+    for row in rows:
+        if best is None or (row.get("updated") or 0) >= (best.get("updated") or 0):
+            best = row
+    return best
+
+
+def find_named_session(provider: str, handle: str) -> dict | None:
+    """Latest saved provider session whose name matches the handle."""
+    wanted = handle.casefold()
+    if provider == "claude":
+        # The sessions/ registry only lists live processes; the durable name is
+        # the agent-name record inside the project transcript.
+        home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects"
+        rows = []
+        for path in home.glob("*/*.jsonl"):
+            name, sid, cwd = "", "", ""
+            try:
+                with path.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        if "agent-name" not in line and '"cwd"' not in line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not cwd and row.get("cwd"):
+                            cwd = str(row["cwd"])
+                        if row.get("type") == "agent-name" and row.get("agentName"):
+                            name = str(row["agentName"])
+                            sid = str(row.get("sessionId") or path.stem)
+            except OSError:
+                continue
+            if sid and name.casefold() == wanted:
+                rows.append({"id": sid, "cwd": cwd, "updated": path.stat().st_mtime})
+        return _named(rows)
+    if provider == "codex":
+        index = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "session_index.jsonl"
+        if not index.exists():
+            return None
+        rows = []
+        try:
+            lines = index.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("thread_name") or "").casefold() != wanted:
+                continue
+            sid = str(row.get("id") or "")
+            if sid:
+                rows.append({"id": sid, "cwd": "", "updated": row.get("updated_at") or 0})
+        return _named(rows)
+    if provider == "kimi":
+        base = Path(os.environ.get("KIMI_HOME", "~/.kimi-code")).expanduser() / "sessions"
+        rows = []
+        for path in base.glob("wd_*/session_*/state.json"):
+            try:
+                row = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if row.get("archived") is True:
+                continue
+            if str(row.get("title") or "").casefold() != wanted:
+                continue
+            if row.get("isCustomTitle") is not True and row.get("titleKind") != "custom":
+                continue
+            sid = str(row.get("id") or path.parent.name)
+            if sid:
+                rows.append({"id": sid, "cwd": row.get("cwd") or "", "updated": row.get("updatedAt") or 0})
+        return _named(rows)
+    if provider == "pi":
+        base = Path(
+            os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+            or Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")) / "sessions"
+        ).expanduser()
+        rows = []
+        for path in base.glob("**/*.jsonl"):
+            sid, name, updated = "", "", ""
+            try:
+                with path.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if row.get("type") == "session" and row.get("id"):
+                            sid = str(row["id"])
+                        if row.get("type") == "session_info" and row.get("name"):
+                            name = str(row["name"])
+                        if row.get("timestamp"):
+                            updated = str(row["timestamp"])
+            except OSError:
+                continue
+            if sid and name.casefold() == wanted:
+                rows.append({"id": sid, "cwd": "", "updated": updated})
+        return _named(rows)
+    return None
+
+
+def gemini_session_file(session_id: str) -> str | None:
+    """Gemini stores chat sessions as JSON files under tmp/<project>/chats/;
+    the assigned UUID is in the file body (and usually the name)."""
+    home = Path(os.environ.get("GEMINI_CLI_HOME", "~/.gemini")).expanduser()
+    for path in home.glob("tmp/*/chats/*.json"):
+        if session_id in path.name:
+            return str(path)
+    for path in home.glob("tmp/*/chats/*.json"):
+        try:
+            if session_id in path.read_text(encoding="utf-8", errors="replace")[:4096]:
+                return str(path)
+        except OSError:
+            continue
+    return None
+
+
+def launch_argv(
+    provider: str,
+    handle: str,
+    session_id: str | None,
+    rooms: list[str],
+    fresh: bool = False,
+) -> list[str]:
+    # The radio briefing rides the launch as provider-native system context:
+    # invisible, spends no turn, and the relay never messages the agent itself.
+    # Resume gets it too — system context is per-process, a restored transcript
+    # does not carry it.
+    briefing = briefing_text(handle, rooms)
+    if provider == "claude":
+        argv = ["claude", "--append-system-prompt", briefing]
+        return argv + (["--resume", session_id] if session_id else []) + ["--name", handle]
+    if provider == "codex":
+        # Codex rewrites the terminal title (OSC) with the current task text,
+        # hiding the pane label that IS the radio handle. Turn its title writer
+        # off for radio-launched sessions; the user's config.toml is untouched.
+        # developer_instructions appends to the built-in instructions (unlike
+        # model_instructions_file, which replaces them); json.dumps emits a
+        # valid TOML basic string for -c parsing.
+        argv = [
+            "codex",
+            "-c", "tui.terminal_title=[]",
+            "-c", f"developer_instructions={json.dumps(briefing)}",
+        ]
+        return argv + (["resume", session_id] if session_id else [])
+    if provider == "kimi":
+        # No append-system-prompt flag and SessionStart hook stdout does not
+        # reach context (verified). The briefing arrives with the first prompt
+        # via bin/radio-kimi-hook.sh (UserPromptSubmit), keyed on RADIO_HANDLE.
+        return ["kimi"] + (["--session", session_id] if session_id else [])
+    if provider == "pi":
+        return ["pi"] + (["--session", session_id] if session_id else []) + ["--name", handle]
+    if provider == "qwen":
+        argv = ["qwen", "--append-system-prompt", briefing]
+        if session_id:
+            # join assigns the id itself (--session-id), so resume is exact.
+            return argv + ["--session-id" if fresh else "--resume", session_id]
+        return argv
+    if provider == "gemini":
+        # No append-system-prompt flag; the briefing is injected by the
+        # SessionStart hook (bin/radio-gemini-hook.sh, additionalContext JSON).
+        if session_id:
+            if fresh:
+                return ["gemini", "--session-id", session_id]
+            found = gemini_session_file(session_id)
+            if not found:
+                raise SystemExit(
+                    f"gemini session file for {session_id[:8]} not found under "
+                    "~/.gemini/tmp — cannot resume"
+                )
+            return ["gemini", "--session-file", found]
+        return ["gemini"]
+    if provider == "opencode":
+        # Briefing rides OPENCODE_CONFIG_CONTENT (inline instructions file
+        # path) — see cmd_join. Session ids are server-generated; resume only.
+        return ["opencode"] + (["--session", session_id] if session_id else [])
+    raise SystemExit(f"unknown provider: {provider}")
+
+
+def ask_provider(handle: str) -> str:
+    options = []
+    for name in PROVIDERS:
+        binary = "" if shutil.which(name) else "  (not on PATH)"
+        options.append(f"{name} — {auth_status(name)}{binary}")
+    options.append("none — just register the handle, don't launch an agent")
+    idx = choose(f'Which agent should "{handle}" join as?', options)
+    if idx is None:
+        raise SystemExit("cancelled")
+    return "" if idx == len(PROVIDERS) else PROVIDERS[idx]
+
+
+def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    interactive = not args.no_launch and sys.stdin.isatty() and sys.stdout.isatty()
+
+    pane_id = args.pane
+    if not pane_id and os.environ.get("HERDR_ENV") == "1":
+        pane_id = os.environ.get("HERDR_PANE_ID")
+    pane = fetch_pane(pane_id) if pane_id else None
+    if pane_id and pane is None:
+        raise SystemExit(f"pane not found: {pane_id}")
+
+    handle = args.handle
+    label = (pane or {}).get("label") or ""
+    if not handle and interactive and not label:
+        handle = input("Handle for this pane (the name others will use to message it): ").strip()
+    if not handle:
+        if not label:
+            raise SystemExit("pass a handle, or give the pane a label first")
+        handle = label
+    if pane and label != handle:
+        # The pane label IS the handle: it is what survives session restore and
+        # what the UI shows. Keep them identical instead of tracking two names.
+        renamed = herdr("pane", "rename", pane_id, handle)
+        if renamed.returncode != 0:
+            raise SystemExit(f"pane rename failed: {(renamed.stderr or '').strip()}")
+
+    provider = args.provider or ""
+    session_id = None
+    existing = conn.execute(
+        "SELECT session_ref, agent, agent_session FROM handles WHERE name = ?", (handle,)
+    ).fetchone()
+    if (
+        existing
+        and existing["agent"]
+        and not existing["agent_session"]
+        and existing["session_ref"].startswith("herdr:")
+    ):
+        # Join could not see the session id while the agent was still booting.
+        # Adopt it now from the bound pane (guarded: same provider, same label,
+        # so a reused pane never donates its session to the wrong handle).
+        bound = fetch_pane(existing["session_ref"].removeprefix("herdr:"))
+        if (
+            bound
+            and bound.get("agent") == existing["agent"]
+            and (bound.get("label") or "") == handle
+        ):
+            live = (bound.get("agent_session") or {}).get("value")
+            if live:
+                conn.execute(
+                    "UPDATE handles SET agent_session=? WHERE name=?", (live, handle)
+                )
+                conn.commit()
+                existing = conn.execute(
+                    "SELECT session_ref, agent, agent_session FROM handles WHERE name = ?",
+                    (handle,),
+                ).fetchone()
+    if (
+        interactive
+        and not provider
+        and not args.new
+        and existing
+        and existing["agent"]
+        and existing["agent_session"]
+    ):
+        # This handle already ran here: offer its recorded session before
+        # asking for provider/session from scratch.
+        idx = choose(
+            f'"{handle}" already joined as {existing["agent"]} '
+            f"(session {existing['agent_session'][:8]}) — bring it back?",
+            ["Bring it back — resume the recorded session",
+             "Start over — pick provider and session again"],
+        )
+        if idx is None:
+            raise SystemExit("cancelled")
+        if idx == 0:
+            provider = existing["agent"]
+            session_id = existing["agent_session"]
+
+    if interactive and not provider:
+        provider = ask_provider(handle)
+    if provider and interactive and not session_id:
+        found = None if args.new else find_named_session(provider, handle)
+        if found and not args.new and not args.resume:
+            cwd = found["cwd"] or "cwd unknown"
+            idx = choose(
+                f'"{handle}" has a saved {provider} session '
+                f"({found['id'][:8]}, {cwd}) — resume it?",
+                ["Resume it — continue the previous conversation",
+                 "Start a new session instead"],
+            )
+            if idx is None:
+                raise SystemExit("cancelled")
+            if idx == 0:
+                session_id = found["id"]
+        elif found and args.resume:
+            session_id = found["id"]
+        elif not found:
+            print(f"no saved {provider} session named {handle}; starting new")
+    elif provider and args.resume:
+        found = find_named_session(provider, handle)
+        if found:
+            session_id = found["id"]
+        elif existing and existing["agent"] == provider and existing["agent_session"]:
+            session_id = existing["agent_session"]  # recorded by join/backfill
+        else:
+            raise SystemExit(f"no saved {provider} session named {handle}")
+
+    launching = interactive and bool(provider)
+    # Providers that accept a caller-assigned session id get one now: the
+    # ledger knows the real id before launch, no boot-window backfill needed.
+    assign_id = provider in ("gemini", "qwen")
+    fresh = bool(launching and assign_id and not session_id)
+    if fresh:
+        session_id = str(uuid.uuid4())
+    pane_session = ((pane or {}).get("agent_session") or {}).get("value")
+    if session_id:
+        agent_session = session_id
+    elif launching:
+        # A new agent is about to boot in this pane; the pane's current
+        # session id belongs to the process being replaced. Leave NULL, the
+        # relay backfills the real id once the agent is up.
+        agent_session = None
+    else:
+        agent_session = pane_session or (existing["agent_session"] if existing else None)
+    ref = f"herdr:{pane_id}" if pane else "manual"
+    if ref == "manual" and existing and existing["session_ref"].startswith("herdr:"):
+        old_pane = existing["session_ref"].removeprefix("herdr:")
+        if pane_exists(old_pane):
+            # A pane-less rejoin must not clobber a live pane binding.
+            ref = existing["session_ref"]
+    ts = now()
+    conn.execute(
+        """INSERT INTO handles(name, session_ref, agent, agent_session, created_at, last_seen)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(name) DO UPDATE SET session_ref=excluded.session_ref,
+                                           agent=excluded.agent,
+                                           agent_session=excluded.agent_session,
+                                           last_seen=excluded.last_seen""",
+        (handle, ref, provider or None, agent_session, ts, ts),
+    )
+    rooms = args.room or [DEFAULT_ROOM]
+    for room in rooms:
+        conn.execute(
+            "INSERT OR IGNORE INTO memberships(handle, room) VALUES (?,?)",
+            (handle, room),
+        )
+    conn.commit()
+    session_note = f", {provider} session {agent_session[:8]}" if provider and agent_session else ""
+    print(f"{handle} joined ({ref}{session_note}) in rooms: {', '.join(rooms)}")
+
+    if not interactive or not provider:
+        return 0
+    argv = launch_argv(provider, handle, session_id, rooms, fresh=fresh)
+    env = os.environ.copy()
+    env["RADIO_HANDLE"] = handle
+    if provider == "opencode":
+        # No append flag/hook channel: the briefing file is injected as an
+        # inline-config `instructions` entry (merged, user config untouched).
+        brief_dir = STATE_DIR / "briefings"
+        brief_dir.mkdir(parents=True, exist_ok=True)
+        brief_file = brief_dir / f"{handle}.md"
+        brief_file.write_text(briefing_text(handle, rooms), encoding="utf-8")
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+            {"instructions": [str(brief_file)]}
+        )
+    print(f"launching: {' '.join(argv)}")
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as exc:
+        raise SystemExit(f"launch failed: {exc}")
+    return 0  # unreachable
+
+
+def briefing_text(handle: str, rooms: list[str]) -> str:
+    return (
+        f'You are on Radio as "{handle}" (rooms: {", ".join(rooms)}). '
+        "Radio is the local message bus between the agents in this workspace — "
+        "no need to search the filesystem for messaging tools. "
+        "Commands: "
+        "radio handles (who is on) · "
+        'radio pm <handle> "<message>" (direct message) · '
+        'radio pm <handle> "<message>" --reply-required (when you need an answer — '
+        "asking for a reply inside the message text does NOT set the flag) · "
+        'radio say <room> "<message>" (message a room) · '
+        f"radio inbox {handle} (FALLBACK ONLY — see below). "
+        "Delivery is push-based: incoming messages arrive in this pane by "
+        "themselves, wrapped in [RADIO_MESSAGE ...] envelopes; the header's "
+        "reply=required means you must answer over radio. After sending a "
+        "message, NEVER poll `radio inbox` and NEVER set timers to check for "
+        "a reply — the reply arrives pushed to this pane on its own; continue "
+        "other work or simply stop. `radio inbox` exists only for messages "
+        "that could not be pushed (e.g. while your pane had no agent), not "
+        "for waiting on replies."
+    )
+
+
+def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    conn.execute("DELETE FROM memberships WHERE handle = ?", (args.handle,))
+    conn.execute("DELETE FROM handles WHERE name = ?", (args.handle,))
+    conn.execute(
+        "UPDATE deliveries SET status='failed', last_error='handle parted' "
+        "WHERE target = ? AND status IN ('pending', 'pull')",
+        (args.handle,),
+    )
+    conn.commit()
+    print(f"{args.handle} parted")
+    return 0
+
+
+def record_message(
+    conn: sqlite3.Connection,
+    kind: str,
+    sender: str,
+    text: str,
+    to_handle: str | None = None,
+    room: str | None = None,
+    reply_required: bool = False,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO messages(ts, kind, from_handle, to_handle, room, text, reply_required) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (now(), kind, sender, to_handle, room, text, int(reply_required)),
+    )
+    return int(cur.lastrowid)
+
+
+def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    sender = resolve_sender(conn, args.sender)
+    text = " ".join(args.text)
+    target = conn.execute(
+        "SELECT name FROM handles WHERE name = ?", (args.to,)
+    ).fetchone()
+    if not target:
+        raise SystemExit(f"unknown handle: {args.to} (join first)")
+    mid = record_message(conn, "pm", sender, text, to_handle=args.to,
+                         reply_required=args.reply_required)
+    enqueue_delivery(conn, mid, args.to)
+    conn.commit()
+    print(f"pm #{mid} -> {args.to}")
+    if args.reply_required:
+        # Senders expecting an answer tend to poll `radio inbox` in a loop.
+        # State the push contract at the exact moment the impulse starts.
+        print(
+            "The reply is pushed to your pane as a [RADIO_MESSAGE] envelope — "
+            "do NOT poll `radio inbox` or set timers to check for it; "
+            "continue other work or stop."
+        )
+    return 0
+
+
+def cmd_say(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    sender = resolve_sender(conn, args.sender)
+    text = " ".join(args.text)
+    conn.execute(
+        "INSERT OR IGNORE INTO memberships(handle, room) VALUES (?,?)", (sender, args.room)
+    )
+    mid = record_message(conn, "room", sender, text, room=args.room,
+                         reply_required=args.reply_required)
+    members = conn.execute(
+        "SELECT handle FROM memberships WHERE room = ? AND handle != ?", (args.room, sender)
+    ).fetchall()
+    for member in members:
+        enqueue_delivery(conn, mid, member["handle"])
+    conn.commit()
+    print(f"say #{mid} -> #{args.room} ({len(members)} recipients)")
+    return 0
+
+
+def handle_status(row: sqlite3.Row) -> str:
+    """Fresh liveness from the bound pane — the ledger row alone says nothing
+    about whether the agent is still there (panes close, get reused, agents
+    exit; nothing parts automatically)."""
+    ref = row["session_ref"]
+    if not ref.startswith("herdr:"):
+        return "manual"
+    pane = fetch_pane(ref.removeprefix("herdr:"))
+    if not pane:
+        return "gone (no live pane)"
+    if (pane.get("label") or "") != row["name"]:
+        return "gone (pane reused)"
+    if row["agent"]:
+        live = pane.get("agent")
+        if live == row["agent"]:
+            return "live"
+        if live:
+            return f"gone (pane now runs {live})"
+        return "gone (agent exited)"
+    return "live"
+
+
+def cmd_handles(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
+    rows = conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
+    if not rows:
+        print("no handles joined")
+        return 0
+    for row in rows:
+        rooms = conn.execute(
+            "SELECT room FROM memberships WHERE handle = ? ORDER BY room", (row["name"],)
+        ).fetchall()
+        room_list = ",".join(r["room"] for r in rooms) or "-"
+        provider = row["agent"] or "-"
+        session = (row["agent_session"] or "-")[:8]
+        print(
+            f"{row['name']:<20} {handle_status(row):<26} {row['session_ref']:<14} "
+            f"{provider:<8} sess: {session:<8} rooms: {room_list}"
+        )
+    return 0
+
+
+def cmd_log(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    rows = conn.execute(
+        "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (args.limit,)
+    ).fetchall()
+    for row in reversed(rows):
+        target = f"-> {row['to_handle']}" if row["kind"] == "pm" else f"-> #{row['room']}"
+        flag = " [reply-required]" if row["reply_required"] else ""
+        print(f"#{row['id']} {row['ts']} {row['from_handle']} {target}{flag}: {row['text']}")
+    return 0
+
+
+def cmd_inbox(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    rows = conn.execute(
+        """SELECT d.id AS delivery_id, d.status, m.*
+           FROM deliveries d JOIN messages m ON m.id = d.message_id
+           WHERE d.target = ? AND d.status IN ('pending', 'pull', 'failed')
+           ORDER BY d.id""",
+        (args.handle,),
+    ).fetchall()
+    if not rows:
+        print("inbox empty")
+        print(
+            "(new messages are pushed to your pane automatically — "
+            "do not poll this command waiting for a reply)"
+        )
+        return 0
+    for row in rows:
+        via = f"#{row['room']}" if row["kind"] == "room" else "pm"
+        flag = " [reply-required]" if row["reply_required"] else ""
+        print(f"[{row['delivery_id']}] {row['ts']} {via}{flag} from {row['from_handle']}: {row['text']}")
+    conn.execute(
+        """UPDATE deliveries SET status='delivered', delivered_at=?
+           WHERE target = ? AND status IN ('pending', 'pull', 'failed')""",
+        (now(), args.handle),
+    )
+    conn.commit()
+    return 0
+
+
+def format_for_pane(message: sqlite3.Row) -> str:
+    # Legacy Arkai radio envelope: the reply semantics live in the structured
+    # header, not in inline command hints — agents learn the commands from the
+    # opening briefing. Multi-line is fine: agent panes get an atomic verified
+    # submission, and the shell path flattens newlines before typing.
+    mid = message["id"]
+    reply = "required" if message["reply_required"] else "not-required"
+    if message["kind"] == "pm":
+        kind, target = "pm", message["to_handle"]
+        lead = f"Radio PM from {message['from_handle']}"
+    else:
+        kind, target = "room", f"#{message['room']}"
+        lead = f"Radio message from {message['from_handle']} in #{message['room']}"
+    reply_line = "\nReply required: answer this over radio." if message["reply_required"] else ""
+    return (
+        f"[RADIO_MESSAGE id={mid} kind={kind} from={message['from_handle']} "
+        f"to={target} reply={reply}]\n"
+        f"{lead}{reply_line}\n"
+        f"{message['text']}\n"
+        f"[END_RADIO_MESSAGE id={mid}]"
+    )
+
+
+AGENT_BOOT_GRACE_S = 30.0
+
+
+def delivery_wait_reason(pane: dict, handle: sqlite3.Row) -> str | None:
+    """Hold a delivery while the target agent cannot accept input yet: a modal
+    dialog is up (blocked), a turn is running (working — codex silently drops
+    prompts submitted mid-turn), or the agent process is still booting (herdr
+    has not detected it within the join grace window). Typing into any of
+    these strands text in the composer or a dialog."""
+    status = pane.get("agent_status") or "unknown"
+    if status in ("blocked", "working"):
+        return f"agent {status}"
+    if pane.get("agent"):
+        return None  # detected agent: herdr agent prompt submits atomically
+    if not handle["agent"]:
+        return None  # plain shell/bot pane: type right away
+    try:
+        age = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(handle["last_seen"])
+        ).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    if age < AGENT_BOOT_GRACE_S:
+        return "agent still booting"
+    return None
+
+
+def relay_tick(conn: sqlite3.Connection) -> list[str]:
+    events: list[str] = []
+    # Backfill agent session ids that join could not see while the agent was
+    # still booting. Guarded by provider+label match so a reused pane never
+    # donates its session to the wrong handle.
+    for h in conn.execute(
+        "SELECT name, session_ref, agent FROM handles "
+        "WHERE agent_session IS NULL AND agent IS NOT NULL AND session_ref LIKE 'herdr:%'"
+    ).fetchall():
+        pane = fetch_pane(h["session_ref"].removeprefix("herdr:"))
+        if (
+            not pane
+            or pane.get("agent") != h["agent"]
+            or (pane.get("label") or "") != h["name"]
+        ):
+            continue
+        sess = (pane.get("agent_session") or {}).get("value")
+        if sess:
+            conn.execute(
+                "UPDATE handles SET agent_session=? WHERE name=?", (sess, h["name"])
+            )
+            events.append(f"{h['name']}: backfilled {h['agent']} session {sess[:8]}")
+    conn.commit()
+    rows = conn.execute(
+        """SELECT d.id AS delivery_id, d.target, d.attempts, m.*
+           FROM deliveries d JOIN messages m ON m.id = d.message_id
+           WHERE d.status = 'pending' ORDER BY d.id LIMIT 50"""
+    ).fetchall()
+    for row in rows:
+        delivery_id = row["delivery_id"]
+        handle = conn.execute(
+            "SELECT session_ref, agent, last_seen FROM handles WHERE name = ?",
+            (row["target"],),
+        ).fetchone()
+        pane_id = pane_id_of(handle["session_ref"]) if handle else None
+        pane = fetch_pane(pane_id) if pane_id else None
+        if not pane_id or pane is None:
+            conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='no live pane' WHERE id = ?",
+                (delivery_id,),
+            )
+            events.append(f"#{delivery_id} -> {row['target']}: no live pane, left for pull")
+            continue
+        wait = delivery_wait_reason(pane, handle)
+        if wait:
+            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: {wait}")
+            continue
+        ok, error = push_to_pane(pane_id, format_for_pane(row))
+        if not ok and error == "agent_blocked":
+            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: agent blocked")
+            continue
+        if ok:
+            conn.execute(
+                "UPDATE deliveries SET status='delivered', delivered_at=? WHERE id = ?",
+                (now(), delivery_id),
+            )
+            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) delivered")
+        else:
+            attempts = int(row["attempts"]) + 1
+            status = "failed" if attempts >= MAX_DELIVERY_ATTEMPTS else "pending"
+            conn.execute(
+                "UPDATE deliveries SET status=?, attempts=?, last_error=? WHERE id = ?",
+                (status, attempts, error, delivery_id),
+            )
+            events.append(f"#{delivery_id} -> {row['target']} attempt {attempts}: {error}")
+    conn.commit()
+    return events
+
+
+def cmd_view(_args: argparse.Namespace) -> int:
+    # The view lives in radio-view (Textual); delegate with the venv python.
+    script = Path(__file__).resolve().parent / "run-view.sh"
+    os.execvp("sh", ["sh", str(script)])
+    return 0  # unreachable
+
+
+def cmd_relay(args: argparse.Namespace) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("radio relay already running (lock held)", file=sys.stderr)
+        return 1
+    print(f"radio relay · db: {DB_PATH} · interval {args.interval}s")
+    script = str(Path(__file__).resolve())
+    started_mtime = Path(script).stat().st_mtime
+    while True:
+        with closing(connect()) as conn:
+            for event in relay_tick(conn):
+                print(f"[{now()}] {event}", flush=True)
+        time.sleep(args.interval)
+        if Path(script).stat().st_mtime != started_mtime:
+            # A deploy swapped the binary; re-exec so the daemon never runs
+            # stale code. The flock fd closes on exec, the new image relocks.
+            print("radio changed on disk; restarting relay", flush=True)
+            os.execv(sys.executable, [sys.executable, script, "relay",
+                                      "--interval", str(args.interval)])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="radio", description=__doc__)
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("join", help="register this pane/session as a handle")
+    p.add_argument("handle", nargs="?", help="defaults to the current pane label")
+    p.add_argument("--pane", help="join a pane from outside (e.g. w1:p5)")
+    p.add_argument("--room", action="append", help="room to join (repeatable)")
+    p.add_argument("--provider", choices=PROVIDERS, help="agent provider to launch")
+    p.add_argument("--new", action="store_true", help="start a new session without asking")
+    p.add_argument("--resume", action="store_true", help="resume the named session without asking")
+    p.add_argument("--no-launch", action="store_true", help="register only, never launch an agent")
+
+    p = sub.add_parser("part", help="remove a handle")
+    p.add_argument("handle")
+
+    p = sub.add_parser("pm", help="direct message a handle")
+    p.add_argument("to")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--from", dest="sender")
+    p.add_argument("--reply-required", action="store_true",
+                   help="mark the message as requiring a reply")
+
+    p = sub.add_parser("say", help="message a room")
+    p.add_argument("room")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--from", dest="sender")
+    p.add_argument("--reply-required", action="store_true",
+                   help="mark the message as requiring a reply")
+
+    sub.add_parser("handles", help="list joined handles")
+    sub.add_parser("rooms", help="list rooms and members")
+
+    p = sub.add_parser("briefing", help=argparse.SUPPRESS)  # used by provider hooks
+    p.add_argument("handle")
+
+    p = sub.add_parser("log", help="recent messages")
+    p.add_argument("--limit", type=int, default=20)
+
+    p = sub.add_parser("inbox", help="read and consume pending messages for a handle")
+    p.add_argument("handle")
+
+    p = sub.add_parser("relay", help="run the delivery relay daemon")
+    p.add_argument("--interval", type=float, default=0.5)
+
+    sub.add_parser("view", help="live roster + message stream TUI")
+    return parser
+
+
+def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Print the opening briefing for a handle. Single source of truth: the
+    launch flags (claude/codex) and provider hooks (kimi) all render this."""
+    rooms = [
+        r["room"]
+        for r in conn.execute(
+            "SELECT room FROM memberships WHERE handle = ?", (args.handle,)
+        ).fetchall()
+    ] or [DEFAULT_ROOM]
+    print(briefing_text(args.handle, rooms))
+    return 0
+
+
+def cmd_rooms(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
+    rows = conn.execute(
+        "SELECT room, group_concat(handle, ', ') AS members FROM memberships "
+        "GROUP BY room ORDER BY room"
+    ).fetchall()
+    if not rows:
+        print("no rooms")
+        return 0
+    for row in rows:
+        print(f"#{row['room']}: {row['members']}")
+    return 0
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command is None:
+        # Bare `radio` in a terminal opens the view; in scripts, print help.
+        if sys.stdout.isatty():
+            return cmd_view(args)
+        build_parser().print_help()
+        return 0
+    if args.command == "relay":
+        return cmd_relay(args)
+    if args.command == "view":
+        return cmd_view(args)
+    with closing(connect()) as conn:
+        handler = {
+            "join": cmd_join,
+            "part": cmd_part,
+            "pm": cmd_pm,
+            "say": cmd_say,
+            "handles": cmd_handles,
+            "rooms": cmd_rooms,
+            "briefing": cmd_briefing,
+            "log": cmd_log,
+            "inbox": cmd_inbox,
+        }[args.command]
+        return handler(conn, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

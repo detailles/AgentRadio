@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Radio view — live roster + message stream TUI (Textual).
+
+Run `sh bin/setup.sh` once to install the view dependencies into .venv.
+State dir resolution mirrors bin/radio: $RADIO_HOME, else
+~/.local/share/herdr-radio.
+"""
+
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+STATE_DIR = (
+    Path(os.environ["RADIO_HOME"]).expanduser()
+    if os.environ.get("RADIO_HOME")
+    else Path.home() / ".local" / "share" / "herdr-radio"
+)
+DB_PATH = STATE_DIR / "radio.db"
+LOCK_PATH = STATE_DIR / "relay.lock"
+MAX_BODY_CHARS = 600
+PATH_RE = re.compile(r"(?:[\w.@~-]+/)+[\w.@-]+")
+
+try:
+    from rich.text import Text
+    from textual.app import App, ComposeResult
+    from textual.containers import Horizontal
+    from textual.widgets import Footer, RichLog, Static
+except ImportError:
+    sys.exit("radio view needs its dependencies — run: sh bin/setup.sh")
+
+
+def herdr(*args: str) -> subprocess.CompletedProcess[str] | None:
+    binary = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+    if not binary:
+        return None
+    try:
+        return subprocess.run([binary, *args], text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def pane_states() -> dict[str, dict]:
+    result = herdr("pane", "list")
+    if not result or result.returncode != 0:
+        return {}
+    try:
+        panes = json.loads(result.stdout).get("result", {}).get("panes", [])
+    except json.JSONDecodeError:
+        return {}
+    return {p["pane_id"]: p for p in panes if p.get("pane_id")}
+
+
+def relay_alive() -> bool:
+    import fcntl
+
+    if not LOCK_PATH.exists():
+        return False
+    fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        fd.close()
+    return False
+
+
+def adopt_pane() -> None:
+    """Label the pane we were launched in; survives Herdr session restore."""
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    if not (pane_id and os.environ.get("HERDR_ENV") == "1"):
+        return
+    result = herdr("pane", "get", pane_id)
+    if not result or result.returncode != 0:
+        return
+    try:
+        label = json.loads(result.stdout)["result"]["pane"].get("label") or ""
+    except (json.JSONDecodeError, KeyError):
+        return
+    if label != "Radio":
+        herdr("pane", "rename", pane_id, "Radio")
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def dot_for(handle: sqlite3.Row, states: dict[str, dict]) -> tuple[Text, str]:
+    """Liveness dot + note for a ledger row. A pane id alone proves nothing —
+    panes outlive handles and get reused — so the pane must still carry the
+    handle's label (and the same agent, if the handle has one)."""
+    ref = handle["session_ref"]
+    pane_id = ref.removeprefix("herdr:") if ref.startswith("herdr:") else None
+    if not pane_id:
+        return Text("·", style="grey62"), "pull"
+    pane = states.get(pane_id)
+    if pane is None:
+        return Text("✗", style="red"), "no pane"
+    if (pane.get("label") or "") != handle["name"]:
+        return Text("✗", style="grey50"), "reused"
+    live_agent = pane.get("agent")
+    if handle["agent"] and live_agent and live_agent != handle["agent"]:
+        return Text("✗", style="grey50"), f"now {live_agent}"
+    status = pane.get("agent_status") or "unknown"
+    if status in ("working", "running"):
+        return Text("●", style="yellow"), status
+    if status == "idle":
+        return Text("●", style="green"), status
+    return Text("●", style="grey62"), status
+
+
+def fmt_message(m: sqlite3.Row) -> Text:
+    try:
+        stamp = datetime.fromisoformat(m["ts"]).astimezone().strftime("%H:%M")
+    except ValueError:
+        stamp = m["ts"][11:16]
+    if m["kind"] == "pm":
+        target, target_style = m["to_handle"], "cyan"
+    else:
+        target, target_style = f"#{m['room']}", "blue"
+    line = Text()
+    line.append(f"{stamp} ", style="grey50")
+    line.append(str(m["from_handle"]), style="bold magenta")
+    line.append(" → ", style="grey50")
+    line.append(str(target), style=f"bold {target_style}")
+    if "reply_required" in m.keys() and m["reply_required"]:
+        line.append(" ⚠reply", style="bold red")
+    line.append("  ", style="grey50")
+    body = str(m["text"])
+    if len(body) > MAX_BODY_CHARS:
+        cut = body[:MAX_BODY_CHARS]
+        extra = len(body) - MAX_BODY_CHARS
+    else:
+        cut, extra = body, 0
+    pos = 0
+    for match in PATH_RE.finditer(cut):
+        if match.start() > pos:
+            line.append(cut[pos : match.start()])
+        line.append(match.group(0), style="yellow")
+        pos = match.end()
+    line.append(cut[pos:])
+    if extra:
+        line.append(f" …(+{extra})", style="grey50")
+    return line
+
+
+class RadioView(App):
+    TITLE = "Radio"
+    CSS = """
+    Screen { background: #0b0f14; }
+    #bar {
+        height: 1;
+        padding: 0 1;
+        background: #111820;
+    }
+    #bar-left { color: #7dd3fc; text-style: bold; width: auto; }
+    #bar-right { color: #c9d1d9; width: 1fr; text-align: right; }
+    #main { height: 1fr; }
+    #stream {
+        width: 1fr;
+        border: round #263241;
+        background: #0b0f14;
+        padding: 0 1;
+    }
+    #handles {
+        width: 30;
+        border: round #263241;
+        background: #0b0f14;
+        padding: 0 1;
+    }
+    """
+    BINDINGS = [("q", "quit", "quit"), ("r", "refresh", "refresh")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_message_id = 0
+        self.states: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="bar"):
+            yield Static("◈ Radio", id="bar-left")
+            yield Static("", id="bar-right")
+        with Horizontal(id="main"):
+            yield RichLog(id="stream", wrap=True, auto_scroll=True, markup=False)
+            yield Static(id="handles")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        adopt_pane()
+        # load recent history, then live-tail
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages ORDER BY id DESC LIMIT 50"
+            ).fetchall()
+        stream = self.query_one("#stream", RichLog)
+        for row in reversed(rows):
+            stream.write(fmt_message(row))
+        if rows:
+            self.last_message_id = max(r["id"] for r in rows)
+        self.refresh_handles()
+        self.set_interval(1.0, self.poll_messages)
+        self.set_interval(2.0, self.refresh_header)
+        self.set_interval(4.0, self.refresh_handles)
+
+    def poll_messages(self) -> None:
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE id > ? ORDER BY id", (self.last_message_id,)
+            ).fetchall()
+        if not rows:
+            return
+        stream = self.query_one("#stream", RichLog)
+        for row in rows:
+            stream.write(fmt_message(row))
+        self.last_message_id = rows[-1]["id"]
+
+    def refresh_header(self) -> None:
+        with connect() as conn:
+            counts = {
+                row["status"]: row["c"]
+                for row in conn.execute(
+                    "SELECT status, count(*) AS c FROM deliveries GROUP BY status"
+                ).fetchall()
+            }
+        up = relay_alive()
+        relay = Text("relay up", style="green") if up else Text("relay DOWN", style="bold red")
+        stats = Text.assemble(
+            relay,
+            f"  ·  {counts.get('pending', 0)} pending · {counts.get('failed', 0)} failed"
+            f" · {counts.get('delivered', 0)} delivered",
+        )
+        self.query_one("#bar-right", Static).update(stats)
+
+    def refresh_handles(self) -> None:
+        self.states = pane_states()
+        with connect() as conn:
+            handles = conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
+        lines = Text("Handles\n", style="bold #7dd3fc")
+        for h in handles:
+            pane_id = (
+                h["session_ref"].removeprefix("herdr:")
+                if h["session_ref"].startswith("herdr:")
+                else "pull"
+            )
+            dot, note = dot_for(h, self.states)
+            lines.append_text(dot)
+            lines.append(f" {h['name']}\n", style="bold")
+            lines.append(f"  {pane_id} {note}\n", style="grey50")
+        self.query_one("#handles", Static).update(lines)
+
+    def action_refresh(self) -> None:
+        self.poll_messages()
+        self.refresh_header()
+        self.refresh_handles()
+
+
+def main() -> int:
+    RadioView().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,24 @@
+id = "radio"
+name = "Radio"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Local message bus for agents running in Herdr panes"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["sh", "bin/autostart.sh"]
+
+[[build]]
+command = ["sh", "bin/setup.sh"]
+
+[[panes]]
+id = "view"
+title = "Radio"
+placement = "tab"
+command = ["sh", "bin/run-view.sh"]
+
+[[actions]]
+id = "open-view"
+title = "Open Radio view"
+contexts = ["workspace"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "radio", "--entrypoint", "view"]
