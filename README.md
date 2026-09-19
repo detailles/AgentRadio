@@ -50,6 +50,7 @@ whatever you like in that pane — an agent, a bot script, a plain shell.
 radio join bot-c                 # inside the pane; binds it, labels it bot-c
 radio join                       # same, adopting the pane's existing label
 radio pm bot2 'hello' --from bot-c
+radio pm bot2 'rapor hazir' --ref /tmp/rapor.md --from bot-c   # payload dosyada
 radio handles
 radio inbox bot2                 # pull path, for pane-less handles
 radio log

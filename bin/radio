@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS messages(
   from_handle TEXT NOT NULL,
   to_handle TEXT,                -- pm target
   text TEXT NOT NULL,
+  ref TEXT,                      -- file reference (payload stays out of the message)
   reply_required INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS deliveries(
@@ -643,6 +644,10 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         brief_file = brief_dir / f"{handle}.md"
         brief_file.write_text(briefing_text(handle), encoding="utf-8")
         cfg: dict = {"instructions": [str(brief_file)]}
+        # Ref-based sharing means agents read files outside their cwd (the
+        # sender's /tmp, another project). opencode asks on external_directory
+        # by default; radio-launched handles must not stall on that dialog.
+        cfg["permission"] = {"external_directory": "allow"}
         if args.model:
             cfg["model"] = args.model
         cfg_file = brief_dir / f"{handle}.json"
@@ -669,6 +674,9 @@ def briefing_text(handle: str) -> str:
         'radio pm <handle> "<message>" --reply-required (when you need an answer — '
         "asking for a reply inside the message text does NOT set the flag) · "
         f"radio inbox {handle} (FALLBACK ONLY — see below). "
+        "Keep messages short: for long content (reports, logs, diffs) write "
+        "it to a file and attach it as --ref <path> — the recipient reads "
+        "the file itself, on demand. "
         "Delivery is push-based: incoming messages arrive in this pane by "
         "themselves, wrapped in [RADIO_MESSAGE ...] envelopes; the header's "
         "reply=required means you must answer over radio. After sending a "
@@ -698,14 +706,18 @@ def record_message(
     sender: str,
     text: str,
     to_handle: str | None = None,
+    ref: str | None = None,
     reply_required: bool = False,
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO messages(ts, kind, from_handle, to_handle, text, reply_required) "
-        "VALUES (?,?,?,?,?,?)",
-        (now(), kind, sender, to_handle, text, int(reply_required)),
+        "INSERT INTO messages(ts, kind, from_handle, to_handle, text, ref, reply_required) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (now(), kind, sender, to_handle, text, ref, int(reply_required)),
     )
     return int(cur.lastrowid)
+
+
+LONG_MESSAGE_CHARS = 1200
 
 
 def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -717,10 +729,18 @@ def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     if not target:
         raise SystemExit(f"unknown handle: {args.to} (join first)")
     mid = record_message(conn, "pm", sender, text, to_handle=args.to,
-                         reply_required=args.reply_required)
+                         ref=args.ref, reply_required=args.reply_required)
     enqueue_delivery(conn, mid, args.to)
     conn.commit()
     print(f"pm #{mid} -> {args.to}")
+    if len(text) > LONG_MESSAGE_CHARS:
+        # Token-sensitive bus: a long paste costs the recipient a big prompt.
+        # Nudge at the exact moment it happens.
+        print(
+            f"note: {len(text)} chars is a heavy message — next time write the "
+            "content to a file and send --ref <path>; the recipient reads it "
+            "itself, on demand."
+        )
     if args.reply_required:
         # Senders expecting an answer tend to poll `radio inbox` in a loop.
         # State the push contract at the exact moment the impulse starts.
@@ -776,7 +796,8 @@ def cmd_log(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     for row in reversed(rows):
         target = f"-> {row['to_handle']}" if row["kind"] == "pm" else f"-> #{row['room']}"
         flag = " [reply-required]" if row["reply_required"] else ""
-        print(f"#{row['id']} {row['ts']} {row['from_handle']} {target}{flag}: {row['text']}")
+        ref = f" (ref: {row['ref']})" if "ref" in row.keys() and row["ref"] else ""
+        print(f"#{row['id']} {row['ts']} {row['from_handle']} {target}{flag}{ref}: {row['text']}")
     return 0
 
 
@@ -798,7 +819,8 @@ def cmd_inbox(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     for row in rows:
         via = f"#{row['room']}" if row["kind"] == "room" else "pm"
         flag = " [reply-required]" if row["reply_required"] else ""
-        print(f"[{row['delivery_id']}] {row['ts']} {via}{flag} from {row['from_handle']}: {row['text']}")
+        ref = f" (ref: {row['ref']})" if "ref" in row.keys() and row["ref"] else ""
+        print(f"[{row['delivery_id']}] {row['ts']} {via}{flag}{ref} from {row['from_handle']}: {row['text']}")
     conn.execute(
         """UPDATE deliveries SET status='delivered', delivered_at=?
            WHERE target = ? AND status IN ('pending', 'pull', 'failed')""",
@@ -816,11 +838,14 @@ def format_for_pane(message: sqlite3.Row) -> str:
     mid = message["id"]
     reply = "required" if message["reply_required"] else "not-required"
     reply_line = "\nReply required: answer this over radio." if message["reply_required"] else ""
+    ref_line = ""
+    if "ref" in message.keys() and message["ref"]:
+        ref_line = f"\nRef: {message['ref']}"
     return (
         f"[RADIO_MESSAGE id={mid} kind=pm from={message['from_handle']} "
         f"to={message['to_handle']} reply={reply}]\n"
         f"Radio PM from {message['from_handle']}{reply_line}\n"
-        f"{message['text']}\n"
+        f"{message['text']}{ref_line}\n"
         f"[END_RADIO_MESSAGE id={mid}]"
     )
 
@@ -973,6 +998,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("to")
     p.add_argument("text", nargs="+")
     p.add_argument("--from", dest="sender")
+    p.add_argument("--ref", help="file reference carrying the payload — keep the "
+                                 "message short, the recipient reads the file")
     p.add_argument("--reply-required", action="store_true",
                    help="mark the message as requiring a reply")
 
