@@ -491,8 +491,8 @@ def launch_argv(
             return ["gemini", "--session-file", found]
         return ["gemini"]
     if provider == "opencode":
-        # Briefing rides OPENCODE_CONFIG_CONTENT (inline instructions file
-        # path) — see cmd_join. Session ids are server-generated; resume only.
+        # Briefing rides a per-handle OPENCODE_CONFIG file (instructions) —
+        # see cmd_join. Session ids are server-generated; resume only.
         return ["opencode"] + (["--session", session_id] if session_id else [])
     raise SystemExit(f"unknown provider: {provider}")
 
@@ -664,15 +664,20 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     env = os.environ.copy()
     env["RADIO_HANDLE"] = handle
     if provider == "opencode":
-        # No append flag/hook channel: the briefing file is injected as an
-        # inline-config `instructions` entry (merged, user config untouched).
-        brief_dir = STATE_DIR / "briefings"
+        # No append flag/hook channel; briefing ships as an `instructions`
+        # file via a per-handle OPENCODE_CONFIG file. (OPENCODE_CONFIG_CONTENT
+        # inline config resolves in `debug config` but its instructions never
+        # reach the model — verified on 1.18.31.) Merges with user config;
+        # its `instructions` shadows the user's global list for this session.
+        brief_dir = STATE_DIR / "opencode"
         brief_dir.mkdir(parents=True, exist_ok=True)
         brief_file = brief_dir / f"{handle}.md"
         brief_file.write_text(briefing_text(handle, rooms), encoding="utf-8")
-        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-            {"instructions": [str(brief_file)]}
+        cfg_file = brief_dir / f"{handle}.json"
+        cfg_file.write_text(
+            json.dumps({"instructions": [str(brief_file)]}), encoding="utf-8"
         )
+        env["OPENCODE_CONFIG"] = str(cfg_file)
     print(f"launching: {' '.join(argv)}")
     try:
         os.execvpe(argv[0], argv, env)
