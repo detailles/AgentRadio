@@ -71,6 +71,45 @@ into the handle row, so a restored agent can be matched back to its handle.
 Sender resolution: `--from`, else `$RADIO_HANDLE`, else the handle bound to
 the current pane.
 
+## Providers
+
+The bus layer is provider-agnostic (panes + handles), but `radio join` can
+also launch an agent CLI into the pane with the radio briefing injected,
+so the agent knows how to read and answer messages without being told each
+time. The briefing always rides a provider-native system-context channel —
+it is never sent as a radio message and never spends a turn.
+
+| Provider | Briefing channel | Session resume | Status |
+|---|---|---|---|
+| claude | `--append-system-prompt` | `--resume <id>` | tested end-to-end |
+| codex | `-c developer_instructions=…` | `codex resume <id>` | tested end-to-end |
+| opencode | per-handle config `instructions` | `--session <id>` | tested end-to-end |
+| gemini | SessionStart hook (`settings.json`) | `--resume <id>` | tested end-to-end |
+| kimi | UserPromptSubmit hook (`config.toml`) | `--session <id>` | briefing mechanism tested |
+| qwen | `--append-system-prompt` | `--resume <id>` | written, not yet live-tested |
+| pi | — (no context channel yet) | `--session <id>` | written, not yet live-tested |
+
+For gemini and qwen, join assigns the session id itself (`--session-id`),
+so resume is exact instead of a search.
+
+### Security notes
+
+Radio-launched agents must answer messages unattended, so some providers
+are launched with relaxed approval:
+
+- **gemini and qwen** launch with `--approval-mode yolo`: every tool call
+  in that pane is auto-approved for the life of the pane.
+- **opencode** joins write a per-handle config under Radio's state dir
+  setting `permission.external_directory: allow`, so `--ref` file
+  references outside the working directory open without a prompt.
+- **codex** launches with per-process `-c` overrides
+  (`tui.terminal_title=[]`, `developer_instructions=…`); your global
+  `config.toml` is untouched.
+
+These settings apply only to panes started by `radio join`. Interactive
+sessions you open yourself keep their own defaults. Do not point a
+yolo-mode handle at work you would not auto-approve.
+
 ## Named agent sessions (optional, provider-side)
 
 Some providers support named sessions, and naming the session after the
@@ -91,6 +130,16 @@ Delivery to a pane uses `herdr agent prompt`, falling back to
 `pane send-text` + `pane send-keys enter` for plain shells. Handles without
 a live pane are marked `pull` — list them with `radio inbox`, read one with
 `radio show <id>` (which records the delivery).
+
+## Known issues
+
+- **Herdr agent detection vs. bundled CLIs.** Some providers ship as one
+  bundled binary (gemini, qwen) that Herdr's pane agent detection does not
+  yet identify as an agent. Consequence: `radio handles` can show such a
+  handle as `gone` while its pane is alive, and delivery falls back from
+  `herdr agent prompt` to plain `send-text`. Radio still works; the status
+  column is the casualty. This is a Herdr-side detection gap, to be fixed
+  there.
 
 ## Demo
 
