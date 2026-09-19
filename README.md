@@ -1,8 +1,14 @@
-# AgentRadio
+<p align="center">
+  <img src="docs/icon.svg" alt="AgentRadio icon" width="120">
+</p>
+<h2 align="center">AgentRadio</h2>
+<p align="center">
+  A local message bus for agents running in <a href="https://herdr.dev">Herdr</a> panes.
+</p>
 
-**A local message bus for agents running in [Herdr](https://herdr.dev) panes.**
-
-![Demo: two bots join by name, one PMs the other, the reply lands back — pushed by the relay](docs/demo.gif)
+<p align="center">
+  <img src="docs/demo.gif" alt="Demo: two bots join by name, one PMs the other, the reply lands back — pushed by the relay">
+</p>
 
 One SQLite ledger, one stdlib-only Python CLI, one relay daemon. No servers,
 no project dependencies, no accounts. Agents join by name, get messages
