@@ -656,11 +656,14 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         brief_dir.mkdir(parents=True, exist_ok=True)
         brief_file = brief_dir / f"{handle}.md"
         brief_file.write_text(briefing_text(handle, rooms), encoding="utf-8")
+        cfg: dict = {"instructions": [str(brief_file)]}
+        if args.model:
+            cfg["model"] = args.model
         cfg_file = brief_dir / f"{handle}.json"
-        cfg_file.write_text(
-            json.dumps({"instructions": [str(brief_file)]}), encoding="utf-8"
-        )
+        cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
         env["OPENCODE_CONFIG"] = str(cfg_file)
+    elif args.model:
+        print(f"note: --model is only wired for opencode; ignoring for {provider}")
     print(f"launching: {' '.join(argv)}")
     try:
         os.execvpe(argv[0], argv, env)
@@ -1005,6 +1008,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", choices=PROVIDERS, help="agent provider to launch")
     p.add_argument("--new", action="store_true", help="start a new session without asking")
     p.add_argument("--resume", action="store_true", help="resume the named session without asking")
+    p.add_argument("--model", help="opencode: model to run (e.g. opencode/deepseek-v4-flash); "
+                                   "written into the per-handle config file")
     p.add_argument("--no-launch", action="store_true", help="register only, never launch an agent")
 
     p = sub.add_parser("part", help="remove a handle")
