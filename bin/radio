@@ -588,9 +588,21 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     if interactive and not provider:
         provider = ask_provider(handle)
-    if provider and interactive and not session_id:
+    if provider and args.resume and not session_id:
+        # Explicit --resume: the ledger's recorded session (backfilled from the
+        # live pane) is authoritative; the provider disk search is the fallback.
+        # Never silently start fresh — a missed resume is an error, not a new chat.
+        if existing and existing["agent"] == provider and existing["agent_session"]:
+            session_id = existing["agent_session"]
+        else:
+            found = find_named_session(provider, handle)
+            if found:
+                session_id = found["id"]
+            else:
+                raise SystemExit(f"no saved {provider} session named {handle}")
+    elif provider and interactive and not session_id:
         found = None if args.new else find_named_session(provider, handle)
-        if found and not args.new and not args.resume:
+        if found:
             cwd = found["cwd"] or "cwd unknown"
             idx = choose(
                 f'"{handle}" has a saved {provider} session '
@@ -602,18 +614,8 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 raise SystemExit("cancelled")
             if idx == 0:
                 session_id = found["id"]
-        elif found and args.resume:
-            session_id = found["id"]
-        elif not found:
-            print(f"no saved {provider} session named {handle}; starting new")
-    elif provider and args.resume:
-        found = find_named_session(provider, handle)
-        if found:
-            session_id = found["id"]
-        elif existing and existing["agent"] == provider and existing["agent_session"]:
-            session_id = existing["agent_session"]  # recorded by join/backfill
         else:
-            raise SystemExit(f"no saved {provider} session named {handle}")
+            print(f"no saved {provider} session named {handle}; starting new")
 
     launching = interactive and bool(provider)
     # Providers that accept a caller-assigned session id get one now: the
