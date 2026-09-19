@@ -7,8 +7,11 @@ daemon. No project-specific dependencies.
 ## Concepts
 
 - **handle** — a name bound to a Herdr pane (or `manual` outside Herdr)
-- **room** — a named group; `say` reaches every member except the sender
 - **relay** — daemon that pushes pending deliveries into live panes
+
+Radio is deliberately PM-only: direct messages between handles. No rooms or
+broadcast — a room message is N pushed turns for N members, and most of them
+are irrelevant to the recipient. Token-sensitive by design.
 
 ## Install
 
@@ -47,9 +50,7 @@ whatever you like in that pane — an agent, a bot script, a plain shell.
 radio join bot-c                 # inside the pane; binds it, labels it bot-c
 radio join                       # same, adopting the pane's existing label
 radio pm bot2 'hello' --from bot-c
-radio say runners 'status?' --from bot-c
 radio handles
-radio rooms
 radio inbox bot2                 # pull path, for pane-less handles
 radio log
 radio part bot-c

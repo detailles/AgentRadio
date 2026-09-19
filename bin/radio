@@ -24,7 +24,6 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_ROOM = "general"
 HERDR_SEND_TIMEOUT = 15
 MAX_DELIVERY_ATTEMPTS = 5
 
@@ -55,18 +54,12 @@ CREATE TABLE IF NOT EXISTS handles(
   created_at TEXT NOT NULL,
   last_seen TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS memberships(
-  handle TEXT NOT NULL,
-  room TEXT NOT NULL,
-  PRIMARY KEY(handle, room)
-);
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
-  kind TEXT NOT NULL,            -- pm | room
+  kind TEXT NOT NULL,            -- pm
   from_handle TEXT NOT NULL,
   to_handle TEXT,                -- pm target
-  room TEXT,                     -- room target
   text TEXT NOT NULL,
   reply_required INTEGER NOT NULL DEFAULT 0
 );
@@ -423,14 +416,13 @@ def launch_argv(
     provider: str,
     handle: str,
     session_id: str | None,
-    rooms: list[str],
     fresh: bool = False,
 ) -> list[str]:
     # The radio briefing rides the launch as provider-native system context:
     # invisible, spends no turn, and the relay never messages the agent itself.
     # Resume gets it too — system context is per-process, a restored transcript
     # does not carry it.
-    briefing = briefing_text(handle, rooms)
+    briefing = briefing_text(handle)
     if provider == "claude":
         argv = ["claude", "--append-system-prompt", briefing]
         return argv + (["--resume", session_id] if session_id else []) + ["--name", handle]
@@ -631,19 +623,13 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                                            last_seen=excluded.last_seen""",
         (handle, ref, provider or None, agent_session, ts, ts),
     )
-    rooms = args.room or [DEFAULT_ROOM]
-    for room in rooms:
-        conn.execute(
-            "INSERT OR IGNORE INTO memberships(handle, room) VALUES (?,?)",
-            (handle, room),
-        )
     conn.commit()
     session_note = f", {provider} session {agent_session[:8]}" if provider and agent_session else ""
-    print(f"{handle} joined ({ref}{session_note}) in rooms: {', '.join(rooms)}")
+    print(f"{handle} joined ({ref}{session_note})")
 
     if not interactive or not provider:
         return 0
-    argv = launch_argv(provider, handle, session_id, rooms, fresh=fresh)
+    argv = launch_argv(provider, handle, session_id, fresh=fresh)
     env = os.environ.copy()
     env["RADIO_HANDLE"] = handle
     if provider == "opencode":
@@ -655,7 +641,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         brief_dir = STATE_DIR / "opencode"
         brief_dir.mkdir(parents=True, exist_ok=True)
         brief_file = brief_dir / f"{handle}.md"
-        brief_file.write_text(briefing_text(handle, rooms), encoding="utf-8")
+        brief_file.write_text(briefing_text(handle), encoding="utf-8")
         cfg: dict = {"instructions": [str(brief_file)]}
         if args.model:
             cfg["model"] = args.model
@@ -672,9 +658,9 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     return 0  # unreachable
 
 
-def briefing_text(handle: str, rooms: list[str]) -> str:
+def briefing_text(handle: str) -> str:
     return (
-        f'You are on Radio as "{handle}" (rooms: {", ".join(rooms)}). '
+        f'You are on Radio as "{handle}". '
         "Radio is the local message bus between the agents in this workspace — "
         "no need to search the filesystem for messaging tools. "
         "Commands: "
@@ -682,7 +668,6 @@ def briefing_text(handle: str, rooms: list[str]) -> str:
         'radio pm <handle> "<message>" (direct message) · '
         'radio pm <handle> "<message>" --reply-required (when you need an answer — '
         "asking for a reply inside the message text does NOT set the flag) · "
-        'radio say <room> "<message>" (message a room) · '
         f"radio inbox {handle} (FALLBACK ONLY — see below). "
         "Delivery is push-based: incoming messages arrive in this pane by "
         "themselves, wrapped in [RADIO_MESSAGE ...] envelopes; the header's "
@@ -696,7 +681,6 @@ def briefing_text(handle: str, rooms: list[str]) -> str:
 
 
 def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    conn.execute("DELETE FROM memberships WHERE handle = ?", (args.handle,))
     conn.execute("DELETE FROM handles WHERE name = ?", (args.handle,))
     conn.execute(
         "UPDATE deliveries SET status='failed', last_error='handle parted' "
@@ -714,13 +698,12 @@ def record_message(
     sender: str,
     text: str,
     to_handle: str | None = None,
-    room: str | None = None,
     reply_required: bool = False,
 ) -> int:
     cur = conn.execute(
-        "INSERT INTO messages(ts, kind, from_handle, to_handle, room, text, reply_required) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (now(), kind, sender, to_handle, room, text, int(reply_required)),
+        "INSERT INTO messages(ts, kind, from_handle, to_handle, text, reply_required) "
+        "VALUES (?,?,?,?,?,?)",
+        (now(), kind, sender, to_handle, text, int(reply_required)),
     )
     return int(cur.lastrowid)
 
@@ -746,24 +729,6 @@ def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             "do NOT poll `radio inbox` or set timers to check for it; "
             "continue other work or stop."
         )
-    return 0
-
-
-def cmd_say(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    sender = resolve_sender(conn, args.sender)
-    text = " ".join(args.text)
-    conn.execute(
-        "INSERT OR IGNORE INTO memberships(handle, room) VALUES (?,?)", (sender, args.room)
-    )
-    mid = record_message(conn, "room", sender, text, room=args.room,
-                         reply_required=args.reply_required)
-    members = conn.execute(
-        "SELECT handle FROM memberships WHERE room = ? AND handle != ?", (args.room, sender)
-    ).fetchall()
-    for member in members:
-        enqueue_delivery(conn, mid, member["handle"])
-    conn.commit()
-    print(f"say #{mid} -> #{args.room} ({len(members)} recipients)")
     return 0
 
 
@@ -795,15 +760,11 @@ def cmd_handles(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
         print("no handles joined")
         return 0
     for row in rows:
-        rooms = conn.execute(
-            "SELECT room FROM memberships WHERE handle = ? ORDER BY room", (row["name"],)
-        ).fetchall()
-        room_list = ",".join(r["room"] for r in rooms) or "-"
         provider = row["agent"] or "-"
         session = (row["agent_session"] or "-")[:8]
         print(
             f"{row['name']:<20} {handle_status(row):<26} {row['session_ref']:<14} "
-            f"{provider:<8} sess: {session:<8} rooms: {room_list}"
+            f"{provider:<8} sess: {session:<8}"
         )
     return 0
 
@@ -854,17 +815,11 @@ def format_for_pane(message: sqlite3.Row) -> str:
     # submission, and the shell path flattens newlines before typing.
     mid = message["id"]
     reply = "required" if message["reply_required"] else "not-required"
-    if message["kind"] == "pm":
-        kind, target = "pm", message["to_handle"]
-        lead = f"Radio PM from {message['from_handle']}"
-    else:
-        kind, target = "room", f"#{message['room']}"
-        lead = f"Radio message from {message['from_handle']} in #{message['room']}"
     reply_line = "\nReply required: answer this over radio." if message["reply_required"] else ""
     return (
-        f"[RADIO_MESSAGE id={mid} kind={kind} from={message['from_handle']} "
-        f"to={target} reply={reply}]\n"
-        f"{lead}{reply_line}\n"
+        f"[RADIO_MESSAGE id={mid} kind=pm from={message['from_handle']} "
+        f"to={message['to_handle']} reply={reply}]\n"
+        f"Radio PM from {message['from_handle']}{reply_line}\n"
         f"{message['text']}\n"
         f"[END_RADIO_MESSAGE id={mid}]"
     )
@@ -1004,7 +959,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("join", help="register this pane/session as a handle")
     p.add_argument("handle", nargs="?", help="defaults to the current pane label")
     p.add_argument("--pane", help="join a pane from outside (e.g. w1:p5)")
-    p.add_argument("--room", action="append", help="room to join (repeatable)")
     p.add_argument("--provider", choices=PROVIDERS, help="agent provider to launch")
     p.add_argument("--new", action="store_true", help="start a new session without asking")
     p.add_argument("--resume", action="store_true", help="resume the named session without asking")
@@ -1022,15 +976,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reply-required", action="store_true",
                    help="mark the message as requiring a reply")
 
-    p = sub.add_parser("say", help="message a room")
-    p.add_argument("room")
-    p.add_argument("text", nargs="+")
-    p.add_argument("--from", dest="sender")
-    p.add_argument("--reply-required", action="store_true",
-                   help="mark the message as requiring a reply")
-
     sub.add_parser("handles", help="list joined handles")
-    sub.add_parser("rooms", help="list rooms and members")
 
     p = sub.add_parser("briefing", help=argparse.SUPPRESS)  # used by provider hooks
     p.add_argument("handle")
@@ -1051,26 +997,7 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Print the opening briefing for a handle. Single source of truth: the
     launch flags (claude/codex) and provider hooks (kimi) all render this."""
-    rooms = [
-        r["room"]
-        for r in conn.execute(
-            "SELECT room FROM memberships WHERE handle = ?", (args.handle,)
-        ).fetchall()
-    ] or [DEFAULT_ROOM]
-    print(briefing_text(args.handle, rooms))
-    return 0
-
-
-def cmd_rooms(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
-    rows = conn.execute(
-        "SELECT room, group_concat(handle, ', ') AS members FROM memberships "
-        "GROUP BY room ORDER BY room"
-    ).fetchall()
-    if not rows:
-        print("no rooms")
-        return 0
-    for row in rows:
-        print(f"#{row['room']}: {row['members']}")
+    print(briefing_text(args.handle))
     return 0
 
 
@@ -1091,9 +1018,7 @@ def main() -> int:
             "join": cmd_join,
             "part": cmd_part,
             "pm": cmd_pm,
-            "say": cmd_say,
             "handles": cmd_handles,
-            "rooms": cmd_rooms,
             "briefing": cmd_briefing,
             "log": cmd_log,
             "inbox": cmd_inbox,
