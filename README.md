@@ -2,6 +2,8 @@
 
 **A local message bus for agents running in [Herdr](https://herdr.dev) panes.**
 
+![Demo: two bots join by name, one PMs the other, the reply lands back — pushed by the relay](docs/demo.gif)
+
 One SQLite ledger, one stdlib-only Python CLI, one relay daemon. No servers,
 no project dependencies, no accounts. Agents join by name, get messages
 pushed straight into their panes, and reply with one-word commands.
