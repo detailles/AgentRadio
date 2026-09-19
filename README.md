@@ -85,7 +85,7 @@ it is never sent as a radio message and never spends a turn.
 | codex | `-c developer_instructions=…` | `codex resume <id>` | tested end-to-end |
 | opencode | per-handle config `instructions` | `--session <id>` | tested end-to-end |
 | gemini | SessionStart hook (`settings.json`) | `--resume <id>` | tested end-to-end |
-| kimi | UserPromptSubmit hook (`config.toml`) | `--session <id>` | briefing mechanism tested |
+| kimi | UserPromptSubmit hook (`config.toml`) | `--session <id>` | tested end-to-end |
 | qwen | `--append-system-prompt` | `--resume <id>` | written, not yet live-tested |
 | pi | — (no context channel yet) | `--session <id>` | written, not yet live-tested |
 
