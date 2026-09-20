@@ -12,6 +12,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -71,6 +72,14 @@ class RadioTestCase(unittest.TestCase):
         return self.conn.execute(
             "SELECT * FROM deliveries WHERE message_id = ?", (mid,)
         ).fetchone()
+
+    def backdate_attempt(self, mid, seconds):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(
+            timespec="milliseconds"
+        )
+        self.conn.execute("UPDATE deliveries SET last_attempt_at=? WHERE message_id=?",
+                          (old, mid))
+        self.conn.commit()
 
 
 class PaneIdOfTest(RadioTestCase):
@@ -291,6 +300,9 @@ class RelayTickTest(RadioTestCase):
         self.conn.execute("UPDATE deliveries SET attempts=? WHERE message_id=?",
                           (radio.MAX_DELIVERY_ATTEMPTS - 1, self.mid))
         self.conn.commit()
+        # The first attempt just stamped last_attempt_at; the backoff window
+        # would skip the retry, so back-date it to make the delivery due.
+        self.backdate_attempt(self.mid, radio.RETRY_AFTER_S + 10)
         self.tick(pane, (False, "agent_not_accepting"))
         row = self.delivery_row(self.mid)
         self.assertEqual(row["attempts"], radio.MAX_DELIVERY_ATTEMPTS)
@@ -558,6 +570,179 @@ class RepromotionTest(RadioTestCase):
         self.assertEqual(self.push_calls, [])
         self.assertEqual(self.delivery_row(m1)["status"], "pull")
         self.assertEqual(self.delivery_row(m2)["status"], "pull")
+
+
+class RetryBackoffTest(RadioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.add_handle("bob", ref="herdr:w1:p1")
+        self._fetch = radio.fetch_pane
+        self._push = radio.push_to_pane
+        self.addCleanup(self._restore)
+        self.push_calls = []
+
+    def _restore(self):
+        radio.fetch_pane = self._fetch
+        radio.push_to_pane = self._push
+
+    def tick(self, push_result=(True, None)):
+        radio.fetch_pane = lambda pane_id: {"label": "bob"}
+
+        def push(pane_id, text):
+            self.push_calls.append(text)
+            return push_result
+
+        radio.push_to_pane = push
+        return radio.relay_tick(self.conn)
+
+    def test_errored_delivery_backs_off_then_retries(self):
+        mid = self.pm("alice", "bob", "hi")
+        self.tick((False, "wedged"))
+        row = self.delivery_row(mid)
+        self.assertEqual(row["attempts"], 1)
+        self.assertIsNotNone(row["last_attempt_at"])
+        self.assertEqual(len(self.push_calls), 1)
+        # Inside RETRY_AFTER_S the errored delivery is not selected again.
+        self.tick((False, "wedged"))
+        self.assertEqual(len(self.push_calls), 1)
+        # Back-dated past the window it becomes due and is retried.
+        self.backdate_attempt(mid, radio.RETRY_AFTER_S + 10)
+        self.tick((False, "wedged"))
+        self.assertEqual(len(self.push_calls), 2)
+
+    def test_fresh_delivery_is_always_selected(self):
+        mid = self.pm("alice", "bob", "hi")
+        self.tick()
+        row = self.delivery_row(mid)
+        self.assertEqual(row["status"], "delivered")
+        self.assertIsNotNone(row["last_attempt_at"])  # attempts stamp on success too
+        self.assertEqual(len(self.push_calls), 1)
+
+    def test_fresh_first_ordering(self):
+        m1 = self.pm("alice", "bob", "old, errored once")
+        self.tick((False, "wedged"))
+        self.backdate_attempt(m1, radio.RETRY_AFTER_S + 10)  # due for retry
+        m2 = self.pm("alice", "bob", "new mail")
+        self.push_calls.clear()
+        self.tick()
+        self.assertEqual(len(self.push_calls), 2)
+        self.assertIn(f"id={m2}", self.push_calls[0])  # fresh mail goes first
+        self.assertIn(f"id={m1}", self.push_calls[1])
+
+    def test_agent_blocked_defer_stamps_nothing(self):
+        mid = self.pm("alice", "bob", "hi")
+        self.tick((False, "agent_blocked"))
+        row = self.delivery_row(mid)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 0)
+        self.assertIsNone(row["last_attempt_at"])
+
+
+class CompareAndSwapTest(RadioTestCase):
+    def test_ack_during_push_is_not_overwritten(self):
+        self.add_handle("bob", ref="herdr:w1:p1")
+        mid = self.pm("alice", "bob", "hi")
+        delivery_id = self.delivery_row(mid)["id"]
+        orig_fetch = radio.fetch_pane
+        self.addCleanup(setattr, radio, "fetch_pane", orig_fetch)
+        radio.fetch_pane = lambda pane_id: {"label": "bob"}
+        orig_push = radio.push_to_pane
+        self.addCleanup(setattr, radio, "push_to_pane", orig_push)
+
+        def push(pane_id, text):
+            # A cmd_show-style ack lands between the relay's SELECT and UPDATE.
+            self.conn.execute(
+                "UPDATE deliveries SET status='delivered', delivered_at='ack-ts' "
+                "WHERE id = ? AND status IN ('pending', 'pull', 'failed')",
+                (delivery_id,),
+            )
+            return True, None
+
+        radio.push_to_pane = push
+        events = radio.relay_tick(self.conn)
+        row = self.delivery_row(mid)
+        # The CAS update must not clobber the ack or claim the delivery.
+        self.assertEqual(row["status"], "delivered")
+        self.assertEqual(row["delivered_at"], "ack-ts")
+        self.assertFalse(any(e.startswith(f"#{delivery_id} ") for e in events))
+
+
+class ChangedEventsTest(RadioTestCase):
+    def test_fingerprinting(self):
+        seen = {}
+        waiting = "#3 -> bob (w1:p1) waiting: agent blocked"
+        self.assertEqual(radio.changed_events([waiting], seen), [waiting])
+        self.assertEqual(radio.changed_events([waiting], seen), [])  # repeat suppressed
+        moved = "#3 -> bob (w1:p1) delivered"
+        self.assertEqual(radio.changed_events([moved], seen), [moved])  # changed text prints
+        batch = ["tick done", "#4 -> bob: no live pane, left for pull"]
+        self.assertEqual(radio.changed_events(batch, seen), batch)
+        # Non-delivery events print every time.
+        self.assertEqual(radio.changed_events(["tick done"], seen), ["tick done"])
+
+
+class TimeoutSplitTest(RadioTestCase):
+    def setUp(self):
+        super().setUp()
+        self._subprocess = radio.subprocess
+        self.addCleanup(self._restore)
+        self.timeouts = []
+
+    def _restore(self):
+        radio.subprocess = self._subprocess
+
+    def install_stub(self, returncode=0, stdout="{}"):
+        import subprocess as real_subprocess
+        timeouts = self.timeouts
+
+        class Stub:
+            TimeoutExpired = real_subprocess.TimeoutExpired
+            CompletedProcess = real_subprocess.CompletedProcess
+
+            @staticmethod
+            def run(cmd, **kwargs):
+                timeouts.append(kwargs.get("timeout"))
+                return real_subprocess.CompletedProcess(
+                    cmd, returncode, stdout=stdout, stderr=""
+                )
+
+        radio.subprocess = Stub
+
+    def test_read_path_uses_read_timeout(self):
+        self.install_stub(stdout='{"result": {"pane": {"label": "x"}}}')
+        pane = radio.fetch_pane("w1:p1")
+        self.assertEqual(pane, {"label": "x"})
+        self.assertEqual(self.timeouts, [radio.HERDR_READ_TIMEOUT])
+
+    def test_send_path_uses_send_timeout(self):
+        self.install_stub(returncode=0)
+        ok, error = radio.push_to_pane("w1:p1", "hi")
+        self.assertEqual((ok, error), (True, None))
+        self.assertEqual(self.timeouts, [radio.HERDR_SEND_TIMEOUT])
+
+
+class CrashSafeRelayTest(RadioTestCase):
+    def test_tick_error_is_logged_and_the_daemon_survives(self):
+        orig_tick = radio.relay_tick
+        self.addCleanup(setattr, radio, "relay_tick", orig_tick)
+        calls = []
+
+        def flaky_tick(conn):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            raise KeyboardInterrupt  # the only way out of the daemon loop
+
+        radio.relay_tick = flaky_tick
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(KeyboardInterrupt):
+                radio.cmd_relay(argparse.Namespace(interval=0.01))
+        out = buf.getvalue()
+        # The injected RuntimeError was logged, not propagated; the loop kept
+        # going until the KeyboardInterrupt (not caught by `except Exception`).
+        self.assertIn("relay tick error: boom", out)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":
