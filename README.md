@@ -6,7 +6,7 @@
   A local message bus for agents running in <a href="https://herdr.dev">Herdr</a> panes.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.6-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.2.5-7dcfff?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/python-3.8%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux-e0af68?style=flat-square" alt="platform">
@@ -28,6 +28,18 @@ Several agent CLIs running side by side can't talk to each other. AgentRadio giv
 - **push delivery** — the relay drops envelopes into live panes; agents never poll
 - **briefing on join** — agents learn the protocol through a system channel, not a wasted first turn
 - **payloads by reference** — `--ref /path/to/file` sends a pointer, not pasted text
+
+## Design decisions
+
+AgentRadio is the deliberately reduced form of a richer in-house radio bus that runs inside a multi-agent harness we operate. The reduction is the feature: every mechanism here earns its place by per-token cost, because every briefing and every delivered message lands in an agent's context window.
+
+Deliberately excluded:
+
+- **Rooms / broadcast.** A room message reaches mostly the wrong agents, and every one of them pays tokens for it. DMs only; `radio handles` answers "who is here" without fan-out.
+- **Task / handoff tracking.** A shared task board means durable coordination state — ownership, lifecycle, conflict semantics — which roughly doubles the complexity of the bus. A working model of this exists in the harness we reduced from, and we know its failure modes; it may be introduced gradually on a future roadmap, deliberately, not absorbed by default. Until then, handoffs travel as refs: point to a file, keep the message short.
+- **MCP transport.** A tool schema costs context in every session permanently; a CLI costs it only when used. Agents already have a shell.
+- **Non-herdr agents (plain tmux, SSH).** The bus is a herdr plugin and presence is pane-derived; agents outside herdr are out of scope by design.
+- **Multi-machine federation.** One bus per herdr instance. Linking instances is a separate, later question.
 
 ## Install
 
@@ -139,8 +151,7 @@ The ledger lives at `$RADIO_HOME/radio.db`, or `~/.local/share/herdr-radio/radio
 ## Known issues
 
 - **Herdr agent detection vs. bundled CLIs.** Providers that ship as one bundled binary (gemini, qwen) aren't yet recognized as agents by Herdr's pane detection. Consequence: such a handle can show as `gone` while its pane is alive, and delivery falls back to `send-text`. Radio still works; the status column is the casualty. Herdr-side gap, to be fixed there.
-- **Narrow terminals.** The view layout breaks below roughly 80 columns — the stream and handles panels overlap instead of stacking. Use a wider pane for the dashboard; the CLI itself is unaffected.
-- **Named Herdr sessions.** The relay discovers panes in the default session only, so handles living in a named session don't get push delivery — their messages wait for `radio inbox` / `radio show <id>` (pull). Everything still arrives; it just isn't pushed.
+- **Named Herdr workspaces.** The relay discovers panes in the default workspace only, so handles living in another workspace don't get push delivery — their messages wait for `radio inbox` / `radio show <id>` (pull). Everything still arrives; it just isn't pushed. (Fix in progress: workspace-aware pane discovery.)
 
 ## License
 
