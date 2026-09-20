@@ -745,5 +745,54 @@ class CrashSafeRelayTest(RadioTestCase):
         self.assertEqual(len(calls), 2)
 
 
+# The view module sys.exit()s at import when textual is missing; guard so the
+# suite still runs with a stdlib-only interpreter.
+try:
+    _vloader = importlib.machinery.SourceFileLoader("radio_view", str(REPO / "bin" / "radio-view"))
+    _vspec = importlib.util.spec_from_file_location("radio_view", REPO / "bin" / "radio-view", loader=_vloader)
+    radio_view = importlib.util.module_from_spec(_vspec)
+    _vspec.loader.exec_module(radio_view)
+    HAS_VIEW = True
+except SystemExit:
+    radio_view = None
+    HAS_VIEW = False
+
+
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+class SidebarPolicyTest(unittest.TestCase):
+    """Responsive sidebar policy (radio-view): auto-hide below NARROW_COLS,
+    manual toggle wins over width."""
+
+    def test_auto_threshold(self):
+        # Below the threshold the fixed sidebar would starve the stream.
+        self.assertFalse(radio_view.sidebar_visible(radio_view.NARROW_COLS - 1, None))
+        self.assertTrue(radio_view.sidebar_visible(radio_view.NARROW_COLS, None))
+        self.assertTrue(radio_view.sidebar_visible(200, None))
+
+    def test_forced_overrides_width(self):
+        self.assertTrue(radio_view.sidebar_visible(40, True))
+        self.assertFalse(radio_view.sidebar_visible(200, False))
+
+
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+class CompactRosterTest(RadioTestCase):
+    """Compact header roster: live handles inline, the rest as +N."""
+
+    def test_live_inline_dead_counted(self):
+        self.add_handle("kimi", ref="herdr:1-1")
+        self.add_handle("codex", ref="manual")  # no pane binding -> pull dot
+        handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
+        states = {"1-1": {"label": "kimi", "agent": None, "agent_status": "idle"}}
+        roster = radio_view.compact_roster(handles, states)
+        self.assertEqual(roster.plain, "●kimi +1")
+
+    def test_all_dead_is_only_the_count(self):
+        self.add_handle("kimi", ref="manual")
+        self.add_handle("codex", ref="herdr:9-9")  # pane gone -> ✗
+        handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
+        roster = radio_view.compact_roster(handles, {})
+        self.assertEqual(roster.plain, " +2")
+
+
 if __name__ == "__main__":
     unittest.main()
