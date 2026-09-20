@@ -48,9 +48,22 @@ def herdr(*args: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def pane_states() -> dict[str, dict]:
-    """Live panes keyed by pane id; empty when herdr is unavailable."""
-    result = herdr("pane", "list")
+def workspace_ids() -> list[str] | None:
+    """All workspace ids, or None when `workspace list` fails or parses bad —
+    callers then fall back to default-workspace-only behavior."""
+    result = herdr("workspace", "list")
+    if not result or result.returncode != 0:
+        return None
+    try:
+        workspaces = json.loads(result.stdout).get("result", {}).get("workspaces", [])
+    except json.JSONDecodeError:
+        return None
+    return [w["workspace_id"] for w in workspaces if w.get("workspace_id")]
+
+
+def _pane_list(*extra: str) -> dict[str, dict]:
+    """One `pane list` call, parsed to the pane-id-keyed map; empty on any failure."""
+    result = herdr("pane", "list", *extra)
     if not result or result.returncode != 0:
         return {}
     try:
@@ -58,6 +71,23 @@ def pane_states() -> dict[str, dict]:
     except json.JSONDecodeError:
         return {}
     return {p["pane_id"]: p for p in panes if p.get("pane_id")}
+
+
+def pane_states() -> dict[str, dict]:
+    """Live panes keyed by pane id, merged across every workspace — pane ids
+    carry their workspace prefix (w2:p1), so the merge cannot collide and a
+    handle living outside the default workspace still gets a real liveness
+    dot. Falls back to the plain default-workspace listing when
+    `workspace list` is unavailable, and skips a workspace that vanishes
+    mid-scan. bin/radio needs no such scan: herdr resolves workspace-prefixed
+    pane ids in `pane get`/`send-text`/`send-keys` directly (verified)."""
+    ids = workspace_ids()
+    if ids is None:
+        return _pane_list()
+    states: dict[str, dict] = {}
+    for wid in ids:
+        states.update(_pane_list("--workspace", wid))
+    return states
 
 
 def relay_alive() -> bool:
