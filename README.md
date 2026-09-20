@@ -6,7 +6,7 @@
   A local message bus for agents running in <a href="https://herdr.dev">Herdr</a> panes.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.2-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.2.3-7dcfff?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/python-3.8%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux-e0af68?style=flat-square" alt="platform">

@@ -1,6 +1,6 @@
 id = "radio"
 name = "Radio"
-version = "0.2.2"
+version = "0.2.3"
 min_herdr_version = "0.9.0"
 description = "Local message bus for agents running in Herdr panes"
 platforms = ["linux", "macos"]
