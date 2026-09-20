@@ -26,12 +26,14 @@ from pathlib import Path
 
 HERDR_SEND_TIMEOUT = 15
 MAX_DELIVERY_ATTEMPTS = 5
+VERSION = "0.2.1"
 
 
 def state_dir() -> Path:
-    # One well-known ledger per machine. HERDR_PLUGIN_STATE_DIR is deliberately
-    # NOT used: the CLI runs from arbitrary panes and shells that never carry
-    # plugin env, so the ledger must resolve to the same path everywhere.
+    """The one well-known ledger dir per machine: $RADIO_HOME, else
+    ~/.local/share/herdr-radio. HERDR_PLUGIN_STATE_DIR is deliberately NOT
+    used: the CLI runs from arbitrary panes and shells that never carry
+    plugin env, so the ledger must resolve to the same path everywhere."""
     override = os.environ.get("RADIO_HOME")
     if override:
         return Path(override).expanduser()
@@ -80,10 +82,13 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_target ON deliveries(target, status);
 
 
 def now() -> str:
+    """Current UTC time in ISO-8601 millis — the ledger's only time format."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def connect() -> sqlite3.Connection:
+    """Open the SQLite ledger (creating it and the schema as needed), apply
+    any pending column migrations, and return a Row-factory connection."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -100,16 +105,20 @@ def connect() -> sqlite3.Connection:
 
 
 def herdr_bin() -> str:
+    """Path to the herdr CLI: $HERDR_BIN_PATH, else PATH lookup, else the bare name."""
     return os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr") or "herdr"
 
 
 def herdr(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run one herdr CLI invocation with captured output and a timeout."""
     return subprocess.run(
         [herdr_bin(), *args], text=True, capture_output=True, timeout=HERDR_SEND_TIMEOUT
     )
 
 
 def herdr_json(*args: str) -> dict | None:
+    """Run herdr and parse stdout as JSON; None on any failure (missing
+    binary, timeout, nonzero exit, or undecodable output)."""
     try:
         result = herdr(*args)
     except (OSError, subprocess.TimeoutExpired):
@@ -123,6 +132,7 @@ def herdr_json(*args: str) -> dict | None:
 
 
 def fetch_pane(pane_id: str) -> dict | None:
+    """Live pane record from herdr, or None when the pane is gone or herdr is unreachable."""
     data = herdr_json("pane", "get", pane_id)
     if not data:
         return None
@@ -130,18 +140,21 @@ def fetch_pane(pane_id: str) -> dict | None:
 
 
 def current_session_ref() -> str:
+    """This process's own binding: 'herdr:<pane-id>' inside a Herdr pane, else 'manual'."""
     if os.environ.get("HERDR_ENV") == "1" and os.environ.get("HERDR_PANE_ID"):
         return f"herdr:{os.environ['HERDR_PANE_ID']}"
     return "manual"
 
 
 def pane_id_of(session_ref: str) -> str | None:
+    """Pane id carried by a 'herdr:' session ref; None for manual refs."""
     if session_ref.startswith("herdr:"):
         return session_ref.removeprefix("herdr:")
     return None
 
 
 def pane_exists(pane_id: str) -> bool:
+    """True when herdr still knows this pane; False on any lookup failure."""
     try:
         return herdr("pane", "get", pane_id).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -213,6 +226,8 @@ def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
 
 
 def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str) -> None:
+    """Queue delivery of a message to a handle: 'pending' (relay pushes) when
+    the target is bound to a pane, else 'pull' (recipient reads via inbox/show)."""
     row = conn.execute(
         "SELECT session_ref FROM handles WHERE name = ?", (target,)
     ).fetchone()
@@ -232,6 +247,8 @@ PROVIDERS = ("claude", "codex", "kimi", "pi", "gemini", "qwen", "opencode")
 
 
 def auth_status(provider: str) -> str:
+    """Human-readable auth state for a provider, probed from its on-disk
+    credentials/config; 'auth unknown' for providers without a known probe."""
     if provider == "claude":
         home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
         if (home / ".credentials.json").exists():
@@ -319,6 +336,7 @@ def choose(question: str, options: list[str], default: int = 0) -> int | None:
 
 
 def _named(rows: list[dict]) -> dict | None:
+    """The most recently updated row among named-session candidates (or None)."""
     best = None
     for row in rows:
         if best is None or (row.get("updated") or 0) >= (best.get("updated") or 0):
@@ -428,6 +446,7 @@ def launch_argv(
     session_id: str | None,
     fresh: bool = False,
 ) -> list[str]:
+    """Build the provider launch/resume argv for a handle."""
     # The radio briefing rides the launch as provider-native system context:
     # invisible, spends no turn, and the relay never messages the agent itself.
     # Resume gets it too — system context is per-process, a restored transcript
@@ -481,6 +500,8 @@ def launch_argv(
 
 
 def ask_provider(handle: str) -> str:
+    """Interactive provider picker; returns the provider name, or '' when the
+    user picks 'none' (register only). Raises SystemExit on cancel."""
     options = []
     for name in PROVIDERS:
         binary = "" if shutil.which(name) else "  (not on PATH)"
@@ -493,6 +514,9 @@ def ask_provider(handle: str) -> str:
 
 
 def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Register a handle bound to the current (or given) pane, adopt or pick
+    its provider session, and — when interactive — exec the agent with the
+    radio briefing attached. Pane label and handle are kept identical."""
     interactive = not args.no_launch and sys.stdin.isatty() and sys.stdout.isatty()
 
     pane_id = args.pane
@@ -673,6 +697,9 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 
 def briefing_text(handle: str) -> str:
+    """The opening briefing every radio-launched agent gets: the handle, the
+    commands, ref-based sharing for long content, and the push-based delivery
+    contract (never poll inbox, never set timers waiting for a reply)."""
     return (
         f'You are on Radio as "{handle}". '
         "Radio is the local message bus between the agents in this workspace — "
@@ -698,6 +725,7 @@ def briefing_text(handle: str) -> str:
 
 
 def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Remove a handle and fail its still-undelivered deliveries."""
     conn.execute("DELETE FROM handles WHERE name = ?", (args.handle,))
     conn.execute(
         "UPDATE deliveries SET status='failed', last_error='handle parted' "
@@ -718,6 +746,8 @@ def record_message(
     ref: str | None = None,
     reply_required: bool = False,
 ) -> int:
+    """Insert one message row and return its id. Queuing the delivery is a
+    separate step (enqueue_delivery) so callers compose the two."""
     cur = conn.execute(
         "INSERT INTO messages(ts, kind, from_handle, to_handle, text, ref, reply_required) "
         "VALUES (?,?,?,?,?,?,?)",
@@ -730,6 +760,9 @@ LONG_MESSAGE_CHARS = 1200
 
 
 def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Record a direct message to a joined handle and queue its delivery;
+    nudges toward --ref for long texts and restates the no-poll rule for
+    reply-required sends."""
     sender = resolve_sender(conn, args.sender)
     text = " ".join(args.text)
     target = conn.execute(
@@ -784,6 +817,7 @@ def handle_status(row: sqlite3.Row) -> str:
 
 
 def cmd_handles(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
+    """Print the roster, probing each bound pane for live status."""
     rows = conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
     if not rows:
         print("no handles joined")
@@ -799,11 +833,12 @@ def cmd_handles(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
 
 
 def cmd_log(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Print the most recent messages, oldest last."""
     rows = conn.execute(
         "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (args.limit,)
     ).fetchall()
     for row in reversed(rows):
-        target = f"-> {row['to_handle']}" if row["kind"] == "pm" else f"-> #{row['room']}"
+        target = f"-> {row['to_handle'] or '-'}"
         flag = " [reply-required]" if row["reply_required"] else ""
         ref = f" (ref: {row['ref']})" if "ref" in row.keys() and row["ref"] else ""
         print(f"#{row['id']} {row['ts']} {row['from_handle']} {target}{flag}{ref}: {row['text']}")
@@ -923,6 +958,8 @@ def delivery_wait_reason(pane: dict, handle: sqlite3.Row) -> str | None:
 
 
 def relay_tick(conn: sqlite3.Connection) -> list[str]:
+    """One relay pass: backfill agent session ids join could not see, then
+    push pending deliveries. Returns human-readable event lines."""
     events: list[str] = []
     # Backfill agent session ids that join could not see while the agent was
     # still booting. Guarded by provider+label match so a reused pane never
@@ -992,13 +1029,16 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
 
 
 def cmd_view(_args: argparse.Namespace) -> int:
-    # The view lives in radio-view (Textual); delegate with the venv python.
+    """Hand off to the Textual view (bin/radio-view) via run-view.sh; replaces this process."""
     script = Path(__file__).resolve().parent / "run-view.sh"
     os.execvp("sh", ["sh", str(script)])
     return 0  # unreachable
 
 
 def cmd_relay(args: argparse.Namespace) -> int:
+    """Run the delivery relay daemon: single instance via flock, ticking
+    relay_tick on the interval, re-execing itself when the script changes on
+    disk so a deploy never leaves stale code running."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_fd = open(LOCK_PATH, "w")
     try:
@@ -1023,7 +1063,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser: one subcommand per ledger operation, plus relay/view."""
     parser = argparse.ArgumentParser(prog="radio", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("join", help="register this pane/session as a handle")
@@ -1082,6 +1124,8 @@ def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    """Dispatch argv: bare `radio` opens the view on a tty (prints help in
+    scripts); relay/view never open the ledger, everything else does."""
     args = build_parser().parse_args()
     if args.command is None:
         # Bare `radio` in a terminal opens the view; in scripts, print help.
