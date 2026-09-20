@@ -1,18 +1,32 @@
 #!/bin/sh
 # Install the Radio view dependencies (Textual) into a plugin-local venv.
-set -e
+# The view is the ONLY component needing third-party packages — the CLI and
+# relay are stdlib-only — so a failure here must not fail the plugin install:
+# warn and continue; the view lights up after a manual `sh bin/setup.sh`.
+# No `set -e`: failures are handled explicitly per section.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-if [ -x .venv/bin/python ]; then
+
+view_ready() {
+  [ -x .venv/bin/python ] && .venv/bin/python -c "import textual" >/dev/null 2>&1
+}
+
+if view_ready; then
   echo "radio view ready: $ROOT/.venv (existing)"
-elif command -v uv >/dev/null 2>&1; then
-  uv venv .venv
-  uv pip install --python .venv/bin/python "textual>=1.0"
-  echo "radio view ready: $ROOT/.venv"
 else
-  python3 -m venv .venv
-  .venv/bin/pip install "textual>=1.0"
-  echo "radio view ready: $ROOT/.venv"
+  rm -rf .venv  # a partial venv would short-circuit the readiness check above
+  if command -v uv >/dev/null 2>&1; then
+    uv venv .venv && uv pip install --python .venv/bin/python "textual>=1.0"
+  else
+    python3 -m venv .venv && .venv/bin/pip install "textual>=1.0"
+  fi
+  if view_ready; then
+    echo "radio view ready: $ROOT/.venv"
+  else
+    rm -rf .venv
+    echo "WARNING: radio view deps not installed (need python3-venv + pip/uv + PyPI access)." >&2
+    echo "  radio CLI and relay still work; the view activates after: sh $ROOT/bin/setup.sh" >&2
+  fi
 fi
 
 # kimi-code briefing hook: kimi has no append-system-prompt flag, so the

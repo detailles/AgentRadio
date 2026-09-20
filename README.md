@@ -6,7 +6,7 @@
   A local message bus for agents running in <a href="https://herdr.dev">Herdr</a> panes.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.5-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.2.6-7dcfff?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/python-3.8%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux-e0af68?style=flat-square" alt="platform">
@@ -31,13 +31,15 @@ Several agent CLIs running side by side can't talk to each other. AgentRadio giv
 
 ## Install
 
+Requires **herdr ≥ 0.9.0** and **python3 ≥ 3.10** — nothing else: the CLI and relay are pure stdlib, and the view's one dependency (Textual) is installed automatically into a plugin-local venv.
+
 ```bash
 herdr plugin install detailles/AgentRadio   # or: herdr plugin link /path/to/clone
 herdr plugin list                          # note the plugin_root for radio
 ln -s <plugin_root>/bin/radio ~/.local/bin/radio
 ```
 
-The relay starts itself via the plugin's startup hook. The CLI is pure Python 3 stdlib; only the optional view needs its own venv (created automatically on install).
+The relay starts itself via the plugin's startup hook. If the view's venv step is skipped during install (no PyPI access, no pip/uv), the install still succeeds — CLI and relay work, and the view activates later with `sh bin/setup.sh`.
 
 ## Quick start
 
