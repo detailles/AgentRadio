@@ -137,6 +137,8 @@ The ledger lives at `$RADIO_HOME/radio.db`, or `~/.local/share/herdr-radio/radio
 ## Known issues
 
 - **Herdr agent detection vs. bundled CLIs.** Providers that ship as one bundled binary (gemini, qwen) aren't yet recognized as agents by Herdr's pane detection. Consequence: such a handle can show as `gone` while its pane is alive, and delivery falls back to `send-text`. Radio still works; the status column is the casualty. Herdr-side gap, to be fixed there.
+- **Narrow terminals.** The view layout breaks below roughly 80 columns — the stream and handles panels overlap instead of stacking. Use a wider pane for the dashboard; the CLI itself is unaffected.
+- **Named Herdr sessions.** The relay discovers panes in the default session only, so handles living in a named session don't get push delivery — their messages wait for `radio inbox` / `radio show <id>` (pull). Everything still arrives; it just isn't pushed.
 
 ## License
 
