@@ -24,6 +24,7 @@ STATE_DIR = (
 DB_PATH = STATE_DIR / "radio.db"
 LOCK_PATH = STATE_DIR / "relay.lock"
 MAX_BODY_CHARS = 600
+NARROW_COLS = 80
 PATH_RE = re.compile(r"(?:[\w.@~-]+/)+[\w.@-]+")
 
 try:
@@ -122,6 +123,34 @@ def dot_for(handle: sqlite3.Row, states: dict[str, dict]) -> tuple[Text, str]:
     return Text("●", style="grey62"), status
 
 
+def sidebar_visible(term_width: int, forced: bool | None) -> bool:
+    """Sidebar policy: a manual toggle (the `h` key) wins; otherwise the
+    roster sidebar is shown only when the terminal is at least NARROW_COLS
+    wide — below that the fixed-width sidebar starves the message stream."""
+    if forced is not None:
+        return forced
+    return term_width >= NARROW_COLS
+
+
+def compact_roster(handles: list, states: dict[str, dict]) -> Text:
+    """One-line '●kimi ●codex +2' roster rendered in the header bar while the
+    sidebar is hidden: live handles inline, the rest as a trailing count."""
+    line = Text()
+    dead = 0
+    for h in handles:
+        dot, _ = dot_for(h, states)
+        if dot.plain == "●":
+            if line.plain:
+                line.append(" ")
+            line.append_text(dot)
+            line.append(str(h["name"]), style="bold")
+        else:
+            dead += 1
+    if dead:
+        line.append(f" +{dead}", style="grey50")
+    return line
+
+
 def fmt_message(m: sqlite3.Row) -> Text:
     """One styled stream line for a message row; bodies are truncated to
     MAX_BODY_CHARS and path-like spans highlighted so refs stand out."""
@@ -184,13 +213,16 @@ class RadioView(App):
         padding: 0 1;
     }
     """
-    BINDINGS = [("q", "quit", "quit"), ("r", "refresh", "refresh")]
+    BINDINGS = [("q", "quit", "quit"), ("r", "refresh", "refresh"), ("h", "toggle_handles", "handles")]
 
     def __init__(self) -> None:
         """Set up tail state: last_message_id tracks the stream watermark."""
         super().__init__()
         self.last_message_id = 0
         self.states: dict[str, str] = {}
+        self.sidebar_forced: bool | None = None
+        self._sidebar_visible = True
+        self.compact = Text()
 
     def compose(self) -> ComposeResult:
         """Build the layout: header bar, message stream, handles sidebar, footer."""
@@ -216,9 +248,26 @@ class RadioView(App):
         if rows:
             self.last_message_id = max(r["id"] for r in rows)
         self.refresh_handles()
+        self.apply_sidebar_policy()
         self.set_interval(1.0, self.poll_messages)
         self.set_interval(2.0, self.refresh_header)
         self.set_interval(4.0, self.refresh_handles)
+
+    def on_resize(self, event) -> None:
+        """Re-apply the sidebar policy when the terminal is resized."""
+        self.apply_sidebar_policy()
+
+    def apply_sidebar_policy(self) -> None:
+        """Show/hide the roster sidebar per width + manual toggle. The header
+        bar carries the compact roster while the sidebar is hidden."""
+        self._sidebar_visible = sidebar_visible(self.size.width, self.sidebar_forced)
+        self.query_one("#handles", Static).display = self._sidebar_visible
+        self.refresh_header()
+
+    def action_toggle_handles(self) -> None:
+        """The `h` key: force the sidebar on/off, overriding the width policy."""
+        self.sidebar_forced = not self._sidebar_visible
+        self.apply_sidebar_policy()
 
     def poll_messages(self) -> None:
         """Append messages newer than the watermark to the stream."""
@@ -249,25 +298,32 @@ class RadioView(App):
             f"  ·  {counts.get('pending', 0)} pending · {counts.get('failed', 0)} failed"
             f" · {counts.get('delivered', 0)} delivered",
         )
+        if not self._sidebar_visible and self.compact.plain:
+            stats.append("  ·  ", style="grey50")
+            stats.append_text(self.compact)
         self.query_one("#bar-right", Static).update(stats)
 
     def refresh_handles(self) -> None:
-        """Redraw the roster sidebar with liveness dots from live pane state."""
+        """Redraw the roster (sidebar when visible, compact line for the header
+        bar when hidden) with liveness dots from live pane state."""
         self.states = pane_states()
         with connect() as conn:
             handles = conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
-        lines = Text("Handles\n", style="bold #7dd3fc")
-        for h in handles:
-            pane_id = (
-                h["session_ref"].removeprefix("herdr:")
-                if h["session_ref"].startswith("herdr:")
-                else "pull"
-            )
-            dot, note = dot_for(h, self.states)
-            lines.append_text(dot)
-            lines.append(f" {h['name']}\n", style="bold")
-            lines.append(f"  {pane_id} {note}\n", style="grey50")
-        self.query_one("#handles", Static).update(lines)
+        self.compact = compact_roster(handles, self.states)
+        if self._sidebar_visible:
+            lines = Text("Handles\n", style="bold #7dd3fc")
+            for h in handles:
+                pane_id = (
+                    h["session_ref"].removeprefix("herdr:")
+                    if h["session_ref"].startswith("herdr:")
+                    else "pull"
+                )
+                dot, note = dot_for(h, self.states)
+                lines.append_text(dot)
+                lines.append(f" {h['name']}\n", style="bold")
+                lines.append(f"  {pane_id} {note}\n", style="grey50")
+            self.query_one("#handles", Static).update(lines)
+        self.refresh_header()
 
     def action_refresh(self) -> None:
         """Manual refresh (the `r` key): re-run every poll immediately."""
