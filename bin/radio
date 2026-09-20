@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -26,7 +27,7 @@ from pathlib import Path
 
 HERDR_SEND_TIMEOUT = 15
 MAX_DELIVERY_ATTEMPTS = 5
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 
 def state_dir() -> Path:
@@ -165,7 +166,9 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
     """Deliver one line into a pane. Agent panes get a verified submission
     (--wait: herdr confirms the agent actually started working, so a 'success'
     can no longer mean text stranded in the composer); plain shells get literal
-    text + Enter."""
+    text + Enter. Error contract for callers: 'agent_blocked' means nothing was
+    submitted (safe to retry next tick); 'delivery_unconfirmed' means the
+    submission state is UNKNOWN — never resubmit, a retry may duplicate."""
     try:
         prompted = herdr(
             "agent", "prompt", pane_id, text,
@@ -180,10 +183,11 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
             # would land in the dialog. Caller defers and retries next tick.
             return False, "agent_blocked"
         if "stalled" in prompt_err or "timeout" in prompt_err:
-            # Agent pane but the submission did not take (turn-boundary redraw
-            # race, booting, wedged TUI). Blind typing here is exactly what
-            # strands text in the composer — let the caller retry instead.
-            return False, "agent_not_accepting"
+            # --wait watches agent lifecycle state AFTER submission, so a
+            # timeout can mean the prompt was already delivered. The state is
+            # unknowable from here — the caller must not resubmit (duplicate
+            # risk) and must not blind-type (composer stranding).
+            return False, "delivery_unconfirmed"
         # Not an agent pane: type into the shell. Flatten newlines — an
         # embedded newline submits the line early and drops the rest.
         flat = " ".join(text.splitlines())
@@ -223,6 +227,20 @@ def resolve_current_handle(conn: sqlite3.Connection, explicit: str | None,
 
 def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
     return resolve_current_handle(conn, explicit, what="sender")
+
+
+HANDLE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def normalize_handle(name: str) -> str:
+    """Strip one leading '@' (agents naturally write `radio pm @foo`) and
+    validate the charset. Anything outside [A-Za-z0-9_.-] is rejected:
+    spaces or ']' would corrupt the [RADIO_MESSAGE from=...] header and the
+    pane rename."""
+    name = name.removeprefix("@")
+    if not HANDLE_RE.match(name):
+        raise SystemExit(f"invalid handle: {name!r} (allowed: letters, digits, _ . -)")
+    return name
 
 
 def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str) -> None:
@@ -534,6 +552,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         if not label:
             raise SystemExit("pass a handle, or give the pane a label first")
         handle = label
+    handle = normalize_handle(handle)
     if pane and label != handle:
         # The pane label IS the handle: it is what survives session restore and
         # what the UI shows. Keep them identical instead of tracking two names.
@@ -726,6 +745,7 @@ def briefing_text(handle: str) -> str:
 
 def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Remove a handle and fail its still-undelivered deliveries."""
+    args.handle = normalize_handle(args.handle)
     conn.execute("DELETE FROM handles WHERE name = ?", (args.handle,))
     conn.execute(
         "UPDATE deliveries SET status='failed', last_error='handle parted' "
@@ -747,7 +767,11 @@ def record_message(
     reply_required: bool = False,
 ) -> int:
     """Insert one message row and return its id. Queuing the delivery is a
-    separate step (enqueue_delivery) so callers compose the two."""
+    separate step (enqueue_delivery) so callers compose the two. Backticks
+    are normalized to quotes at this single insertion point: model-generated
+    text habitually contains them, and typed into a shell pane (the send-text
+    fallback) a backtick is shell command substitution."""
+    text = text.replace("`", "'")
     cur = conn.execute(
         "INSERT INTO messages(ts, kind, from_handle, to_handle, text, ref, reply_required) "
         "VALUES (?,?,?,?,?,?,?)",
@@ -764,6 +788,7 @@ def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     nudges toward --ref for long texts and restates the no-poll rule for
     reply-required sends."""
     sender = resolve_sender(conn, args.sender)
+    args.to = normalize_handle(args.to)
     text = " ".join(args.text)
     target = conn.execute(
         "SELECT name FROM handles WHERE name = ?", (args.to,)
@@ -1002,6 +1027,23 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             )
             events.append(f"#{delivery_id} -> {row['target']}: no live pane, left for pull")
             continue
+        # Identity guard: a live pane id proves nothing — panes get reused.
+        # Never push one handle's mail into a pane that now belongs to
+        # someone else; leave it for pull instead (mirrors handle_status).
+        if (pane.get("label") or "").casefold() != row["target"].casefold():
+            conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='pane reused' WHERE id = ?",
+                (delivery_id,),
+            )
+            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): pane reused, left for pull")
+            continue
+        if handle["agent"] and pane.get("agent") != handle["agent"]:
+            conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='agent changed' WHERE id = ?",
+                (delivery_id,),
+            )
+            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): agent changed, left for pull")
+            continue
         wait = delivery_wait_reason(pane, handle)
         if wait:
             events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: {wait}")
@@ -1009,6 +1051,16 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         ok, error = push_to_pane(pane_id, format_for_pane(row))
         if not ok and error == "agent_blocked":
             events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: agent blocked")
+            continue
+        if not ok and error == "delivery_unconfirmed":
+            # The submission may have landed despite the --wait timeout —
+            # retrying risks a duplicate. Terminal for push: pull only.
+            conn.execute(
+                "UPDATE deliveries SET status='pull', "
+                "last_error='delivery unconfirmed — left for pull, not retried' WHERE id = ?",
+                (delivery_id,),
+            )
+            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): unconfirmed, left for pull")
             continue
         if ok:
             conn.execute(
