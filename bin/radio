@@ -22,12 +22,17 @@ import time
 import tty
 import uuid
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-HERDR_SEND_TIMEOUT = 15
+# Split timeouts: one wedged herdr must not stall the relay daemon — a
+# read-only pane lookup gets 2s, a real delivery (agent prompt / send-text /
+# send-keys) gets 7s. (Was a single 15s constant covering both.)
+HERDR_READ_TIMEOUT = 2
+HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
-VERSION = "0.2.3"
+RETRY_AFTER_S = 30.0
+VERSION = "0.2.4"
 
 
 def state_dir() -> Path:
@@ -101,6 +106,9 @@ def connect() -> sqlite3.Connection:
     msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     if "reply_required" not in msg_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0")
+    del_cols = {r["name"] for r in conn.execute("PRAGMA table_info(deliveries)").fetchall()}
+    if "last_attempt_at" not in del_cols:
+        conn.execute("ALTER TABLE deliveries ADD COLUMN last_attempt_at TEXT")
     conn.commit()
     return conn
 
@@ -110,10 +118,12 @@ def herdr_bin() -> str:
     return os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr") or "herdr"
 
 
-def herdr(*args: str) -> subprocess.CompletedProcess[str]:
-    """Run one herdr CLI invocation with captured output and a timeout."""
+def herdr(*args: str, timeout: float = HERDR_READ_TIMEOUT) -> subprocess.CompletedProcess[str]:
+    """Run one herdr CLI invocation with captured output. Read-only lookups
+    take the short read timeout (default); delivery paths pass the send
+    timeout explicitly — one wedged herdr must not stall the relay."""
     return subprocess.run(
-        [herdr_bin(), *args], text=True, capture_output=True, timeout=HERDR_SEND_TIMEOUT
+        [herdr_bin(), *args], text=True, capture_output=True, timeout=timeout
     )
 
 
@@ -174,6 +184,7 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
             "agent", "prompt", pane_id, text,
             "--wait", "--until", "working", "--until", "blocked",
             "--timeout", "6000",
+            timeout=HERDR_SEND_TIMEOUT,
         )
         if prompted.returncode == 0:
             return True, None
@@ -191,12 +202,12 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
         # Not an agent pane: type into the shell. Flatten newlines — an
         # embedded newline submits the line early and drops the rest.
         flat = " ".join(text.splitlines())
-        typed = herdr("pane", "send-text", pane_id, flat)
+        typed = herdr("pane", "send-text", pane_id, flat, timeout=HERDR_SEND_TIMEOUT)
         if typed.returncode != 0:
             err = (prompt_err or typed.stderr or typed.stdout).strip()
             return False, err or "pane rejected delivery"
         time.sleep(0.4)  # let the paste land before Enter
-        entered = herdr("pane", "send-keys", pane_id, "enter")
+        entered = herdr("pane", "send-keys", pane_id, "enter", timeout=HERDR_SEND_TIMEOUT)
         if entered.returncode != 0:
             return False, (entered.stderr or "enter key rejected").strip()
         return True, None
@@ -1092,17 +1103,34 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             continue
         if handle["agent"] and pane.get("agent") != handle["agent"]:
             continue
-        conn.execute(
-            "UPDATE deliveries SET status='pending', last_error=NULL WHERE id = ?",
+        cur = conn.execute(
+            "UPDATE deliveries SET status='pending', last_error=NULL "
+            "WHERE id = ? AND status = 'pull'",
             (d["id"],),
         )
-        events.append(f"#{d['id']} -> {d['target']} ({pane_id}): pane back, re-queued for push")
+        if cur.rowcount:
+            events.append(f"#{d['id']} -> {d['target']} ({pane_id}): pane back, re-queued for push")
     conn.commit()
+    # Backoff + fresh-first: an errored delivery is retried only after
+    # RETRY_AFTER_S (each retry costs several herdr subprocess calls), and new
+    # mail always goes ahead of retries. last_attempt_at IS NULL covers rows
+    # errored before the column existed.
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=RETRY_AFTER_S)).isoformat(
+        timespec="milliseconds"
+    )
     rows = conn.execute(
         """SELECT d.id AS delivery_id, d.target, d.attempts, m.*
            FROM deliveries d JOIN messages m ON m.id = d.message_id
-           WHERE d.status = 'pending' ORDER BY d.id LIMIT 50"""
+           WHERE d.status = 'pending'
+             AND (d.attempts = 0 OR d.last_attempt_at IS NULL OR d.last_attempt_at <= ?)
+           ORDER BY CASE WHEN d.attempts = 0 THEN 0 ELSE 1 END, d.id LIMIT 50""",
+        (cutoff,),
     ).fetchall()
+    # Every delivery UPDATE below is compare-and-swap on the state it expects
+    # (AND status = 'pending'): cmd_show may have acked the row (delivered)
+    # between our SELECT and UPDATE, and an unconditional write would lose
+    # that ack. rowcount 0 means the row moved under us — the push outcome is
+    # no longer authoritative, so no event either.
     for row in rows:
         delivery_id = row["delivery_id"]
         handle = conn.execute(
@@ -1112,28 +1140,34 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         pane_id = pane_id_of(handle["session_ref"]) if handle else None
         pane = fetch_pane(pane_id) if pane_id else None
         if not pane_id or pane is None:
-            conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='no live pane' WHERE id = ?",
+            cur = conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='no live pane' "
+                "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
-            events.append(f"#{delivery_id} -> {row['target']}: no live pane, left for pull")
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {row['target']}: no live pane, left for pull")
             continue
         # Identity guard: a live pane id proves nothing — panes get reused.
         # Never push one handle's mail into a pane that now belongs to
         # someone else; leave it for pull instead (mirrors handle_status).
         if (pane.get("label") or "").casefold() != row["target"].casefold():
-            conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='pane reused' WHERE id = ?",
+            cur = conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='pane reused' "
+                "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
-            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): pane reused, left for pull")
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): pane reused, left for pull")
             continue
         if handle["agent"] and pane.get("agent") != handle["agent"]:
-            conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='agent changed' WHERE id = ?",
+            cur = conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='agent changed' "
+                "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
-            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): agent changed, left for pull")
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): agent changed, left for pull")
             continue
         wait = delivery_wait_reason(pane, handle)
         if wait:
@@ -1141,32 +1175,40 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             continue
         ok, error = push_to_pane(pane_id, format_for_pane(row))
         if not ok and error == "agent_blocked":
+            # A defer, not an attempt: no attempts increment, no last_attempt_at.
             events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: agent blocked")
             continue
+        attempted_at = now()
         if not ok and error == "delivery_unconfirmed":
             # The submission may have landed despite the --wait timeout —
             # retrying risks a duplicate. Terminal for push: pull only.
-            conn.execute(
-                "UPDATE deliveries SET status='pull', "
-                "last_error='delivery unconfirmed — left for pull, not retried' WHERE id = ?",
-                (delivery_id,),
+            cur = conn.execute(
+                "UPDATE deliveries SET status='pull', last_attempt_at=?, "
+                "last_error='delivery unconfirmed — left for pull, not retried' "
+                "WHERE id = ? AND status = 'pending'",
+                (attempted_at, delivery_id),
             )
-            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): unconfirmed, left for pull")
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): unconfirmed, left for pull")
             continue
         if ok:
-            conn.execute(
-                "UPDATE deliveries SET status='delivered', delivered_at=? WHERE id = ?",
-                (now(), delivery_id),
+            cur = conn.execute(
+                "UPDATE deliveries SET status='delivered', delivered_at=?, last_attempt_at=? "
+                "WHERE id = ? AND status = 'pending'",
+                (attempted_at, attempted_at, delivery_id),
             )
-            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) delivered")
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) delivered")
         else:
             attempts = int(row["attempts"]) + 1
             status = "failed" if attempts >= MAX_DELIVERY_ATTEMPTS else "pending"
-            conn.execute(
-                "UPDATE deliveries SET status=?, attempts=?, last_error=? WHERE id = ?",
-                (status, attempts, error, delivery_id),
+            cur = conn.execute(
+                "UPDATE deliveries SET status=?, attempts=?, last_error=?, last_attempt_at=? "
+                "WHERE id = ? AND status = 'pending'",
+                (status, attempts, error, attempted_at, delivery_id),
             )
-            events.append(f"#{delivery_id} -> {row['target']} attempt {attempts}: {error}")
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {row['target']} attempt {attempts}: {error}")
     conn.commit()
     return events
 
@@ -1176,6 +1218,22 @@ def cmd_view(_args: argparse.Namespace) -> int:
     script = Path(__file__).resolve().parent / "run-view.sh"
     os.execvp("sh", ["sh", str(script)])
     return 0  # unreachable
+
+
+def changed_events(events: list[str], seen: dict[str, str]) -> list[str]:
+    """Filter a tick's events to the ones worth printing: a stuck delivery
+    would otherwise log an identical 'waiting' line every 0.5s. Delivery
+    events (starting with '#<id>') print only when their text differs from
+    the last print for that delivery id; non-delivery events always print."""
+    out = []
+    for event in events:
+        key = event.split(" ", 1)[0] if event.startswith("#") else None
+        if key is not None:
+            if seen.get(key) == event:
+                continue
+            seen[key] = event
+        out.append(event)
+    return out
 
 
 def cmd_relay(args: argparse.Namespace) -> int:
@@ -1192,9 +1250,19 @@ def cmd_relay(args: argparse.Namespace) -> int:
     print(f"radio relay · db: {DB_PATH} · interval {args.interval}s")
     script = str(Path(__file__).resolve())
     started_mtime = Path(script).stat().st_mtime
+    seen: dict[str, str] = {}
     while True:
         with closing(connect()) as conn:
-            for event in relay_tick(conn):
+            try:
+                events = relay_tick(conn)
+            except Exception as exc:
+                # One bad tick (DB locked past timeout, a herdr hiccup
+                # escaping the wrappers, a bug) must not kill the daemon —
+                # autostart only respawns on herdr restart. KeyboardInterrupt
+                # and SystemExit still propagate.
+                print(f"[{now()}] relay tick error: {exc}", flush=True)
+                events = []
+            for event in changed_events(events, seen):
                 print(f"[{now()}] {event}", flush=True)
         time.sleep(args.interval)
         if Path(script).stat().st_mtime != started_mtime:
