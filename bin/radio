@@ -27,7 +27,7 @@ from pathlib import Path
 
 HERDR_SEND_TIMEOUT = 15
 MAX_DELIVERY_ATTEMPTS = 5
-VERSION = "0.3.0"
+VERSION = "0.2.2"
 
 
 def state_dir() -> Path:
