@@ -8,8 +8,10 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -792,6 +794,122 @@ class CompactRosterTest(RadioTestCase):
         handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
         roster = radio_view.compact_roster(handles, {})
         self.assertEqual(roster.plain, " +2")
+
+
+class WorkspaceDeliveryTest(RadioTestCase):
+    """End-to-end (monkeypatched herdr): a handle bound to a non-default
+    workspace gets push delivery. bin/radio needs no workspace scan — pane
+    ids carry the workspace prefix (w2:p1) and herdr resolves them globally
+    in pane get/send-text/send-keys (verified live against herdr)."""
+
+    def test_relay_pushes_to_non_default_workspace(self):
+        self.add_handle("bob", ref="herdr:w2:p1")
+        mid = self.pm("alice", "bob", "hi")
+        orig_fetch, orig_push = radio.fetch_pane, radio.push_to_pane
+        self.addCleanup(setattr, radio, "fetch_pane", orig_fetch)
+        self.addCleanup(setattr, radio, "push_to_pane", orig_push)
+        fetched, pushed = [], []
+        radio.fetch_pane = lambda pane_id: (fetched.append(pane_id), {"label": "bob"})[1]
+        radio.push_to_pane = lambda pane_id, text: (pushed.append(pane_id), (True, None))[1]
+        radio.relay_tick(self.conn)
+        # The workspace-prefixed id travels unchanged from ledger to herdr.
+        self.assertEqual(fetched, ["w2:p1"])
+        self.assertEqual(pushed, ["w2:p1"])
+        self.assertEqual(self.delivery_row(mid)["status"], "delivered")
+
+
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+class WorkspacePaneStatesTest(RadioTestCase):
+    """Workspace-aware pane discovery (radio-view): merge across workspaces,
+    fallback to the default scan when `workspace list` fails, skip a
+    workspace that vanishes mid-scan."""
+
+    WS_TWO = json.dumps(
+        {"result": {"workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}]}}
+    )
+
+    @staticmethod
+    def _panes(*pane_ids):
+        return json.dumps(
+            {"result": {"panes": [{"pane_id": p, "label": "x"} for p in pane_ids]}}
+        )
+
+    def setUp(self):
+        super().setUp()
+        self._herdr = radio_view.herdr
+        self.addCleanup(self._restore)
+        self.calls = []
+
+    def _restore(self):
+        radio_view.herdr = self._herdr
+
+    def install(self, routes):
+        """Script radio_view.herdr: argv tuple -> (stdout, rc), or None (binary gone)."""
+        def fake(*args):
+            self.calls.append(args)
+            route = routes.get(tuple(args), ("{}", 1))
+            if route is None:
+                return None
+            stdout, rc = route
+            return subprocess.CompletedProcess(list(args), rc, stdout=stdout, stderr="")
+
+        radio_view.herdr = fake
+
+    def test_merges_all_workspaces(self):
+        self.install({
+            ("workspace", "list"): (self.WS_TWO, 0),
+            ("pane", "list", "--workspace", "w1"): (self._panes("w1:p1"), 0),
+            ("pane", "list", "--workspace", "w2"): (self._panes("w2:p3", "w2:p4"), 0),
+        })
+        states = radio_view.pane_states()
+        self.assertEqual(set(states), {"w1:p1", "w2:p3", "w2:p4"})
+        # The default-workspace-only scan must not be used on the merged path.
+        self.assertNotIn(("pane", "list"), self.calls)
+
+    def test_workspace_list_failure_falls_back_to_default_scan(self):
+        routes = {
+            ("workspace", "list"): ("", 1),  # herdr error
+            ("pane", "list"): (self._panes("w1:p1"), 0),
+        }
+        self.install(routes)
+        self.assertEqual(set(radio_view.pane_states()), {"w1:p1"})
+        self.assertIn(("pane", "list"), self.calls)
+        # Bad JSON and a missing herdr binary fall back the same way.
+        self.calls.clear()
+        self.install({**routes, ("workspace", "list"): ("not-json", 0)})
+        self.assertEqual(set(radio_view.pane_states()), {"w1:p1"})
+        self.calls.clear()
+        self.install({**routes, ("workspace", "list"): None})
+        self.assertEqual(set(radio_view.pane_states()), {"w1:p1"})
+
+    def test_workspace_vanishing_mid_scan_is_skipped(self):
+        self.install({
+            ("workspace", "list"): (self.WS_TWO, 0),
+            ("pane", "list", "--workspace", "w1"): (self._panes("w1:p1"), 0),
+            ("pane", "list", "--workspace", "w2"): ("", 1),  # closed mid-scan
+        })
+        states = radio_view.pane_states()
+        self.assertEqual(set(states), {"w1:p1"})
+
+    def test_dot_for_handle_in_non_default_workspace(self):
+        self.add_handle("bob", ref="herdr:w2:p3")
+        row = self.conn.execute("SELECT * FROM handles WHERE name='bob'").fetchone()
+        states = {"w2:p3": {"label": "bob", "agent_status": "idle"}}
+        dot, note = radio_view.dot_for(row, states)
+        self.assertEqual((dot.plain, note), ("●", "idle"))
+
+    def test_duplicate_labels_across_workspaces_stay_keyed_by_pane_id(self):
+        # Two workspaces may hold a pane with the same label: dot_for looks
+        # the pane up by its workspace-prefixed id; the label is only the
+        # identity check, never the lookup key.
+        self.add_handle("bob", ref="herdr:w2:p1", agent="claude")
+        row = self.conn.execute("SELECT * FROM handles WHERE name='bob'").fetchone()
+        states = {
+            "w1:p1": {"label": "bob", "agent": "claude", "agent_status": "working"},
+            "w2:p1": {"label": "bob", "agent": "claude", "agent_status": "idle"},
+        }
+        dot, note = radio_view.dot_for(row, states)
+        self.assertEqual((dot.plain, note), ("●", "idle"))  # w2's pane, not w1's
 
 
 if __name__ == "__main__":
