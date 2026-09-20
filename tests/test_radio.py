@@ -30,6 +30,10 @@ spec.loader.exec_module(radio)
 class RadioTestCase(unittest.TestCase):
     def setUp(self):
         self._saved = (radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH)
+        # Hermetic identity: an ambient Herdr pane env (running the suite from
+        # inside a pane) must not leak into current_session_ref/cmd_join.
+        self._saved_env = {k: os.environ.pop(k, None)
+                           for k in ("HERDR_ENV", "HERDR_PANE_ID", "RADIO_HANDLE")}
         tmp = Path(tempfile.mkdtemp(prefix="radio-test-"))
         radio.STATE_DIR = tmp
         radio.DB_PATH = tmp / "radio.db"
@@ -39,6 +43,9 @@ class RadioTestCase(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
         radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = self._saved
+        for key, value in self._saved_env.items():
+            if value is not None:
+                os.environ[key] = value
 
     def add_handle(self, name, ref="manual", agent=None, agent_session=None,
                    last_seen=None):
@@ -405,6 +412,152 @@ class NormalizeHandleTest(RadioTestCase):
             radio.cmd_pm(self.conn, args)
         row = self.conn.execute("SELECT * FROM messages").fetchone()
         self.assertEqual(row["to_handle"], "bob")
+
+
+def join_args(handle, pane=None):
+    return argparse.Namespace(handle=handle, pane=pane, provider=None,
+                              new=False, resume=False, model=None, no_launch=True)
+
+
+class ResolveHandleTest(RadioTestCase):
+    def test_resolver_semantics(self):
+        self.add_handle("bob")
+        self.assertEqual(radio.resolve_handle(self.conn, "bob"), "bob")
+        self.assertEqual(radio.resolve_handle(self.conn, "BOB"), "bob")
+        self.assertIsNone(radio.resolve_handle(self.conn, "ghost"))
+
+    def test_ambiguous_case_variants_exit(self):
+        self.add_handle("Foo")
+        self.add_handle("foo")
+        with self.assertRaises(SystemExit):
+            radio.resolve_handle(self.conn, "FOO")
+
+    def test_pm_case_insensitive_uses_registered_spelling(self):
+        self.add_handle("bob")
+        args = argparse.Namespace(sender="alice", to="BOB", text=["hi"],
+                                  ref=None, reply_required=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_pm(self.conn, args)
+        row = self.conn.execute("SELECT * FROM messages").fetchone()
+        self.assertEqual(row["to_handle"], "bob")
+
+    def test_part_wrong_case_removes_the_right_row(self):
+        self.add_handle("bob")
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_part(self.conn, argparse.Namespace(handle="BOB"))
+        row = self.conn.execute("SELECT name FROM handles").fetchone()
+        self.assertIsNone(row)
+
+    def test_join_case_variant_upserts_existing(self):
+        self.add_handle("bob", ref="manual")
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_join(self.conn, join_args("BOB"))
+        rows = self.conn.execute(
+            "SELECT name FROM handles WHERE LOWER(name) = 'bob'"
+        ).fetchall()
+        self.assertEqual([r["name"] for r in rows], ["bob"])
+
+
+class CatchUpCompactionTest(RadioTestCase):
+    def setUp(self):
+        super().setUp()
+        self._fetch = radio.fetch_pane
+        self._pane_exists = radio.pane_exists
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        radio.fetch_pane = self._fetch
+        radio.pane_exists = self._pane_exists
+
+    def seed_backlog(self):
+        self.add_handle("bob", ref="herdr:w1:p1")
+        m1 = self.pm("alice", "bob", "plain 1")
+        m2 = self.pm("alice", "bob", "rr old", reply_required=True)
+        m3 = self.pm("alice", "bob", "rr new", reply_required=True)
+        m4 = self.pm("carol", "bob", "plain 2")
+        m5 = self.pm("carol", "bob", "rr carol", reply_required=True)
+        m6 = self.pm("alice", "bob", "gave up")
+        self.conn.execute("UPDATE deliveries SET status='failed' WHERE message_id=?",
+                          (m6,))
+        self.conn.commit()
+        return m1, m2, m3, m4, m5, m6
+
+    def statuses(self):
+        return {
+            r["message_id"]: (r["status"], r["last_error"])
+            for r in self.conn.execute("SELECT * FROM deliveries").fetchall()
+        }
+
+    def test_pane_rejoin_compacts_backlog(self):
+        m1, m2, m3, m4, m5, m6 = self.seed_backlog()
+        radio.fetch_pane = lambda pane_id: {"label": "bob"}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            radio.cmd_join(self.conn, join_args("bob", pane="w1:p1"))
+        got = self.statuses()
+        # Only the newest reply-required PM per sender stays push-worthy.
+        self.assertEqual(got[m3][0], "pending")
+        self.assertEqual(got[m5][0], "pending")
+        for mid in (m1, m2, m4):
+            self.assertEqual(got[mid], ("pull", "catch-up: read via radio inbox"))
+        # A terminal 'failed' delivery becomes fetchable again, never pushed.
+        self.assertEqual(got[m6], ("pull", "catch-up: read via radio inbox"))
+        self.assertIn("catch-up: 2 push (reply-required), 4 left for pull", buf.getvalue())
+
+    def test_manual_join_compacts_nothing(self):
+        m1, m2, m3, m4, m5, m6 = self.seed_backlog()
+        radio.pane_exists = lambda pane_id: False  # old pane gone: ref stays manual
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_join(self.conn, join_args("bob"))
+        got = self.statuses()
+        for mid in (m1, m2, m3, m4, m5):
+            self.assertEqual(got[mid][0], "pending")
+        self.assertEqual(got[m6][0], "failed")
+
+
+class RepromotionTest(RadioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.add_handle("bob", ref="herdr:w1:p1")
+        self._fetch = radio.fetch_pane
+        self._push = radio.push_to_pane
+        self.addCleanup(self._restore)
+        self.push_calls = []
+
+    def _restore(self):
+        radio.fetch_pane = self._fetch
+        radio.push_to_pane = self._push
+
+    def stranded(self, last_error):
+        mid = self.pm("alice", "bob", "hi")
+        self.conn.execute("UPDATE deliveries SET status='pull', last_error=? "
+                          "WHERE message_id=?", (last_error, mid))
+        self.conn.commit()
+        return mid
+
+    def tick(self):
+        radio.fetch_pane = lambda pane_id: {"label": "bob"}
+
+        def push(pane_id, text):
+            self.push_calls.append(pane_id)
+            return True, None
+
+        radio.push_to_pane = push
+        return radio.relay_tick(self.conn)
+
+    def test_no_live_pane_is_repromoted_and_pushed(self):
+        mid = self.stranded("no live pane")
+        self.tick()
+        self.assertEqual(self.push_calls, ["w1:p1"])
+        self.assertEqual(self.delivery_row(mid)["status"], "delivered")
+
+    def test_deliberate_pull_stays_pull(self):
+        m1 = self.stranded("catch-up: read via radio inbox")
+        m2 = self.stranded("delivery unconfirmed — left for pull, not retried")
+        self.tick()
+        self.assertEqual(self.push_calls, [])
+        self.assertEqual(self.delivery_row(m1)["status"], "pull")
+        self.assertEqual(self.delivery_row(m2)["status"], "pull")
 
 
 if __name__ == "__main__":
