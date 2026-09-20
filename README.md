@@ -32,7 +32,7 @@ Several agent CLIs running side by side can't talk to each other. AgentRadio giv
 ## Install
 
 ```bash
-herdr plugin install detaybey/AgentRadio   # or: herdr plugin link /path/to/clone
+herdr plugin install detailles/AgentRadio   # or: herdr plugin link /path/to/clone
 herdr plugin list                          # note the plugin_root for radio
 ln -s <plugin_root>/bin/radio ~/.local/bin/radio
 ```
