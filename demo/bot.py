@@ -14,6 +14,7 @@ RADIO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin", "r
 
 
 def radio(*args: str) -> None:
+    """Run the radio CLI with the current interpreter; raises on failure."""
     subprocess.run([sys.executable, RADIO, *args], check=True)
 
 
