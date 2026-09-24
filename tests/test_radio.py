@@ -1221,41 +1221,45 @@ class RelayCwdTest(RadioTestCase):
 
 class RelayUpdateTest(RadioTestCase):
     """The relay survives an in-place update: a missing or mid-replacement
-    script must not kill the daemon, and a failed re-exec is retried."""
+    script must not kill the daemon, and an on-disk change hands over to a
+    detached successor instead of a fragile re-exec."""
 
     def test_script_changed_is_false_when_unreadable(self):
         self.assertFalse(radio.script_changed("/nonexistent/radio", 1.0))
         self.assertTrue(radio.script_changed(str(REPO / "bin" / "radio"), 1.0))
 
-    def test_restart_failure_does_not_kill_the_relay(self):
-        saved = (radio.script_changed, radio.os.execv, radio.relay_tick, radio.time.sleep)
+    def test_on_disk_change_hands_over_to_a_successor(self):
+        saved = (radio.script_changed, radio.subprocess.Popen, radio.relay_tick, radio.time.sleep)
         self.addCleanup(self._restore, saved)
         radio.script_changed = lambda script, mtime: True
+        spawned = []
 
-        def bad_execv(*_args):
-            raise OSError("file busy")
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                spawned.append((argv, kwargs))
 
-        radio.os.execv = bad_execv
-        calls = []
-
-        def tick(_conn):
-            calls.append(1)
-            if len(calls) >= 2:
-                raise KeyboardInterrupt
-            return []
-
-        radio.relay_tick = tick
+        radio.subprocess.Popen = FakePopen
+        radio.relay_tick = lambda _conn: []
         radio.time.sleep = lambda _seconds: None
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            with self.assertRaises(KeyboardInterrupt):
-                radio.cmd_relay(argparse.Namespace(interval=0.01))
-        self.assertIn("restart failed", buf.getvalue())
-        self.assertEqual(len(calls), 2)
+            rc = radio.cmd_relay(argparse.Namespace(interval=0.01))
+        self.assertEqual(rc, 0)
+        self.assertIn("restarting relay", buf.getvalue())
+        self.assertEqual(len(spawned), 1)
+        argv, kwargs = spawned[0]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1], str((REPO / "bin" / "radio").resolve()))
+        self.assertEqual(argv[2:4], ["relay", "--interval"])
+        self.assertEqual(kwargs["cwd"], str(radio.STATE_DIR))
+        # The lock was released before the successor starts.
+        probe = open(radio.LOCK_PATH, "a+")
+        self.addCleanup(probe.close)
+        self.assertTrue(radio.relay_lock(probe))
 
     @staticmethod
     def _restore(saved):
-        radio.script_changed, radio.os.execv, radio.relay_tick, radio.time.sleep = saved
+        radio.script_changed, radio.subprocess.Popen, radio.relay_tick, radio.time.sleep = saved
 
 
 class CrashSafeRelayTest(RadioTestCase):

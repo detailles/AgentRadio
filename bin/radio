@@ -1692,6 +1692,32 @@ def script_changed(script: str, started_mtime: float) -> bool:
         return False
 
 
+def restart_relay(interval: float, script: str, lock_fd) -> None:
+    """Hand the daemon over to a fresh process running the script as it is now
+    on disk: release the lock, spawn a detached successor, and let the caller
+    exit. Windows has no true exec — the CRT emulation races the lock and can
+    lose stdio — so both platforms use the same explicit handover."""
+    lock_fd.close()
+    log = open(STATE_DIR / "relay.log", "a", encoding="utf-8")
+    try:
+        subprocess.Popen(
+            [sys.executable, script, "relay", "--interval", str(interval)],
+            cwd=str(STATE_DIR),  # never hold the plugin dir: it blocks updates
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name != "nt",
+            creationflags=(
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                if os.name == "nt"
+                else 0
+            ),
+            close_fds=True,
+        )
+    finally:
+        log.close()
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     """Run the delivery relay daemon: single instance via relay_lock, ticking
     relay_tick on the interval, re-execing itself when the script changes on
@@ -1729,16 +1755,11 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 print(f"[{now()}] {event}", flush=True)
         time.sleep(args.interval)
         if script_changed(script, started_mtime):
-            # A deploy swapped the binary; re-exec so the daemon never runs
-            # stale code. The flock fd closes on exec, the new image relocks.
+            # A deploy swapped the binary: hand over to a fresh daemon so the
+            # relay never runs stale code.
             print("radio changed on disk; restarting relay", flush=True)
-            try:
-                os.execv(sys.executable, [sys.executable, script, "relay",
-                                          "--interval", str(args.interval)])
-            except OSError as exc:
-                # The file was mid-replacement; keep serving the old code and
-                # retry on the next tick.
-                print(f"relay restart failed ({exc}); retrying", flush=True)
+            restart_relay(args.interval, script, lock_fd)
+            return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
