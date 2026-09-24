@@ -1,34 +1,46 @@
 #!/usr/bin/env python3
-"""Radio view launcher: pick the plugin venv interpreter when present and exec
-bin/radio-view in it (Textual lives only in that venv).
+"""Radio view launcher: run bin/radio-view with the venv interpreter when it
+exists, else with this launcher's own interpreter (radio-view then reports the
+missing dependencies itself).
 
-Called by the manifest pane entrypoint and by `radio view`; on Windows
-bin/run-view.cmd is the pane entry that finds a Python to run this file.
-Falls back to this launcher's own interpreter when the venv is missing, and
-radio-view itself then reports the missing dependencies.
+The venv lives under the plugin state dir (~/.local/share/herdr-radio/venv),
+not in the plugin dir: a running view pane must never hold the managed plugin
+directory, or Windows refuses `herdr plugin install` updates. Called by the
+manifest pane entrypoints and by `radio view`; on Windows bin/run-view.cmd is
+the pane entry that finds a Python to run this file.
 """
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 
-def view_python(root: Path) -> Path:
-    """The interpreter for the view: the plugin-local venv when it exists
-    (POSIX: .venv/bin/python, Windows: .venv/Scripts/python.exe), else this
-    launcher's own interpreter."""
-    venv = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    return venv if venv.exists() else Path(sys.executable)
+def state_dir() -> Path:
+    """The plugin state dir, mirroring bin/radio: $RADIO_HOME, else
+    ~/.local/share/herdr-radio (the ledger lives here too)."""
+    override = os.environ.get("RADIO_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".local" / "share" / "herdr-radio"
+
+
+def view_python(venv: Path | None = None) -> Path:
+    """The interpreter for the view: the state-dir venv when it exists
+    (POSIX: bin/python, Windows: Scripts/python.exe), else this launcher's own
+    interpreter."""
+    venv = venv or state_dir() / "venv"
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return python if python.exists() else Path(sys.executable)
 
 
 def main() -> int:
     """Hand the terminal to the view. Windows runs it as a waited-for child:
     the CRT's exec would return the shell prompt while the view still runs."""
-    root = Path(__file__).resolve().parent.parent
-    python = str(view_python(root))
-    view = str(root / "bin" / "radio-view")
+    python = str(view_python())
+    view = str(Path(__file__).resolve().parent / "radio-view")
     if os.name == "nt":
+        import subprocess
+
         return subprocess.run([python, view]).returncode
     os.execv(python, [python, view])
     return 0  # unreachable

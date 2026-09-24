@@ -1,32 +1,43 @@
 #!/bin/sh
-# Install the Radio view dependencies (Textual) into a plugin-local venv.
-# The view is the ONLY component needing third-party packages — the CLI and
-# relay are stdlib-only — so a failure here must not fail the plugin install:
-# warn and continue; the view lights up after a manual `sh bin/setup.sh`.
+# Install the Radio view dependencies (Textual) into a venv under the plugin
+# state dir (~/.local/share/herdr-radio/venv). The view is the ONLY component
+# needing third-party packages — the CLI and relay are stdlib-only — so a
+# failure here must not fail the plugin install: warn and continue; the view
+# lights up after a manual `sh bin/setup.sh`.
+# The venv deliberately lives outside the plugin dir: a running view pane must
+# never hold the managed plugin directory (Windows then refuses updates).
 # No `set -e`: failures are handled explicitly per section.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE="${RADIO_HOME:-$HOME/.local/share/herdr-radio}"
+VENV="$STATE/venv"
+mkdir -p "$STATE"
 cd "$ROOT"
 
 # Make the CLI reachable right after install (see bin/link-cli.sh).
 sh "$ROOT/bin/link-cli.sh"
 
+# A pre-0.3.1 venv lived inside the plugin dir; drop it (best effort).
+if [ -d "$ROOT/.venv" ]; then
+  rm -rf "$ROOT/.venv" 2>/dev/null || true
+fi
+
 view_ready() {
-  [ -x .venv/bin/python ] && .venv/bin/python -c "import textual" >/dev/null 2>&1
+  [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import textual" >/dev/null 2>&1
 }
 
 if view_ready; then
-  echo "radio view ready: $ROOT/.venv (existing)"
+  echo "radio view ready: $VENV (existing)"
 else
-  rm -rf .venv  # a partial venv would short-circuit the readiness check above
+  rm -rf "$VENV"  # a partial venv would short-circuit the readiness check above
   if command -v uv >/dev/null 2>&1; then
-    uv venv .venv && uv pip install --python .venv/bin/python "textual>=1.0"
+    uv venv "$VENV" && uv pip install --python "$VENV/bin/python" "textual>=1.0"
   else
-    python3 -m venv .venv && .venv/bin/pip install "textual>=1.0"
+    python3 -m venv "$VENV" && "$VENV/bin/pip" install "textual>=1.0"
   fi
   if view_ready; then
-    echo "radio view ready: $ROOT/.venv"
+    echo "radio view ready: $VENV"
   else
-    rm -rf .venv
+    rm -rf "$VENV"
     echo "WARNING: radio view deps not installed (need python3-venv + pip/uv + PyPI access)." >&2
     echo "  radio CLI and relay still work; the view activates after: sh $ROOT/bin/setup.sh" >&2
   fi

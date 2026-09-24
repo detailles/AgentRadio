@@ -1562,22 +1562,24 @@ class WinShimTest(RadioTestCase):
 
 
 class ViewPythonTest(unittest.TestCase):
-    """run-view.py: prefer the plugin venv interpreter (per-platform layout),
-    fall back to the launcher's own interpreter."""
+    """run-view.py: prefer the state-dir venv interpreter (per-platform
+    layout), fall back to the launcher's own interpreter."""
 
     def setUp(self):
         self.run_view = load_bin_script("radio_run_view", "run-view.py")
 
     def test_prefers_posix_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
-            venv_python = Path(tmp) / ".venv" / "bin" / "python"
+            venv = Path(tmp) / "venv"
+            venv_python = venv / "bin" / "python"
             venv_python.parent.mkdir(parents=True)
             venv_python.write_text("")
-            self.assertEqual(self.run_view.view_python(Path(tmp)), venv_python)
+            self.assertEqual(self.run_view.view_python(venv), venv_python)
 
     def test_prefers_windows_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
-            venv_python = Path(tmp) / ".venv" / "Scripts" / "python.exe"
+            venv = Path(tmp) / "venv"
+            venv_python = venv / "Scripts" / "python.exe"
             venv_python.parent.mkdir(parents=True)
             venv_python.write_text("")
             # Module-local fake os: patching the real os.name would make
@@ -1585,11 +1587,26 @@ class ViewPythonTest(unittest.TestCase):
             saved = self.run_view.os
             self.addCleanup(setattr, self.run_view, "os", saved)
             self.run_view.os = types.SimpleNamespace(name="nt")
-            self.assertEqual(self.run_view.view_python(Path(tmp)), venv_python)
+            self.assertEqual(self.run_view.view_python(venv), venv_python)
 
     def test_falls_back_when_venv_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(self.run_view.view_python(Path(tmp)), Path(sys.executable))
+            self.assertEqual(
+                self.run_view.view_python(Path(tmp) / "venv"), Path(sys.executable)
+            )
+
+    def test_state_dir_honours_radio_home(self):
+        saved = os.environ.get("RADIO_HOME")
+        self.addCleanup(self._restore_env, saved)
+        os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
+        self.assertEqual(self.run_view.state_dir(), Path("/tmp/radio-home-test"))
+
+    @staticmethod
+    def _restore_env(saved):
+        if saved is None:
+            os.environ.pop("RADIO_HOME", None)
+        else:
+            os.environ["RADIO_HOME"] = saved
 
 
 class WorkspaceCreatedHookTest(unittest.TestCase):
