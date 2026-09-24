@@ -217,7 +217,7 @@ The ledger records a schema version. A ledger written by a newer radio is refuse
 
 - **Herdr agent detection vs. bundled CLIs.** Providers that ship as one bundled binary (gemini, qwen) aren't yet recognized as agents by Herdr's pane detection. Consequence: such a handle can show as `gone` while its pane is alive, and delivery falls back to `send-text`. Radio still works; the status column is the casualty. Herdr-side gap, to be fixed there.
 - **Windows (preview).** Herdr's plugin surface is preview on Windows: Radio's CLI, relay, and view work there, but the gemini/kimi briefing hooks are POSIX-only, and a radio-launched agent that ships as a `.cmd` shim starts through `cmd /c`.
-- **Windows updates on 0.3.0 and older.** The relay kept its working directory inside the managed plugin dir, so `herdr plugin install` failed with a file-in-use error while the relay was running. 0.3.1 moves the relay out; until you update, stop the relay once (`Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*bin\radio*relay*" } | Stop-Process -Force`) and reinstall.
+- **Windows updates on 0.3.0 and older.** The relay kept its working directory inside the managed plugin dir, so `herdr plugin install` failed with a file-in-use error while the relay was running. 0.4.0 moves the relay out; until you update, stop the relay once (`Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*bin\radio*relay*" } | Stop-Process -Force`) and reinstall.
 
 ## License
 
