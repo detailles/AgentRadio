@@ -824,47 +824,78 @@ class AccountTest(RadioTestCase):
             rc = radio.cmd_account(self.conn, args)
         return rc, buf.getvalue()
 
-    def test_default_dirs_follow_the_harness_convention(self):
-        self.assertEqual(radio.default_account_dir("codex", "codex"), Path.home() / ".codex")
+    def test_default_homes_follow_the_provider_convention(self):
+        self.assertEqual(radio.default_account_home("codex", "codex"), Path.home() / ".codex")
         self.assertEqual(
-            radio.default_account_dir("codex", "codex2"), Path.home() / ".codex-account-2"
+            radio.default_account_home("codex", "codex2"), Path.home() / ".codex-account-2"
         )
         self.assertEqual(
-            radio.default_account_dir("claude", "claude3"), Path.home() / ".claude-account-3"
+            radio.default_account_home("claude", "claude3"), Path.home() / ".claude-account-3"
         )
 
-    def test_account_env_maps_provider_homes(self):
+    def test_account_env_combines_home_and_overrides(self):
         self.assertEqual(
-            radio.account_env({"provider": "codex", "dir": r"C:\x"}), {"CODEX_HOME": r"C:\x"}
+            radio.account_env({"provider": "codex", "home": r"C:\x", "env": "{}"}),
+            {"CODEX_HOME": r"C:\x"},
         )
         self.assertEqual(
-            radio.account_env({"provider": "claude", "dir": "/x"}),
+            radio.account_env({"provider": "claude", "home": "/x", "env": "{}"}),
             {"CLAUDE_CONFIG_DIR": "/x"},
         )
         self.assertEqual(
-            radio.account_env({"provider": "kimi", "dir": "/x"}),
+            radio.account_env({"provider": "kimi", "home": "/x", "env": "{}"}),
             {"KIMI_CODE_HOME": "/x", "KIMI_HOME": "/x"},
+        )
+        # Overrides can add any variable, and they win over the home mapping.
+        self.assertEqual(
+            radio.account_env(
+                {"provider": "codex", "home": "/x", "env": '{"HTTPS_PROXY": "http://p"}'}
+            ),
+            {"CODEX_HOME": "/x", "HTTPS_PROXY": "http://p"},
+        )
+        self.assertEqual(
+            radio.account_env({"provider": "codex", "home": "/x", "env": '{"CODEX_HOME": "/y"}'}),
+            {"CODEX_HOME": "/y"},
+        )
+        # No home: only the overrides apply (the provider default is used).
+        self.assertEqual(
+            radio.account_env({"provider": "codex", "home": None, "env": '{"A": "1"}'}),
+            {"A": "1"},
         )
 
     def test_add_list_remove(self):
         tmp_home = str(radio.STATE_DIR / "codex2-home")
-        rc, out = self.run_account("add", "codex2", "--provider", "codex", "--dir", tmp_home)
+        rc, out = self.run_account("add", "codex2", "--provider", "codex", "--home", tmp_home)
         self.assertEqual(rc, 0)
         self.assertIn("codex2", out)
         row = self.conn.execute("SELECT * FROM accounts WHERE name='codex2'").fetchone()
         self.assertEqual(row["provider"], "codex")
-        self.assertEqual(row["dir"], tmp_home)
+        self.assertEqual(row["home"], tmp_home)
         self.assertTrue(Path(tmp_home).is_dir())  # the home is created for login
         rc, out = self.run_account("list")
         self.assertIn("codex2", out)
-        self.assertIn(row["dir"], out)
+        self.assertIn(row["home"], out)
         rc, out = self.run_account("remove", "codex2")
         self.assertIn("removed", out)
         self.assertIsNone(self.conn.execute("SELECT * FROM accounts").fetchone())
 
+    def test_env_overrides_are_recorded_and_listed(self):
+        tmp_home = str(radio.STATE_DIR / "proxy-home")
+        rc, out = self.run_account(
+            "add", "proxy", "--provider", "codex", "--home", tmp_home,
+            "--env", "HTTPS_PROXY=http://p", "--env", "FOO=bar",
+        )
+        self.assertIn("HTTPS_PROXY=http://p", out)
+        row = self.conn.execute("SELECT * FROM accounts WHERE name='proxy'").fetchone()
+        self.assertEqual(json.loads(row["env"]), {"HTTPS_PROXY": "http://p", "FOO": "bar"})
+        rc, out = self.run_account("list")
+        self.assertIn("HTTPS_PROXY=http://p", out)
+        with self.assertRaises(SystemExit):
+            self.run_account("add", "bad", "--provider", "codex", "--env", "NOVALUE")
+
     def test_duplicate_and_in_use_guards(self):
         self.run_account(
-            "add", "codex2", "--provider", "codex", "--dir", str(radio.STATE_DIR / "codex2-home")
+            "add", "codex2", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex2-home")
         )
         with self.assertRaises(SystemExit):
             self.run_account("add", "codex2", "--provider", "codex")
@@ -877,7 +908,7 @@ class AccountTest(RadioTestCase):
 
     def test_join_with_account_records_it(self):
         self.run_account(
-            "add", "codex2", "--provider", "codex", "--dir", str(radio.STATE_DIR / "codex2-home")
+            "add", "codex2", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex2-home")
         )
         with contextlib.redirect_stdout(io.StringIO()):
             radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="codex2"))
@@ -888,7 +919,7 @@ class AccountTest(RadioTestCase):
         with self.assertRaises(SystemExit):
             radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="ghost"))
         self.run_account(
-            "add", "codex2", "--provider", "codex", "--dir", str(radio.STATE_DIR / "codex2-home")
+            "add", "codex2", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex2-home")
         )
         args = join_args("coder", pane="w2:p1", account="codex2")
         args.provider = "claude"
@@ -972,7 +1003,7 @@ class RestoreTest(RadioTestCase):
     def test_restore_reports_the_recorded_account(self):
         self.conn.execute("UPDATE handles SET account='codex2' WHERE name='coder'")
         self.conn.execute(
-            "INSERT INTO accounts(name, provider, dir, created_at) "
+            "INSERT INTO accounts(name, provider, home, created_at) "
             "VALUES ('codex2', 'codex', '/tmp/codex2', 't')"
         )
         self.conn.commit()
@@ -1043,6 +1074,44 @@ class ScopedRosterTest(RadioTestCase):
         out = self.capture(radio.cmd_log, argparse.Namespace(limit=20))
         self.assertIn("own message", out)
         self.assertNotIn("other message", out)
+
+
+class AccountsMigrationTest(unittest.TestCase):
+    """An accounts table from the first cut stored a single `dir`; the
+    migration renames it to `home` and adds the env column."""
+
+    def test_old_accounts_shape_converges(self):
+        tmp = Path(tempfile.mkdtemp(prefix="radio-accounts-"))
+        db = tmp / "radio.db"
+        legacy = sqlite3.connect(db)
+        legacy.executescript(
+            """
+            CREATE TABLE accounts(
+              name TEXT PRIMARY KEY,
+              provider TEXT NOT NULL,
+              dir TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            INSERT INTO accounts(name, provider, dir, created_at)
+              VALUES ('codex2', 'codex', 'C:/x/.codex-account-2', 't');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+        saved = (radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH)
+        self.addCleanup(self._restore, saved)
+        radio.STATE_DIR = tmp
+        radio.DB_PATH = db
+        radio.LOCK_PATH = tmp / "relay.lock"
+        conn = radio.connect()
+        self.addCleanup(conn.close)
+        row = conn.execute("SELECT * FROM accounts WHERE name='codex2'").fetchone()
+        self.assertEqual(row["home"], "C:/x/.codex-account-2")
+        self.assertEqual(row["env"], "{}")
+
+    @staticmethod
+    def _restore(saved):
+        radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = saved
 
 
 class ScopeMigrationTest(unittest.TestCase):

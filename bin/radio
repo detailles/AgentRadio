@@ -78,7 +78,8 @@ CREATE INDEX IF NOT EXISTS idx_handles_name ON handles(name);
 CREATE TABLE IF NOT EXISTS accounts(
   name TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
-  dir TEXT NOT NULL,
+  home TEXT,                       -- config dir; NULL uses the provider's default home
+  env TEXT NOT NULL DEFAULT '{}',  -- JSON: extra environment applied at launch
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages(
@@ -182,6 +183,18 @@ def connect() -> sqlite3.Connection:
         ("target_ws", "ALTER TABLE deliveries ADD COLUMN target_ws TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in del_cols:
+            conn.execute(ddl)
+    # Accounts: the first cut stored a single dir; the model is home + env
+    # overrides now. Rename/add columns so both shapes converge.
+    acct_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    if "dir" in acct_cols and "home" not in acct_cols:
+        conn.execute("ALTER TABLE accounts RENAME COLUMN dir TO home")
+        acct_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+    for column, ddl in (
+        ("home", "ALTER TABLE accounts ADD COLUMN home TEXT"),
+        ("env", "ALTER TABLE accounts ADD COLUMN env TEXT NOT NULL DEFAULT '{}'"),
+    ):
+        if column not in acct_cols:
             conn.execute(ddl)
     # Indexes last: on a pre-scope ledger the columns they reference only
     # exist after the migrations above. idx_deliveries_scope is a new name so
@@ -539,10 +552,10 @@ DEFAULT_HOMES: dict[str, str] = {
 }
 
 
-def default_account_dir(provider: str, name: str) -> Path:
+def default_account_home(provider: str, name: str) -> Path:
     """The conventional home for an account: the provider's default dir when
-    the name is the provider itself, else ~/.<provider>-account-<suffix> —
-    matching the harness convention (~/.codex-account-2 for codex2)."""
+    the name is the provider itself, else ~/.<provider>-account-<suffix>.
+    Only a default — `--home` and `--env` express anything else."""
     if name == provider:
         return Path(DEFAULT_HOMES[provider]).expanduser()
     suffix = name[len(provider):].lstrip("-_") if name.startswith(provider) else name
@@ -562,16 +575,36 @@ def resolve_account(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
     return None
 
 
+def account_home(account: sqlite3.Row) -> Path | None:
+    """The account's config home, or None when it uses the provider default."""
+    return Path(account["home"]).expanduser() if account["home"] else None
+
+
 def account_env(account: sqlite3.Row) -> dict[str, str]:
-    """The environment variables that point a provider at this account's home."""
-    return {var: account["dir"] for var in ACCOUNT_ENV.get(account["provider"], ())}
+    """Environment applied when launching this account: the provider's home
+    variables pointed at the account home (when one is set), plus the account's
+    own overrides — any variable, so unusual setups need no code change."""
+    env: dict[str, str] = {}
+    home = account_home(account)
+    if home:
+        for var in ACCOUNT_ENV.get(account["provider"], ()):
+            env[var] = str(home)
+    try:
+        overrides = json.loads(account["env"] or "{}")
+    except (TypeError, ValueError):
+        overrides = {}
+    if isinstance(overrides, dict):
+        env.update({str(key): str(value) for key, value in overrides.items()})
+    return env
 
 
 def provider_home(provider: str, account: sqlite3.Row | None = None) -> Path:
-    """The config home for a provider launch/session search: the account's dir
-    when one is selected, else the provider's default home."""
+    """The config home for a provider launch/session search: the account's home
+    when one is set, else the provider's default home."""
     if account:
-        return Path(account["dir"]).expanduser()
+        home = account_home(account)
+        if home:
+            return home
     return Path(DEFAULT_HOMES.get(provider, "~")).expanduser()
 
 
@@ -1257,27 +1290,36 @@ def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             raise SystemExit(f"invalid account name: {name!r} (allowed: letters, digits, _ . -)")
         if resolve_account(conn, name):
             raise SystemExit(f"account already exists: {name}")
-        directory = (
-            Path(args.dir).expanduser() if args.dir else default_account_dir(args.provider, name)
+        home = (
+            Path(args.home).expanduser() if args.home else default_account_home(args.provider, name)
         )
+        overrides: dict[str, str] = {}
+        for pair in args.env or []:
+            key, sep, value = pair.partition("=")
+            if not sep or not key.strip():
+                raise SystemExit(f"invalid --env {pair!r} (expected NAME=VALUE)")
+            overrides[key.strip()] = value
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            home.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             print(f"  note: could not create the home: {exc}")
         conn.execute(
-            "INSERT INTO accounts(name, provider, dir, created_at) VALUES (?,?,?,?)",
-            (name, args.provider, str(directory), now()),
+            "INSERT INTO accounts(name, provider, home, env, created_at) VALUES (?,?,?,?,?)",
+            (name, args.provider, str(home), json.dumps(overrides), now()),
         )
         conn.commit()
-        print(f"account {name} -> {args.provider} · {directory}")
-        print(f"  {auth_status(args.provider, directory)}")
+        print(f"account {name} -> {args.provider} · {home}")
+        print(f"  {auth_status(args.provider, home)}")
+        if overrides:
+            print("  env: " + ", ".join(f"{key}={value}" for key, value in overrides.items()))
+        home_var = ACCOUNT_ENV.get(args.provider, ("<ENV>",))[0]
         print(f"  log in inside this home before relying on it "
-              f"(e.g. {ACCOUNT_ENV.get(args.provider, ('<ENV>',))[0]}={directory} {args.provider} login)")
+              f"(e.g. {home_var}={home} {args.provider} login)")
         return 0
     if command == "list":
         rows = conn.execute("SELECT * FROM accounts ORDER BY provider, name").fetchall()
         if not rows:
-            print("no accounts — add one: radio account add codex2 --provider codex")
+            print("no accounts — add one: radio account add work --provider codex --home ~/.codex-work")
             return 0
         for row in rows:
             users = [
@@ -1286,8 +1328,15 @@ def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                     "SELECT name FROM handles WHERE account = ? ORDER BY name", (row["name"],)
                 ).fetchall()
             ]
-            print(f"{row['name']:<12} {row['provider']:<8} {row['dir']}")
-            print(f"  {auth_status(row['provider'], Path(row['dir']))}")
+            home = account_home(row)
+            print(f"{row['name']:<12} {row['provider']:<8} {home or '(provider default home)'}")
+            print(f"  {auth_status(row['provider'], home)}")
+            try:
+                overrides = json.loads(row["env"] or "{}")
+            except (TypeError, ValueError):
+                overrides = {}
+            if isinstance(overrides, dict) and overrides:
+                print("  env: " + ", ".join(f"{key}={value}" for key, value in overrides.items()))
             if users:
                 print(f"  used by: {', '.join(users)}")
         return 0
@@ -1973,8 +2022,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap = acct.add_parser("add", help="register an account home")
     ap.add_argument("name")
     ap.add_argument("--provider", required=True, choices=PROVIDERS)
-    ap.add_argument("--dir", help="config home; default: the provider's convention "
-                                  "(codex2 -> ~/.codex-account-2)")
+    ap.add_argument("--home", help="config dir; default: the provider's convention "
+                                   "(codex2 -> ~/.codex-account-2)")
+    ap.add_argument("--env", action="append", metavar="NAME=VALUE",
+                    help="extra environment for the launch; repeatable")
     acct.add_parser("list", help="list accounts with auth state")
     ap = acct.add_parser("remove", help="remove an unused account")
     ap.add_argument("name")
@@ -2184,7 +2235,7 @@ def cmd_restore(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         raise SystemExit(f'could not submit the command in {pane_id}: {(entered.stderr or "").strip()}')
     print(f'restoring {row["name"]} in {pane_id}: {command}')
     if account:
-        print(f'  account: {account["name"]} ({account["dir"]})')
+        print(f'  account: {account["name"]} ({account_home(account) or "provider default home"})')
     print('the agent boots in that pane; radio handles shows it live once detected')
     return 0
 
