@@ -16,11 +16,20 @@ import sys
 
 
 def event_workspace(payload: str) -> str:
-    """The first workspace_id string anywhere in the event JSON, else ''."""
+    """The workspace the event is about: the nested `workspace.workspace_id`
+    when present, else a top-level `workspace_id`, else the first
+    workspace_id anywhere in the payload — the event shape is Herdr's to
+    change, and guessing wrong would open the view in the wrong project."""
     try:
         data = json.loads(payload)
     except (TypeError, ValueError):
         return ""
+    if isinstance(data, dict):
+        workspace = data.get("workspace")
+        if isinstance(workspace, dict) and isinstance(workspace.get("workspace_id"), str):
+            return workspace["workspace_id"]
+        if isinstance(data.get("workspace_id"), str):
+            return data["workspace_id"]
     found = ""
 
     def walk(node) -> None:
