@@ -641,6 +641,21 @@ class ScopedPmTest(RadioTestCase):
         self.assertIn('no handle "hede"', message)
         self.assertIn("w2", message)
 
+    def test_pm_warns_when_the_sender_is_not_joined(self):
+        self.add_handle("bob", workspace="w2")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            radio.cmd_pm(
+                self.conn,
+                argparse.Namespace(sender="host", to="bob", text=["hi"],
+                                   ref=None, reply_required=False),
+            )
+        self.assertIn("not a joined handle", buf.getvalue())
+        self.assertEqual(
+            self.conn.execute("SELECT from_handle FROM messages").fetchone()["from_handle"],
+            "host",
+        )
+
     def test_pm_accepts_internal_qualified_form(self):
         # Scripts outside herdr address a scoped handle as w1:name.
         self.add_handle("bob", workspace="w1")
