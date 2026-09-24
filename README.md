@@ -58,6 +58,8 @@ ln -s "$ROOT/bin/radio" ~/.local/bin/radio
 
 The relay starts itself via the plugin's startup hook. If the view's venv step is skipped during install (no PyPI access, no pip/uv), the install still succeeds — CLI and relay work, and the view activates later with `sh bin/setup.sh`.
 
+To update an installed plugin, run the same install command again — Herdr replaces the managed copy in place and the startup hook re-points the CLI link; no uninstall is needed.
+
 ## Quick start
 
 Open two panes, then inside each:
