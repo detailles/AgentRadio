@@ -7,7 +7,7 @@
   Agents join by name, talk in direct messages, and get every reply pushed straight into their pane.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.10-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.3.0-7dcfff?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/python-3.10%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux%20%7C%20windows-e0af68?style=flat-square" alt="platform">
@@ -31,6 +31,8 @@ PM-only and token-sensitive by design: no rooms, no broadcast, no chatter. A mes
 ## Highlights
 
 - **Handles, not plumbing.** A handle is a name bound to a pane, and the pane label *is* the handle.
+- **Scoped to the project.** Every Herdr workspace is its own bus — its own roster, its own names — so the same handle can live in several projects without collisions.
+- **Roles.** A handle carries a role paragraph that rides its briefing, editable any time with `radio role`.
 - **Push delivery.** The relay drops envelopes into live panes, so agents never poll.
 - **Real dialogue.** `--reply-required` marks the envelope `reply=required`. The recipient answers over radio, and that answer is pushed back the same way. Agents ask, answer, push back and agree without a human relaying.
 - **Busy-aware.** The relay holds a delivery while the target agent is mid-turn, stuck on a dialog or still booting, then pushes it when the agent can take input.
@@ -64,7 +66,7 @@ To update an installed plugin, run the same install command again. Herdr replace
 
 ### macOS and Linux
 
-The install links `radio` into `~/.local/bin` when that directory exists, and the startup hook repairs that link on every Herdr start. The managed plugin dir is content-hashed and changes on every update, so a link made by hand would dangle. If `~/.local/bin` is not on your PATH, or you want the link elsewhere, point one at the plugin root yourself:
+The install links `radio` into `~/.local/bin` when that directory exists, and the startup hook repairs that link on every Herdr start, so a reinstall or a moved plugin directory never leaves it dangling. If `~/.local/bin` is not on your PATH, or you want the link elsewhere, point one at the plugin root yourself:
 
 ```bash
 ROOT="$(herdr plugin list --json | python3 -c 'import json,sys; print(next(p["plugin_root"] for p in json.load(sys.stdin)["result"]["plugins"] if p["plugin_id"]=="radio"))')"
@@ -73,11 +75,7 @@ ln -s "$ROOT/bin/radio" ~/.local/bin/radio
 
 ### Windows (preview)
 
-The install writes a generated `radio.cmd` shim into `%USERPROFILE%\.local\bin` and the startup hook refreshes it on every update. The shim probes for `py -3`, `python`, then `python3`, so Python 3.10+ must be on PATH. Add the shim directory to your user PATH once, then open a new terminal:
-
-```powershell
-[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:USERPROFILE + '\.local\bin', 'User')
-```
+The install writes a stable `radio.cmd` shim into `%USERPROFILE%\.local\bin` — it resolves the plugin root at run time — and adds the shim directory to your user PATH automatically. Restart the terminal (and Herdr) once so already-open panes see the new PATH. `herdr plugin install` needs `git` on PATH (for example `winget install Git.Git`).
 
 Herdr's plugin support is preview on Windows: CLI, push delivery and the view work; the gemini/kimi briefing hooks are POSIX-only and are not installed there.
 
@@ -128,12 +126,14 @@ radio pm coder 'ping' --from planner
 | Command | What it does |
 |---|---|
 | `radio join <handle>` | Bind this pane to a handle; launches an agent if you pick one |
-| `radio pm <h> 'msg'` | Direct message. `--ref <file>` sends a file reference, `--reply-required` asks for an answer |
-| `radio handles` | Who is on: live, gone, or pull |
+| `radio pm <h> 'msg'` | Direct message in this project. `--ref <file>` sends a file reference, `--reply-required` asks for an answer |
+| `radio handles` | This project's roster: live, gone, or pull. Outside Herdr: every project, grouped |
+| `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
 | `radio inbox` | Index of your messages: ids, senders, status. Nothing consumed |
 | `radio show <id>` | Read one exact body; records the delivery |
-| `radio log` | Global message log |
+| `radio log` | This project's message log |
 | `radio part <h>` | Remove a handle |
+| `radio repair` | Ledger health report; `--reset` snapshots it and starts empty |
 | `radio` | Open the dashboard in the current pane |
 
 Sender resolution: `--from`, else `$RADIO_HANDLE`, else the handle bound to the current pane.
@@ -146,11 +146,17 @@ Run one word in any pane, and the dashboard adopts and labels it:
 radio
 ```
 
-It shows the live message stream (`⚠reply` marks reply-required messages), a roster with each handle's pane and live state (idle, working, pull, or a missing/reused pane), and pending/failed/delivered counts. `h` toggles the roster; below 80 columns it folds into the header bar. The relay is separate, so the view is read-only and can be opened and closed freely.
+It shows the live message stream (`⚠reply` marks reply-required messages), a roster with each handle's pane and live state (idle, working, pull, or a missing/reused pane), and pending/failed/delivered counts. It starts scoped to its workspace; `a` widens it to every workspace, where the roster groups by project. `h` toggles the roster; below 80 columns it folds into the header bar. The relay is separate, so the view is read-only and can be opened and closed freely.
 
-## Handles and panes
+## Handles, projects and panes
 
 **The pane label IS the handle.** Joining renames the pane to the handle so the two never drift, and this is what survives Herdr session restore. The pane's agent session id is recorded too, so a restored agent is matched back to its handle, and rejoining a handle offers to bring its recorded session back.
+
+**A handle belongs to its project.** Every Herdr workspace is its own scope: joining from a pane records that workspace, and inside it every command resolves there — `radio handles` lists this project's agents, `radio pm` reaches this project, `radio log` shows this project's traffic. The same name can join in several projects, and a miss says so plainly (`no handle "x" in this workspace`) instead of reaching across projects. Handles joined outside Herdr (or before scoping) live in one global namespace reachable from every project; scripts can address a scoped handle explicitly as `w1:alice`, the internal form that rosters and envelopes never show.
+
+**Roles.** `radio role <handle> "…"` stores a role paragraph on the handle, `radio role <handle>` prints it, `--clear` removes it. The paragraph rides the briefing, so the agent learns its role on its next join or resume; a role change is never pushed as a message.
+
+**New projects come with a view.** When Herdr creates a workspace, a `workspace.created` hook opens a scoped Radio view pane in it, so every project starts with its own dashboard.
 
 Delivery uses `herdr agent prompt`, falling back to `send-text` for plain shells. Handles without a live pane are marked `pull`: their messages wait for `radio inbox` / `radio show <id>`. When a handle rejoins on a live pane, only the newest reply-required message per sender is pushed; the rest of the backlog stays available through `radio inbox` instead of flooding the fresh agent.
 
@@ -189,6 +195,7 @@ AgentRadio is deliberately small. Every mechanism here earns its place by per-to
 Deliberately excluded:
 
 - **Rooms / broadcast.** A room message reaches mostly the wrong agents, and every one of them pays tokens for it. DMs only; `radio handles` answers "who is here" without fan-out.
+- **Project isolation, not rooms.** Scoping is identity: each Herdr workspace has its own names, roster and delivery, so the same handle can exist in several projects without collisions. It is not a fan-out mechanism, and agents cannot message across projects; scripts can address another project explicitly, a deliberately narrow escape hatch.
 - **Task / handoff tracking.** A shared task board means durable coordination state (ownership, lifecycle, conflict semantics), which roughly doubles the complexity of the bus. It may come later on the roadmap, introduced deliberately rather than absorbed by default. Until then, handoffs travel as refs: point to a file, keep the message short.
 - **MCP transport.** A tool schema costs context in every session permanently; a CLI costs it only when used. Agents already have a shell.
 - **Non-herdr agents (plain tmux, SSH).** The bus is a herdr plugin and presence is pane-derived; agents outside herdr are out of scope by design.
@@ -197,6 +204,8 @@ Deliberately excluded:
 ## State
 
 The ledger lives at `$RADIO_HOME/radio.db`, or `~/.local/share/herdr-radio/radio.db` by default. One well-known path per machine: the CLI is invoked from arbitrary panes, so every invocation must resolve to the same ledger.
+
+The ledger records a schema version. A ledger written by a newer radio is refused with a clear message instead of failing halfway; upgrade the plugin, or run `radio repair --reset`, which snapshots the ledger beside itself and starts empty. `radio repair` alone prints a health report (schema, integrity, counts, relay state) and changes nothing. Upgrades are one-way: an older radio cannot use a ledger a newer one has upgraded.
 
 ## Known issues
 
