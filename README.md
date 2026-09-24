@@ -54,7 +54,7 @@ flowchart LR
 
 ## Install
 
-Requires **herdr ≥ 0.9.0** and **Python 3.10+**, nothing else. The CLI and relay are pure stdlib, and the view's one dependency (Textual) is installed automatically into a plugin-local venv.
+Requires **herdr ≥ 0.9.0** and **Python 3.10+**, nothing else. The CLI and relay are pure stdlib, and the view's one dependency (Textual) is installed automatically into a venv under the plugin state dir (`~/.local/share/herdr-radio/venv`) — outside the managed plugin dir, so an open view pane never blocks an update.
 
 ```bash
 herdr plugin install detailles/AgentRadio   # or: herdr plugin link /path/to/clone
