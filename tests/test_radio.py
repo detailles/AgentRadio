@@ -1204,6 +1204,45 @@ class RelayCwdTest(RadioTestCase):
         self.assertEqual(calls, [radio.STATE_DIR])
 
 
+class RelayUpdateTest(RadioTestCase):
+    """The relay survives an in-place update: a missing or mid-replacement
+    script must not kill the daemon, and a failed re-exec is retried."""
+
+    def test_script_changed_is_false_when_unreadable(self):
+        self.assertFalse(radio.script_changed("/nonexistent/radio", 1.0))
+        self.assertTrue(radio.script_changed(str(REPO / "bin" / "radio"), 1.0))
+
+    def test_restart_failure_does_not_kill_the_relay(self):
+        saved = (radio.script_changed, radio.os.execv, radio.relay_tick, radio.time.sleep)
+        self.addCleanup(self._restore, saved)
+        radio.script_changed = lambda script, mtime: True
+
+        def bad_execv(*_args):
+            raise OSError("file busy")
+
+        radio.os.execv = bad_execv
+        calls = []
+
+        def tick(_conn):
+            calls.append(1)
+            if len(calls) >= 2:
+                raise KeyboardInterrupt
+            return []
+
+        radio.relay_tick = tick
+        radio.time.sleep = lambda _seconds: None
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(KeyboardInterrupt):
+                radio.cmd_relay(argparse.Namespace(interval=0.01))
+        self.assertIn("restart failed", buf.getvalue())
+        self.assertEqual(len(calls), 2)
+
+    @staticmethod
+    def _restore(saved):
+        radio.script_changed, radio.os.execv, radio.relay_tick, radio.time.sleep = saved
+
+
 class CrashSafeRelayTest(RadioTestCase):
     def test_tick_error_is_logged_and_the_daemon_survives(self):
         orig_tick = radio.relay_tick

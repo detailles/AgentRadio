@@ -1682,6 +1682,16 @@ def relay_lock(lock_fd) -> bool:
         return False
 
 
+def script_changed(script: str, started_mtime: float) -> bool:
+    """True when the script on disk differs from the running image; False when
+    it cannot be read — mid-update the file is briefly replaced, and that must
+    not kill the daemon."""
+    try:
+        return Path(script).stat().st_mtime != started_mtime
+    except OSError:
+        return False
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     """Run the delivery relay daemon: single instance via relay_lock, ticking
     relay_tick on the interval, re-execing itself when the script changes on
@@ -1718,12 +1728,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
             for event in changed_events(events, seen):
                 print(f"[{now()}] {event}", flush=True)
         time.sleep(args.interval)
-        if Path(script).stat().st_mtime != started_mtime:
+        if script_changed(script, started_mtime):
             # A deploy swapped the binary; re-exec so the daemon never runs
             # stale code. The flock fd closes on exec, the new image relocks.
             print("radio changed on disk; restarting relay", flush=True)
-            os.execv(sys.executable, [sys.executable, script, "relay",
-                                      "--interval", str(args.interval)])
+            try:
+                os.execv(sys.executable, [sys.executable, script, "relay",
+                                          "--interval", str(args.interval)])
+            except OSError as exc:
+                # The file was mid-replacement; keep serving the old code and
+                # retry on the next tick.
+                print(f"relay restart failed ({exc}); retrying", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
