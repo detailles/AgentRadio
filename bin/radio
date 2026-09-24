@@ -40,7 +40,7 @@ HERDR_READ_TIMEOUT = 2
 HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
-VERSION = "0.3.0"  # keep in sync with herdr-plugin.toml
+VERSION = "0.3.1"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 1  # PRAGMA user_version this build writes; a newer ledger needs a newer radio
 
 
@@ -1687,6 +1687,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
     relay_tick on the interval, re-execing itself when the script changes on
     disk so a deploy never leaves stale code running."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Leave the plugin directory: a daemon whose cwd sits inside the managed
+    # plugin dir blocks Herdr's install/update on Windows (sharing violation),
+    # so every update would need the relay killed first.
+    try:
+        os.chdir(STATE_DIR)
+    except OSError:
+        pass
     # 'a+', not 'w': Windows refuses to truncate a file whose bytes another
     # process holds locked, so the second relay must open without truncating.
     lock_fd = open(LOCK_PATH, "a+")
