@@ -40,7 +40,7 @@ HERDR_READ_TIMEOUT = 2
 HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
-VERSION = "0.2.8"  # keep in sync with herdr-plugin.toml
+VERSION = "0.3.0"  # keep in sync with herdr-plugin.toml
 
 
 def state_dir() -> Path:
@@ -61,20 +61,26 @@ LOCK_PATH = STATE_DIR / "relay.lock"
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS handles(
-  name TEXT PRIMARY KEY,
+  workspace TEXT NOT NULL DEFAULT '',     -- herdr workspace (project) id; '' = outside herdr
+  name TEXT NOT NULL,
   session_ref TEXT NOT NULL DEFAULT 'manual',
   kind TEXT NOT NULL DEFAULT 'terminal',
   agent TEXT,
   agent_session TEXT,
   briefed_at TEXT,
+  role TEXT,                              -- free-form role paragraph, carried in the briefing
   created_at TEXT NOT NULL,
-  last_seen TEXT NOT NULL
+  last_seen TEXT NOT NULL,
+  PRIMARY KEY (workspace, name)
 );
+CREATE INDEX IF NOT EXISTS idx_handles_name ON handles(name);
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
   kind TEXT NOT NULL,            -- pm
+  from_ws TEXT NOT NULL DEFAULT '',
   from_handle TEXT NOT NULL,
+  to_ws TEXT NOT NULL DEFAULT '',
   to_handle TEXT,                -- pm target
   text TEXT NOT NULL,
   ref TEXT,                      -- file reference (payload stays out of the message)
@@ -83,6 +89,7 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE TABLE IF NOT EXISTS deliveries(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id INTEGER NOT NULL REFERENCES messages(id),
+  target_ws TEXT NOT NULL DEFAULT '',
   target TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',  -- pending|delivered|pull|failed
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -90,8 +97,6 @@ CREATE TABLE IF NOT EXISTS deliveries(
   created_at TEXT NOT NULL,
   delivered_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);
-CREATE INDEX IF NOT EXISTS idx_deliveries_target ON deliveries(target, status);
 """
 
 
@@ -102,21 +107,68 @@ def now() -> str:
 
 def connect() -> sqlite3.Connection:
     """Open the SQLite ledger (creating it and the schema as needed), apply
-    any pending column migrations, and return a Row-factory connection."""
+    any pending migrations, and return a Row-factory connection."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(handles)").fetchall()}
+    # Pre-scope ledgers first: the rebuild below copies these columns, so they
+    # must exist before it runs.
     for column in ("agent", "agent_session", "briefed_at"):
         if column not in cols:
             conn.execute(f"ALTER TABLE handles ADD COLUMN {column} TEXT")
+    if "workspace" not in cols:
+        # SQLite cannot alter a primary key: rebuild the table for the scoped
+        # identity (workspace, name). Existing rows predate scoping and remain
+        # reachable as the unscoped ('') namespace.
+        conn.executescript(
+            """
+            CREATE TABLE handles_scoped(
+              workspace TEXT NOT NULL DEFAULT '',
+              name TEXT NOT NULL,
+              session_ref TEXT NOT NULL DEFAULT 'manual',
+              kind TEXT NOT NULL DEFAULT 'terminal',
+              agent TEXT,
+              agent_session TEXT,
+              briefed_at TEXT,
+              role TEXT,
+              created_at TEXT NOT NULL,
+              last_seen TEXT NOT NULL,
+              PRIMARY KEY (workspace, name)
+            );
+            INSERT INTO handles_scoped(workspace, name, session_ref, kind, agent, agent_session, briefed_at, created_at, last_seen)
+              SELECT '', name, session_ref, kind, agent, agent_session, briefed_at, created_at, last_seen FROM handles;
+            DROP TABLE handles;
+            ALTER TABLE handles_scoped RENAME TO handles;
+            CREATE INDEX IF NOT EXISTS idx_handles_name ON handles(name);
+            """
+        )
+    elif "role" not in cols:
+        conn.execute("ALTER TABLE handles ADD COLUMN role TEXT")
     msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
-    if "reply_required" not in msg_cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0")
+    for column, ddl in (
+        ("reply_required", "ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0"),
+        ("from_ws", "ALTER TABLE messages ADD COLUMN from_ws TEXT NOT NULL DEFAULT ''"),
+        ("to_ws", "ALTER TABLE messages ADD COLUMN to_ws TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in msg_cols:
+            conn.execute(ddl)
     del_cols = {r["name"] for r in conn.execute("PRAGMA table_info(deliveries)").fetchall()}
-    if "last_attempt_at" not in del_cols:
-        conn.execute("ALTER TABLE deliveries ADD COLUMN last_attempt_at TEXT")
+    for column, ddl in (
+        ("last_attempt_at", "ALTER TABLE deliveries ADD COLUMN last_attempt_at TEXT"),
+        ("target_ws", "ALTER TABLE deliveries ADD COLUMN target_ws TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in del_cols:
+            conn.execute(ddl)
+    # Indexes last: on a pre-scope ledger the columns they reference only
+    # exist after the migrations above. idx_deliveries_scope is a new name so
+    # an old (target, status) index under the same table is left untouched.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_handles_name ON handles(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deliveries_scope ON deliveries(target_ws, target, status)"
+    )
     conn.commit()
     return conn
 
@@ -223,31 +275,102 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-def resolve_current_handle(conn: sqlite3.Connection, explicit: str | None,
-                           what: str = "handle") -> str:
-    """Who is asking: explicit arg, else $RADIO_HANDLE, else the handle bound
-    to this pane (the pane label IS the handle). A given name is resolved to
-    its registered spelling so the ack path works regardless of case typed;
-    an unregistered name passes through unchanged (reads just match nothing)."""
+def current_workspace() -> str:
+    """This command's project scope: the herdr workspace id inside a pane,
+    else '' (outside herdr — the unscoped namespace)."""
+    if os.environ.get("HERDR_ENV") == "1":
+        return os.environ.get("HERDR_WORKSPACE_ID", "")
+    return ""
+
+
+def identity(workspace: str, name: str) -> str:
+    """The internal qualified form used in relay events and cross-scope
+    envelopes: 'w1:alice' for scoped handles, the bare name for unscoped."""
+    return f"{workspace}:{name}" if workspace else name
+
+
+def workspace_labels() -> dict[str, str]:
+    """Live workspace id → label map from herdr; empty when herdr is
+    unreachable (callers fall back to bare ids)."""
+    data = herdr_json("workspace", "list")
+    if not data:
+        return {}
+    labels: dict[str, str] = {}
+    for ws in data.get("result", {}).get("workspaces", []):
+        if ws.get("workspace_id"):
+            labels[str(ws["workspace_id"])] = str(ws.get("label") or "")
+    return labels
+
+
+def workspace_display(workspace: str, labels: dict[str, str] | None = None) -> str:
+    """'w2 · Servers' for humans; the bare id when the label is unknown, and
+    'no workspace' for the unscoped namespace."""
+    if not workspace:
+        return "no workspace"
+    labels = workspace_labels() if labels is None else labels
+    label = labels.get(workspace)
+    return f"{workspace} · {label}" if label else workspace
+
+
+def workspace_label(workspace: str) -> str:
+    """The live label for a workspace id, or the id itself when herdr cannot
+    answer — briefing and error paths must never depend on herdr."""
+    return workspace_labels().get(workspace) or workspace
+
+
+def resolve_workspace_spec(spec: str, conn: sqlite3.Connection | None = None) -> str:
+    """Resolve a workspace id or label typed by a human into a workspace id:
+    exact id first, then a unique case-insensitive label, then ids known in
+    the ledger when herdr cannot answer. Unknown is a SystemExit naming the
+    known workspaces."""
+    if not spec:
+        return ""
+    labels = workspace_labels()
+    if spec in labels:
+        return spec
+    matches = [ws for ws, label in labels.items() if label.casefold() == spec.casefold()]
+    if len(matches) == 1:
+        return matches[0]
+    known = set(labels)
+    if conn is not None:
+        known |= {
+            r["workspace"]
+            for r in conn.execute("SELECT DISTINCT workspace FROM handles").fetchall()
+            if r["workspace"]
+        }
+    if spec in known:
+        return spec
+    shown = ", ".join(sorted(workspace_display(ws, labels) for ws in known)) or "none"
+    raise SystemExit(f"unknown workspace: {spec} (known: {shown})")
+
+
+def resolve_identity(conn: sqlite3.Connection, explicit: str | None,
+                     what: str = "handle") -> tuple[str, str]:
+    """(workspace, name) for who is asking: the explicit argument (bare, or the
+    internal 'w1:alice' form), else $RADIO_HANDLE, else the handle bound to
+    this pane. An unregistered explicit name passes through with the caller's
+    scope so reads simply match nothing."""
+    scope = current_workspace()
     if explicit:
-        return resolve_handle(conn, explicit) or explicit
+        row = resolve_handle(conn, explicit, scope)
+        if row:
+            return row["workspace"], row["name"]
+        workspace, name = parse_handle(explicit)
+        return workspace or scope, name
     env = os.environ.get("RADIO_HANDLE")
     if env:
-        return resolve_handle(conn, env) or env
+        row = resolve_handle(conn, env, scope)
+        if row:
+            return row["workspace"], row["name"]
+        return scope, normalize_handle(env)
     ref = current_session_ref()
     if ref != "manual":
-        row = conn.execute(
-            "SELECT name FROM handles WHERE session_ref = ?", (ref,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM handles WHERE session_ref = ?", (ref,)).fetchone()
         if row:
-            return row["name"]
+            return row["workspace"], row["name"]
     raise SystemExit(
         f"{what} unknown: pass it explicitly, set RADIO_HANDLE, or join from this pane"
     )
-
-
-def resolve_sender(conn: sqlite3.Connection, explicit: str | None) -> str:
-    return resolve_current_handle(conn, explicit, what="sender")
 
 
 HANDLE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -264,36 +387,101 @@ def normalize_handle(name: str) -> str:
     return name
 
 
-def resolve_handle(conn: sqlite3.Connection, name: str) -> str | None:
-    """Resolve a typed handle name to its registered spelling. Exact match
-    wins; else a case-insensitive lookup: exactly one case-variant returns
-    the registered spelling, several spellings differing only by case are a
-    SystemExit (naming them), none returns None. Runs after normalize_handle,
-    so '@' and charset are already handled."""
-    row = conn.execute("SELECT name FROM handles WHERE name = ?", (name,)).fetchone()
+def parse_handle(spec: str) -> tuple[str, str]:
+    """Split a handle reference into (workspace, name). 'w1:alice' names a
+    workspace explicitly — the internal form scripts use from outside herdr;
+    a bare name returns workspace '', i.e. 'resolve in my own scope'."""
+    workspace, sep, name = spec.partition(":")
+    if not sep:
+        return "", normalize_handle(spec)
+    return normalize_handle(workspace), normalize_handle(name)
+
+
+def _match_in_workspace(conn: sqlite3.Connection, workspace: str,
+                        name: str) -> sqlite3.Row | None:
+    """One row by (workspace, name): exact spelling first, then a unique
+    case-insensitive variant. Several spellings differing only by case are a
+    SystemExit naming them (the pre-scope behavior); none returns None."""
+    row = conn.execute(
+        "SELECT * FROM handles WHERE workspace = ? AND name = ?", (workspace, name)
+    ).fetchone()
     if row:
-        return row["name"]
+        return row
     rows = conn.execute(
-        "SELECT name FROM handles WHERE LOWER(name) = LOWER(?)", (name,)
+        "SELECT * FROM handles WHERE workspace = ? AND LOWER(name) = LOWER(?)",
+        (workspace, name),
     ).fetchall()
     if not rows:
         return None
     if len(rows) > 1:
         names = ", ".join(sorted(r["name"] for r in rows))
         raise SystemExit(f"ambiguous handle: {name!r} matches {names} — part one first")
-    return rows[0]["name"]
+    return rows[0]
 
 
-def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str) -> None:
+def resolve_handle(conn: sqlite3.Connection, spec: str,
+                   scope: str = "") -> sqlite3.Row | None:
+    """Resolve a handle reference to its ledger row, honoring project scope.
+
+    - `w1:alice` (internal form): exactly that workspace's handle.
+    - bare name with a scope: this workspace first, then the unscoped
+      namespace (handles outside herdr, or rows that predate scoping). A
+      handle registered in another workspace is deliberately NOT reachable.
+    - bare name without a scope (outside herdr): the unscoped handle, else a
+      single scoped match anywhere, else a SystemExit listing the candidates.
+    """
+    workspace, name = parse_handle(spec)
+    if workspace:
+        return _match_in_workspace(conn, workspace, name)
+    if scope:
+        return _match_in_workspace(conn, scope, name) or _match_in_workspace(conn, "", name)
+    row = _match_in_workspace(conn, "", name)
+    if row:
+        return row
+    rows = conn.execute(
+        "SELECT * FROM handles WHERE LOWER(name) = LOWER(?)", (name,)
+    ).fetchall()
+    if len(rows) > 1:
+        names = ", ".join(sorted(identity(r["workspace"], r["name"]) for r in rows))
+        raise SystemExit(f"ambiguous handle: {name!r} matches {names} — pass a workspace")
+    return rows[0] if rows else None
+
+
+def no_handle_message(conn: sqlite3.Connection, spec: str, scope: str) -> str:
+    """The error text for an unresolved target. Inside a workspace the miss is
+    explicit about the scope and, when the name exists elsewhere, says so
+    without teaching cross-workspace addressing."""
+    workspace, name = parse_handle(spec)
+    if workspace:
+        return f'no handle "{name}" in workspace {workspace_display(workspace)}'
+    if scope:
+        message = f'no handle "{name}" in this workspace ({workspace_display(scope)})'
+        rows = conn.execute(
+            "SELECT DISTINCT workspace FROM handles "
+            "WHERE LOWER(name) = LOWER(?) AND workspace != ? AND workspace != ''",
+            (name, scope),
+        ).fetchall()
+        if rows:
+            labels = workspace_labels()
+            others = ", ".join(sorted(workspace_display(r["workspace"], labels) for r in rows))
+            message += f" — it exists in {others}, outside this workspace"
+        return message
+    return f"unknown handle: {name} (join first)"
+
+
+def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str,
+                     target_ws: str = "") -> None:
     """Queue delivery of a message to a handle: 'pending' (relay pushes) when
     the target is bound to a pane, else 'pull' (recipient reads via inbox/show)."""
     row = conn.execute(
-        "SELECT session_ref FROM handles WHERE name = ?", (target,)
+        "SELECT session_ref FROM handles WHERE workspace = ? AND name = ?",
+        (target_ws, target),
     ).fetchone()
     has_pane = bool(row and pane_id_of(row["session_ref"]))
     conn.execute(
-        "INSERT INTO deliveries(message_id, target, status, created_at) VALUES (?,?,?,?)",
-        (message_id, target, "pending" if has_pane else "pull", now()),
+        "INSERT INTO deliveries(message_id, target_ws, target, status, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (message_id, target_ws, target, "pending" if has_pane else "pull", now()),
     )
 
 
@@ -532,13 +720,15 @@ def launch_argv(
     handle: str,
     session_id: str | None,
     fresh: bool = False,
+    workspace: str = "",
+    role: str | None = None,
 ) -> list[str]:
     """Build the provider launch/resume argv for a handle."""
     # The radio briefing rides the launch as provider-native system context:
     # invisible, spends no turn, and the relay never messages the agent itself.
     # Resume gets it too — system context is per-process, a restored transcript
     # does not carry it.
-    briefing = briefing_text(handle)
+    briefing = briefing_text(handle, workspace, role)
     if provider == "claude":
         argv = ["claude", "--append-system-prompt", briefing]
         return argv + (["--resume", session_id] if session_id else []) + ["--name", handle]
@@ -648,9 +838,10 @@ def ask_provider(handle: str) -> str:
 
 
 def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Register a handle bound to the current (or given) pane, adopt or pick
-    its provider session, and — when interactive — exec the agent with the
-    radio briefing attached. Pane label and handle are kept identical."""
+    """Register a handle bound to the current (or given) pane inside its
+    workspace, adopt or pick its provider session, and — when interactive —
+    exec the agent with the radio briefing attached. Pane label and handle are
+    kept identical; the workspace comes from the pane or the caller's env."""
     interactive = not args.no_launch and sys.stdin.isatty() and sys.stdout.isatty()
 
     pane_id = args.pane
@@ -659,6 +850,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     pane = fetch_pane(pane_id) if pane_id else None
     if pane_id and pane is None:
         raise SystemExit(f"pane not found: {pane_id}")
+    workspace = (pane or {}).get("workspace_id") or current_workspace()
 
     handle = args.handle
     label = (pane or {}).get("label") or ""
@@ -669,10 +861,12 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             raise SystemExit("pass a handle, or give the pane a label first")
         handle = label
     handle = normalize_handle(handle)
-    # Case-insensitive rejoin: joining "BOB" when "bob" is registered must
-    # join THAT handle. A case-variant row would split the identity — and the
-    # label check would then report one spelling as "gone (pane reused)".
-    handle = resolve_handle(conn, handle) or handle
+    # Case-insensitive rejoin resolves inside this workspace first, then the
+    # unscoped namespace (rows that predate scoping) — never another
+    # workspace's spelling: a case-variant row would split the identity, and
+    # the label check would then report one spelling as "gone (pane reused)".
+    registered = resolve_handle(conn, handle, workspace)
+    handle = registered["name"] if registered else handle
     if pane and label != handle:
         # The pane label IS the handle: it is what survives session restore and
         # what the UI shows. Keep them identical instead of tracking two names.
@@ -682,9 +876,19 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     provider = args.provider or ""
     session_id = None
-    existing = conn.execute(
-        "SELECT session_ref, agent, agent_session FROM handles WHERE name = ?", (handle,)
-    ).fetchone()
+    existing = registered
+    if existing is not None and existing["workspace"] == "" and workspace:
+        # A pre-scope row bound to this workspace: adopt it into the scope so
+        # a rejoin never forks a duplicate row for the same pane.
+        if _match_in_workspace(conn, workspace, handle) is None:
+            conn.execute(
+                "UPDATE handles SET workspace=? WHERE workspace='' AND name=?",
+                (workspace, handle),
+            )
+            conn.commit()
+            existing = conn.execute(
+                "SELECT * FROM handles WHERE workspace=? AND name=?", (workspace, handle)
+            ).fetchone()
     if (
         existing
         and existing["agent"]
@@ -699,16 +903,20 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             bound
             and bound.get("agent") == existing["agent"]
             and (bound.get("label") or "") == handle
+            and (
+                not existing["workspace"]
+                or (bound.get("workspace_id") or "") == existing["workspace"]
+            )
         ):
             live = (bound.get("agent_session") or {}).get("value")
             if live:
                 conn.execute(
-                    "UPDATE handles SET agent_session=? WHERE name=?", (live, handle)
+                    "UPDATE handles SET agent_session=? WHERE workspace=? AND name=?",
+                    (live, workspace, handle),
                 )
                 conn.commit()
                 existing = conn.execute(
-                    "SELECT session_ref, agent, agent_session FROM handles WHERE name = ?",
-                    (handle,),
+                    "SELECT * FROM handles WHERE workspace=? AND name=?", (workspace, handle)
                 ).fetchone()
     if (
         interactive
@@ -786,19 +994,25 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         if pane_exists(old_pane):
             # A pane-less rejoin must not clobber a live pane binding.
             ref = existing["session_ref"]
+    if args.role is not None:
+        role = args.role.strip() or None  # --role "" clears the paragraph
+    else:
+        role = existing["role"] if existing else None
     ts = now()
     conn.execute(
-        """INSERT INTO handles(name, session_ref, agent, agent_session, created_at, last_seen)
-           VALUES (?,?,?,?,?,?)
-           ON CONFLICT(name) DO UPDATE SET session_ref=excluded.session_ref,
-                                           agent=excluded.agent,
-                                           agent_session=excluded.agent_session,
-                                           last_seen=excluded.last_seen""",
-        (handle, ref, provider or None, agent_session, ts, ts),
+        """INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, created_at, last_seen)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(workspace, name) DO UPDATE SET session_ref=excluded.session_ref,
+                                                      agent=excluded.agent,
+                                                      agent_session=excluded.agent_session,
+                                                      role=excluded.role,
+                                                      last_seen=excluded.last_seen""",
+        (workspace, handle, ref, provider or None, agent_session, role, ts, ts),
     )
     conn.commit()
     session_note = f", {provider} session {agent_session[:8]}" if provider and agent_session else ""
-    print(f"{handle} joined ({ref}{session_note})")
+    where_note = f" in workspace {workspace}" if workspace else ""
+    print(f"{handle} joined{where_note} ({ref}{session_note})")
 
     if ref != "manual":
         # Catch-up compaction: a handle rejoining on a live pane must not get
@@ -811,25 +1025,26 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             for r in conn.execute(
                 """SELECT MAX(m.id) AS mid
                    FROM deliveries d JOIN messages m ON m.id = d.message_id
-                   WHERE d.target = ? AND d.status = 'pending' AND m.reply_required = 1
-                   GROUP BY m.from_handle""",
-                (handle,),
+                   WHERE d.target_ws = ? AND d.target = ? AND d.status = 'pending'
+                     AND m.reply_required = 1
+                   GROUP BY m.from_ws, m.from_handle""",
+                (workspace, handle),
             ).fetchall()
         ]
         clause = ""
-        values: list[object] = [handle]
+        values: list[object] = [workspace, handle]
         if keep_ids:
             clause = f" AND message_id NOT IN ({','.join('?' * len(keep_ids))})"
             values += keep_ids
         demoted = conn.execute(
             "UPDATE deliveries SET status='pull', last_error='catch-up: read via radio inbox' "
-            f"WHERE target = ? AND status = 'pending'{clause}",
+            f"WHERE target_ws = ? AND target = ? AND status = 'pending'{clause}",
             values,
         ).rowcount
         revived = conn.execute(
             "UPDATE deliveries SET status='pull', last_error='catch-up: read via radio inbox' "
-            "WHERE target = ? AND status = 'failed'",
-            (handle,),
+            "WHERE target_ws = ? AND target = ? AND status = 'failed'",
+            (workspace, handle),
         ).rowcount
         conn.commit()
         if keep_ids or demoted or revived:
@@ -838,7 +1053,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     if not interactive or not provider:
         return 0
-    argv = launch_argv(provider, handle, session_id, fresh=fresh)
+    argv = launch_argv(provider, handle, session_id, fresh=fresh, workspace=workspace, role=role)
     env = os.environ.copy()
     env["RADIO_HANDLE"] = handle
     if provider == "opencode":
@@ -850,7 +1065,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         brief_dir = STATE_DIR / "opencode"
         brief_dir.mkdir(parents=True, exist_ok=True)
         brief_file = brief_dir / f"{handle}.md"
-        brief_file.write_text(briefing_text(handle), encoding="utf-8")
+        brief_file.write_text(briefing_text(handle, workspace, role), encoding="utf-8")
         cfg: dict = {"instructions": [str(brief_file)]}
         # Ref-based sharing means agents read files outside their cwd (the
         # sender's /tmp, another project). opencode asks on external_directory
@@ -867,14 +1082,18 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     return launch_agent(argv, env)
 
 
-def briefing_text(handle: str) -> str:
-    """The opening briefing every radio-launched agent gets: the handle, the
-    commands, ref-based sharing for long content, and the push-based delivery
-    contract (never poll inbox, never set timers waiting for a reply)."""
+def briefing_text(handle: str, workspace: str = "", role: str | None = None) -> str:
+    """The opening briefing every radio-launched agent gets: its handle, its
+    project scope, its role paragraph when one is set, the commands, ref-based
+    sharing for long content, and the push-based delivery contract (never poll
+    inbox, never set timers waiting for a reply)."""
+    where = f' in workspace "{workspace_label(workspace)}"' if workspace else ""
+    role_line = f"Your role: {role} " if role else ""
     return (
-        f'You are on Radio as "{handle}". '
-        "Radio is the local message bus between the agents in this workspace — "
-        "no need to search the filesystem for messaging tools. "
+        f'You are on Radio as "{handle}"{where}. '
+        + role_line
+        + "Radio is scoped to this workspace: `radio handles` lists this "
+        "project's agents and `radio pm <handle>` reaches this project. "
         "Commands: "
         "radio handles (who is on) · "
         'radio pm <handle> "<message>" (direct message) · '
@@ -896,20 +1115,52 @@ def briefing_text(handle: str) -> str:
 
 
 def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Remove a handle and fail its still-undelivered deliveries."""
-    args.handle = normalize_handle(args.handle)
-    resolved = resolve_handle(conn, args.handle)
-    if not resolved:
-        raise SystemExit(f"unknown handle: {args.handle}")
-    args.handle = resolved
-    conn.execute("DELETE FROM handles WHERE name = ?", (args.handle,))
+    """Remove a handle from the caller's workspace and fail its still-
+    undelivered deliveries."""
+    scope = current_workspace()
+    row = resolve_handle(conn, args.handle, scope)
+    if not row:
+        raise SystemExit(no_handle_message(conn, args.handle, scope))
+    conn.execute(
+        "DELETE FROM handles WHERE workspace = ? AND name = ?",
+        (row["workspace"], row["name"]),
+    )
     conn.execute(
         "UPDATE deliveries SET status='failed', last_error='handle parted' "
-        "WHERE target = ? AND status IN ('pending', 'pull')",
-        (args.handle,),
+        "WHERE target_ws = ? AND target = ? AND status IN ('pending', 'pull')",
+        (row["workspace"], row["name"]),
     )
     conn.commit()
-    print(f"{args.handle} parted")
+    print(f"{row['name']} parted")
+    return 0
+
+
+def cmd_role(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Show, set, or clear one handle's role paragraph in the caller's
+    workspace. The role is ledger state, not a message — a change reaches the
+    agent on its next join/resume briefing and is never pushed."""
+    scope = current_workspace()
+    row = resolve_handle(conn, args.handle, scope)
+    if not row:
+        raise SystemExit(no_handle_message(conn, args.handle, scope))
+    if args.clear:
+        conn.execute(
+            "UPDATE handles SET role = NULL WHERE workspace = ? AND name = ?",
+            (row["workspace"], row["name"]),
+        )
+        conn.commit()
+        print(f"role cleared for {row['name']}")
+        return 0
+    text = " ".join(args.text).strip()
+    if not text:
+        print(row["role"] or f"no role set for {row['name']}")
+        return 0
+    conn.execute(
+        "UPDATE handles SET role = ? WHERE workspace = ? AND name = ?",
+        (text, row["workspace"], row["name"]),
+    )
+    conn.commit()
+    print(f"role set for {row['name']} — it reaches the agent on its next join/resume")
     return 0
 
 
@@ -921,6 +1172,8 @@ def record_message(
     to_handle: str | None = None,
     ref: str | None = None,
     reply_required: bool = False,
+    from_ws: str = "",
+    to_ws: str = "",
 ) -> int:
     """Insert one message row and return its id. Queuing the delivery is a
     separate step (enqueue_delivery) so callers compose the two. Backticks
@@ -929,9 +1182,9 @@ def record_message(
     fallback) a backtick is shell command substitution."""
     text = text.replace("`", "'")
     cur = conn.execute(
-        "INSERT INTO messages(ts, kind, from_handle, to_handle, text, ref, reply_required) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (now(), kind, sender, to_handle, text, ref, int(reply_required)),
+        "INSERT INTO messages(ts, kind, from_ws, from_handle, to_ws, to_handle, text, ref, reply_required) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (now(), kind, from_ws, sender, to_ws, to_handle, text, ref, int(reply_required)),
     )
     return int(cur.lastrowid)
 
@@ -940,19 +1193,20 @@ LONG_MESSAGE_CHARS = 1200
 
 
 def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Record a direct message to a joined handle and queue its delivery;
-    nudges toward --ref for long texts and restates the no-poll rule for
-    reply-required sends."""
-    sender = resolve_sender(conn, args.sender)
+    """Record a direct message to a joined handle in the sender's workspace
+    and queue its delivery; nudges toward --ref for long texts and restates
+    the no-poll rule for reply-required sends."""
+    from_ws, sender = resolve_identity(conn, args.sender, what="sender")
     args.to = normalize_handle(args.to)
-    resolved = resolve_handle(conn, args.to)
-    if not resolved:
-        raise SystemExit(f"unknown handle: {args.to} (join first)")
-    args.to = resolved  # record/send with the registered spelling
+    row = resolve_handle(conn, args.to, from_ws)
+    if not row:
+        raise SystemExit(no_handle_message(conn, args.to, from_ws))
+    to_ws, args.to = row["workspace"], row["name"]
     text = " ".join(args.text)
     mid = record_message(conn, "pm", sender, text, to_handle=args.to,
-                         ref=args.ref, reply_required=args.reply_required)
-    enqueue_delivery(conn, mid, args.to)
+                         ref=args.ref, reply_required=args.reply_required,
+                         from_ws=from_ws, to_ws=to_ws)
+    enqueue_delivery(conn, mid, args.to, to_ws)
     conn.commit()
     print(f"pm #{mid} -> {args.to}")
     if len(text) > LONG_MESSAGE_CHARS:
@@ -977,7 +1231,9 @@ def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 def handle_status(row: sqlite3.Row) -> str:
     """Fresh liveness from the bound pane — the ledger row alone says nothing
     about whether the agent is still there (panes close, get reused, agents
-    exit; nothing parts automatically)."""
+    exit; nothing parts automatically). A moved pane gets a new
+    workspace-qualified id, so a workspace mismatch here means the row was
+    recorded against the wrong project."""
     ref = row["session_ref"]
     if not ref.startswith("herdr:"):
         return "manual"
@@ -986,6 +1242,8 @@ def handle_status(row: sqlite3.Row) -> str:
         return "gone (no live pane)"
     if (pane.get("label") or "") != row["name"]:
         return "gone (pane reused)"
+    if row["workspace"] and (pane.get("workspace_id") or "") != row["workspace"]:
+        return "gone (pane moved)"
     if row["agent"]:
         live = pane.get("agent")
         if live == row["agent"]:
@@ -996,27 +1254,69 @@ def handle_status(row: sqlite3.Row) -> str:
     return "live"
 
 
-def cmd_handles(conn: sqlite3.Connection, _args: argparse.Namespace) -> int:
-    """Print the roster, probing each bound pane for live status."""
-    rows = conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
+def handle_line(row: sqlite3.Row) -> str:
+    """One roster line plus an indented role snippet when a role is set."""
+    provider = row["agent"] or "-"
+    session = (row["agent_session"] or "-")[:8]
+    line = (
+        f"  {row['name']:<20} {handle_status(row):<26} {row['session_ref']:<14} "
+        f"{provider:<8} sess: {session:<8}"
+    )
+    role = row["role"] or ""
+    if role:
+        snippet = role[:80] + ("…" if len(role) > 80 else "")
+        line += f"\n    role: {snippet}"
+    return line
+
+
+def cmd_handles(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Print the roster: inside a pane only this workspace's handles, outside
+    herdr every handle grouped by workspace. An explicit workspace id or label
+    narrows it to that project."""
+    def scoped(workspace: str) -> int:
+        rows = conn.execute(
+            "SELECT * FROM handles WHERE workspace = ? ORDER BY name", (workspace,)
+        ).fetchall()
+        if not rows:
+            print(f"no handles in {workspace_display(workspace)}")
+        else:
+            print(f"handles in {workspace_display(workspace)}:")
+            for row in rows:
+                print(handle_line(row))
+        return 0
+
+    if args.workspace:
+        return scoped(resolve_workspace_spec(args.workspace, conn))
+    scope = current_workspace()
+    if scope:
+        return scoped(scope)
+    rows = conn.execute("SELECT * FROM handles ORDER BY workspace, name").fetchall()
     if not rows:
         print("no handles joined")
         return 0
+    labels = workspace_labels()
+    last = None
     for row in rows:
-        provider = row["agent"] or "-"
-        session = (row["agent_session"] or "-")[:8]
-        print(
-            f"{row['name']:<20} {handle_status(row):<26} {row['session_ref']:<14} "
-            f"{provider:<8} sess: {session:<8}"
-        )
+        if row["workspace"] != last:
+            last = row["workspace"]
+            print(f"{workspace_display(last, labels)}:")
+        print(handle_line(row))
     return 0
 
 
 def cmd_log(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    """Print the most recent messages, oldest last."""
-    rows = conn.execute(
-        "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (args.limit,)
-    ).fetchall()
+    """Print the most recent messages, oldest last. Inside a pane only this
+    workspace's traffic; outside herdr the full ledger."""
+    scope = current_workspace()
+    if scope:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE from_ws = ? OR to_ws = ? ORDER BY id DESC LIMIT ?",
+            (scope, scope, args.limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (args.limit,)
+        ).fetchall()
     for row in reversed(rows):
         target = f"-> {row['to_handle'] or '-'}"
         flag = " [reply-required]" if row["reply_required"] else ""
@@ -1029,16 +1329,16 @@ def cmd_inbox(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Metadata-only index of incoming messages — bodies stay out of context
     until the agent asks for one with `radio show <id>`. Listing consumes
     nothing; delivery state is recorded by the relay (push) or by show."""
-    handle = resolve_current_handle(conn, args.handle, what="inbox handle")
+    handle_ws, handle = resolve_identity(conn, args.handle, what="inbox handle")
     clause = "" if args.status == "all" else " AND d.status = ?"
-    values: list[object] = [handle]
+    values: list[object] = [handle_ws, handle]
     if args.status != "all":
         values.append(args.status)
     values.append(args.limit)
     rows = conn.execute(
         f"""SELECT d.id AS delivery_id, d.status, m.*
             FROM deliveries d JOIN messages m ON m.id = d.message_id
-            WHERE d.target = ?{clause}
+            WHERE d.target_ws = ? AND d.target = ?{clause}
             ORDER BY m.id DESC LIMIT ?""",
         values,
     ).fetchall()
@@ -1076,15 +1376,15 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         raise SystemExit(f"no message #{args.message_id}")
     print(format_for_pane(row))
     try:
-        viewer = resolve_current_handle(conn, args.by, what="reader")
+        viewer_ws, viewer = resolve_identity(conn, args.by, what="reader")
     except SystemExit:
         return 0  # reading without an identity is fine; nothing to record
-    if viewer == row["to_handle"]:
+    if (viewer_ws, viewer) == (row["to_ws"], row["to_handle"]):
         conn.execute(
             """UPDATE deliveries SET status='delivered', delivered_at=?
-               WHERE message_id = ? AND target = ?
+               WHERE message_id = ? AND target_ws = ? AND target = ?
                  AND status IN ('pending', 'pull', 'failed')""",
-            (now(), args.message_id, viewer),
+            (now(), args.message_id, viewer_ws, viewer),
         )
         conn.commit()
     return 0
@@ -1101,8 +1401,13 @@ def format_for_pane(message: sqlite3.Row) -> str:
     ref_line = ""
     if "ref" in message.keys() and message["ref"]:
         ref_line = f"\nRef: {message['ref']}"
+    from_display = message["from_handle"]
+    if message["from_ws"] and message["from_ws"] != message["to_ws"]:
+        # Cross-scope mail (a script or manual sender): the qualified form is
+        # the only address the recipient can reply to.
+        from_display = identity(message["from_ws"], message["from_handle"])
     return (
-        f"[RADIO_MESSAGE id={mid} kind=pm from={message['from_handle']} "
+        f"[RADIO_MESSAGE id={mid} kind=pm from={from_display} "
         f"to={message['to_handle']} reply={reply}]\n"
         f"Radio PM from {message['from_handle']}{reply_line}\n"
         f"{message['text']}{ref_line}\n"
@@ -1145,7 +1450,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
     # still booting. Guarded by provider+label match so a reused pane never
     # donates its session to the wrong handle.
     for h in conn.execute(
-        "SELECT name, session_ref, agent FROM handles "
+        "SELECT workspace, name, session_ref, agent FROM handles "
         "WHERE agent_session IS NULL AND agent IS NOT NULL AND session_ref LIKE 'herdr:%'"
     ).fetchall():
         pane = fetch_pane(h["session_ref"].removeprefix("herdr:"))
@@ -1153,25 +1458,30 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             not pane
             or pane.get("agent") != h["agent"]
             or (pane.get("label") or "") != h["name"]
+            or (h["workspace"] and (pane.get("workspace_id") or "") != h["workspace"])
         ):
             continue
         sess = (pane.get("agent_session") or {}).get("value")
         if sess:
             conn.execute(
-                "UPDATE handles SET agent_session=? WHERE name=?", (sess, h["name"])
+                "UPDATE handles SET agent_session=? WHERE workspace=? AND name=?",
+                (sess, h["workspace"], h["name"]),
             )
-            events.append(f"{h['name']}: backfilled {h['agent']} session {sess[:8]}")
+            events.append(
+                f"{identity(h['workspace'], h['name'])}: backfilled {h['agent']} session {sess[:8]}"
+            )
     conn.commit()
     # Re-promote deliveries stranded by downtime: 'pull' + 'no live pane'
     # means the pane was gone at push time — transient. Catch-up demotions
     # ('catch-up: read via radio inbox') and 'delivery unconfirmed' stays are
     # deliberate and must NEVER be auto-pushed; only 'no live pane' comes back.
     for d in conn.execute(
-        "SELECT id, target FROM deliveries "
+        "SELECT id, target_ws, target FROM deliveries "
         "WHERE status = 'pull' AND last_error = 'no live pane'"
     ).fetchall():
         handle = conn.execute(
-            "SELECT session_ref, agent FROM handles WHERE name = ?", (d["target"],)
+            "SELECT session_ref, agent FROM handles WHERE workspace = ? AND name = ?",
+            (d["target_ws"], d["target"]),
         ).fetchone()
         pane_id = pane_id_of(handle["session_ref"]) if handle else None
         pane = fetch_pane(pane_id) if pane_id else None
@@ -1179,6 +1489,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             continue
         # Same identity guard as the push path: a reused pane gets nothing.
         if (pane.get("label") or "").casefold() != d["target"].casefold():
+            continue
+        if d["target_ws"] and (pane.get("workspace_id") or "") != d["target_ws"]:
             continue
         if handle["agent"] and pane.get("agent") != handle["agent"]:
             continue
@@ -1188,7 +1500,10 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             (d["id"],),
         )
         if cur.rowcount:
-            events.append(f"#{d['id']} -> {d['target']} ({pane_id}): pane back, re-queued for push")
+            events.append(
+                f"#{d['id']} -> {identity(d['target_ws'], d['target'])} ({pane_id}): "
+                "pane back, re-queued for push"
+            )
     conn.commit()
     # Backoff + fresh-first: an errored delivery is retried only after
     # RETRY_AFTER_S (each retry costs several herdr subprocess calls), and new
@@ -1198,7 +1513,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         timespec="milliseconds"
     )
     rows = conn.execute(
-        """SELECT d.id AS delivery_id, d.target, d.attempts, m.*
+        """SELECT d.id AS delivery_id, d.target_ws, d.target, d.attempts, m.*
            FROM deliveries d JOIN messages m ON m.id = d.message_id
            WHERE d.status = 'pending'
              AND (d.attempts = 0 OR d.last_attempt_at IS NULL OR d.last_attempt_at <= ?)
@@ -1212,9 +1527,10 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
     # no longer authoritative, so no event either.
     for row in rows:
         delivery_id = row["delivery_id"]
+        target = identity(row["target_ws"], row["target"])
         handle = conn.execute(
-            "SELECT session_ref, agent, last_seen FROM handles WHERE name = ?",
-            (row["target"],),
+            "SELECT session_ref, agent, last_seen FROM handles WHERE workspace = ? AND name = ?",
+            (row["target_ws"], row["target"]),
         ).fetchone()
         pane_id = pane_id_of(handle["session_ref"]) if handle else None
         pane = fetch_pane(pane_id) if pane_id else None
@@ -1225,7 +1541,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                 (delivery_id,),
             )
             if cur.rowcount:
-                events.append(f"#{delivery_id} -> {row['target']}: no live pane, left for pull")
+                events.append(f"#{delivery_id} -> {target}: no live pane, left for pull")
             continue
         # Identity guard: a live pane id proves nothing — panes get reused.
         # Never push one handle's mail into a pane that now belongs to
@@ -1237,7 +1553,18 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                 (delivery_id,),
             )
             if cur.rowcount:
-                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): pane reused, left for pull")
+                events.append(f"#{delivery_id} -> {target} ({pane_id}): pane reused, left for pull")
+            continue
+        if row["target_ws"] and (pane.get("workspace_id") or "") != row["target_ws"]:
+            # A moved pane gets a fresh workspace-qualified id, so this only
+            # fires when the row's workspace was recorded wrong.
+            cur = conn.execute(
+                "UPDATE deliveries SET status='pull', last_error='workspace changed' "
+                "WHERE id = ? AND status = 'pending'",
+                (delivery_id,),
+            )
+            if cur.rowcount:
+                events.append(f"#{delivery_id} -> {target} ({pane_id}): workspace changed, left for pull")
             continue
         if handle["agent"] and pane.get("agent") != handle["agent"]:
             cur = conn.execute(
@@ -1246,16 +1573,16 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                 (delivery_id,),
             )
             if cur.rowcount:
-                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): agent changed, left for pull")
+                events.append(f"#{delivery_id} -> {target} ({pane_id}): agent changed, left for pull")
             continue
         wait = delivery_wait_reason(pane, handle)
         if wait:
-            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: {wait}")
+            events.append(f"#{delivery_id} -> {target} ({pane_id}) waiting: {wait}")
             continue
         ok, error = push_to_pane(pane_id, format_for_pane(row))
         if not ok and error == "agent_blocked":
             # A defer, not an attempt: no attempts increment, no last_attempt_at.
-            events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) waiting: agent blocked")
+            events.append(f"#{delivery_id} -> {target} ({pane_id}) waiting: agent blocked")
             continue
         attempted_at = now()
         if not ok and error == "delivery_unconfirmed":
@@ -1268,7 +1595,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                 (attempted_at, delivery_id),
             )
             if cur.rowcount:
-                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}): unconfirmed, left for pull")
+                events.append(f"#{delivery_id} -> {target} ({pane_id}): unconfirmed, left for pull")
             continue
         if ok:
             cur = conn.execute(
@@ -1277,7 +1604,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                 (attempted_at, attempted_at, delivery_id),
             )
             if cur.rowcount:
-                events.append(f"#{delivery_id} -> {row['target']} ({pane_id}) delivered")
+                events.append(f"#{delivery_id} -> {target} ({pane_id}) delivered")
         else:
             attempts = int(row["attempts"]) + 1
             status = "failed" if attempts >= MAX_DELIVERY_ATTEMPTS else "pending"
@@ -1287,7 +1614,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                 (status, attempts, error, attempted_at, delivery_id),
             )
             if cur.rowcount:
-                events.append(f"#{delivery_id} -> {row['target']} attempt {attempts}: {error}")
+                events.append(f"#{delivery_id} -> {target} attempt {attempts}: {error}")
     conn.commit()
     return events
 
@@ -1388,6 +1715,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="resume the named session without asking")
     p.add_argument("--model", help="opencode: model to run (e.g. opencode/deepseek-v4-flash); "
                                    "written into the per-handle config file")
+    p.add_argument("--role", help="role paragraph for this handle; carried in the briefing and "
+                                  "editable later with `radio role` (\"\" clears it)")
     p.add_argument("--no-launch", action="store_true", help="register only, never launch an agent")
 
     p = sub.add_parser("part", help="remove a handle")
@@ -1402,7 +1731,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reply-required", action="store_true",
                    help="mark the message as requiring a reply")
 
-    sub.add_parser("handles", help="list joined handles")
+    p = sub.add_parser("handles", help="list joined handles")
+    p.add_argument("workspace", nargs="?", help="workspace id or label to list; inside a pane "
+                                                "the roster always shows this workspace only")
+
+    p = sub.add_parser("role", help="show, set, or clear a handle's role paragraph")
+    p.add_argument("handle")
+    p.add_argument("text", nargs="*", help="the role paragraph; omitted, the current role prints")
+    p.add_argument("--clear", action="store_true", help="remove the role")
 
     p = sub.add_parser("briefing", help=argparse.SUPPRESS)  # used by provider hooks
     p.add_argument("handle")
@@ -1430,8 +1766,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Print the opening briefing for a handle. Single source of truth: the
-    launch flags (claude/codex) and provider hooks (kimi) all render this."""
-    print(briefing_text(args.handle))
+    launch flags (claude/codex) and provider hooks (kimi/gemini) all render
+    this; workspace and role come from the ledger when the handle is joined,
+    so a resumed agent re-learns both."""
+    scope = current_workspace()
+    row = resolve_handle(conn, args.handle, scope)
+    if row:
+        print(briefing_text(row["name"], row["workspace"], row["role"]))
+    else:
+        workspace, name = parse_handle(args.handle)
+        print(briefing_text(name, workspace or scope, None))
     return 0
 
 
@@ -1455,6 +1799,7 @@ def main() -> int:
             "part": cmd_part,
             "pm": cmd_pm,
             "handles": cmd_handles,
+            "role": cmd_role,
             "briefing": cmd_briefing,
             "log": cmd_log,
             "inbox": cmd_inbox,
