@@ -33,9 +33,20 @@ def view_python(venv: Path | None = None) -> Path:
     return python if python.exists() else Path(sys.executable)
 
 
+def detach_cwd() -> None:
+    """Leave the plugin directory before running the view. Herdr launches the
+    pane with the managed plugin dir as cwd; a process that keeps that cwd
+    blocks `herdr plugin install` on Windows (sharing violation)."""
+    try:
+        os.chdir(state_dir())
+    except OSError:
+        pass
+
+
 def main() -> int:
     """Hand the terminal to the view. Windows runs it as a waited-for child:
     the CRT's exec would return the shell prompt while the view still runs."""
+    detach_cwd()
     python = str(view_python())
     view = str(Path(__file__).resolve().parent / "radio-view")
     if os.name == "nt":
