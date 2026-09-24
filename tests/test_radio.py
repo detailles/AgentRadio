@@ -1182,6 +1182,21 @@ class TimeoutSplitTest(RadioTestCase):
         self.assertEqual(self.timeouts, [radio.HERDR_SEND_TIMEOUT])
 
 
+class Utf8StreamsTest(RadioTestCase):
+    """Windows pipes default to cp1252; radio forces UTF-8 so typography in
+    its output (·, ⚠, —) can never crash a command."""
+
+    def test_reconfigures_real_streams_and_ignores_replaced_ones(self):
+        buf = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        saved = sys.stdout
+        self.addCleanup(setattr, sys, "stdout", saved)
+        sys.stdout = buf
+        radio.utf8_streams()
+        self.assertEqual(buf.encoding.lower(), "utf-8")
+        sys.stdout = io.StringIO()  # replaced stream: must not raise
+        radio.utf8_streams()
+
+
 class RelayCwdTest(RadioTestCase):
     """The relay must leave the plugin directory: a daemon cwd inside the
     managed plugin dir blocks Herdr's install/update on Windows."""

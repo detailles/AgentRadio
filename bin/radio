@@ -1932,9 +1932,23 @@ def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     return 0
 
 
+def utf8_streams() -> None:
+    """Force UTF-8 on stdout/stderr. Windows pipes default to the locale codec
+    (cp1252), which cannot encode the envelopes' typography (·, ⚠, —) and
+    crashes the command that prints it; UTF-8 with replacement is what every
+    consumer of radio's output expects. No-op on POSIX and for replaced
+    streams (tests)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main() -> int:
     """Dispatch argv: bare `radio` opens the view on a tty (prints help in
     scripts); relay/view never open the ledger, everything else does."""
+    utf8_streams()
     args = build_parser().parse_args()
     if args.command is None:
         # Bare `radio` in a terminal opens the view; in scripts, print help.
