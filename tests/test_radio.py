@@ -801,6 +801,80 @@ class ScopedJoinTest(RadioTestCase):
         self.assertEqual(rows[0]["workspace"], "w2")
 
 
+class RestoreTest(RadioTestCase):
+    """radio restore: verify the pane still belongs to the handle, then type
+    the join/resume command into it; never creates layout."""
+
+    def setUp(self):
+        super().setUp()
+        self._herdr = radio.herdr
+        self._fetch = radio.fetch_pane
+        self.addCleanup(setattr, radio, "herdr", self._herdr)
+        self.addCleanup(setattr, radio, "fetch_pane", self._fetch)
+        self.calls = []
+
+        def fake_herdr(*args, **kwargs):
+            self.calls.append(args)
+            return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
+
+        radio.herdr = fake_herdr
+        self.panes = {}
+        radio.fetch_pane = lambda pane_id: self.panes.get(pane_id)
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2",
+                        agent="codex", agent_session="sess-1")
+
+    def restore(self, handle="coder"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = radio.cmd_restore(self.conn, argparse.Namespace(handle=handle))
+        return rc, buf.getvalue()
+
+    def send_text_calls(self):
+        return [call for call in self.calls if call[:2] == ("pane", "send-text")]
+
+    def test_types_the_resume_command_into_the_pane(self):
+        self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
+        rc, out = self.restore()
+        self.assertEqual(rc, 0)
+        calls = self.send_text_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2], "w2:p1")
+        self.assertIn("radio join coder --provider codex --resume", calls[0][3])
+        self.assertIn(("pane", "send-keys", "w2:p1", "enter"), self.calls)
+        self.assertIn("restoring coder", out)
+
+    def test_starts_fresh_without_a_recorded_session(self):
+        self.conn.execute("UPDATE handles SET agent_session=NULL WHERE name='coder'")
+        self.conn.commit()
+        self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
+        rc, out = self.restore()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--resume", self.send_text_calls()[0][3])
+        self.assertIn("no recorded session", out)
+
+    def test_already_running_is_a_noop(self):
+        self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2", "agent": "codex"}
+        rc, out = self.restore()
+        self.assertEqual(rc, 0)
+        self.assertIn("already running", out)
+        self.assertEqual(self.send_text_calls(), [])
+
+    def test_missing_pane_reports_what_to_do(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.restore()
+        self.assertIn("radio join coder", str(ctx.exception))
+
+    def test_foreign_agent_blocks(self):
+        self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2", "agent": "claude"}
+        with self.assertRaises(SystemExit):
+            self.restore()
+
+    def test_handle_without_provider(self):
+        self.add_handle("plain", ref="herdr:w2:p2", workspace="w2")
+        with self.assertRaises(SystemExit):
+            self.restore("plain")
+
+
 class ScopedRosterTest(RadioTestCase):
     """The roster and log are workspace-scoped inside a pane; an explicit
     workspace narrows them from outside."""
