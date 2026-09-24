@@ -53,12 +53,12 @@ class RadioTestCase(unittest.TestCase):
                 os.environ[key] = value
 
     def add_handle(self, name, ref="manual", agent=None, agent_session=None,
-                   last_seen=None, workspace="", role=None):
+                   last_seen=None, workspace="", role=None, account=None):
         ts = last_seen or radio.now()
         self.conn.execute(
-            "INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, created_at, last_seen) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (workspace, name, ref, agent, agent_session, role, ts, ts),
+            "INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, account, created_at, last_seen) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (workspace, name, ref, agent, agent_session, role, account, ts, ts),
         )
         self.conn.commit()
 
@@ -905,6 +905,65 @@ class AccountTest(RadioTestCase):
         with self.assertRaises(SystemExit) as ctx:
             self.run_account("remove", "codex2")
         self.assertIn("in use by: coder", str(ctx.exception))
+
+    def test_roster_shows_the_account_separately(self):
+        self.add_handle("coder", ref="manual", workspace="w2", agent="codex", account="work")
+        row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
+        line = radio.handle_line(row)
+        self.assertIn("codex", line)
+        self.assertIn("account: work", line)
+        self.assertNotIn("codex/work", line)
+
+    def test_move_copies_the_session_and_switches_the_account(self):
+        source_home = radio.STATE_DIR / "codex-home"
+        target_home = radio.STATE_DIR / "codex-work"
+        session_file = source_home / "sessions" / "2026" / "09" / "rollout-x-sess-1.jsonl"
+        session_file.parent.mkdir(parents=True)
+        session_file.write_text('{"type": "session"}\n')
+        (source_home / "session_index.jsonl").write_text('{"id": "sess-1", "thread_name": "coder"}\n')
+        self.run_account("add", "personal", "--provider", "codex", "--home", str(source_home))
+        self.run_account("add", "work", "--provider", "codex", "--home", str(target_home))
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex",
+                        agent_session="sess-1", account="personal")
+        args = radio.build_parser().parse_args(["account", "move", "coder", "--to", "work"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = radio.cmd_account(self.conn, args)
+        self.assertEqual(rc, 0)
+        self.assertIn("personal -> work", buf.getvalue())
+        row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
+        self.assertEqual(row["account"], "work")
+        copied = target_home / "sessions" / "2026" / "09" / "rollout-x-sess-1.jsonl"
+        self.assertTrue(copied.exists())
+        self.assertIn("sess-1", (target_home / "session_index.jsonl").read_text(encoding="utf-8"))
+        # a copy, never a move: the old account keeps its data
+        self.assertTrue(session_file.exists())
+
+    def test_move_refuses_unknown_account_and_missing_sessions(self):
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex",
+                        agent_session="sess-1")
+        args = radio.build_parser().parse_args(["account", "move", "coder", "--to", "ghost"])
+        with self.assertRaises(SystemExit):
+            radio.cmd_account(self.conn, args)
+        self.run_account(
+            "add", "work", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex-work")
+        )
+        args = radio.build_parser().parse_args(["account", "move", "coder", "--to", "work"])
+        with self.assertRaises(SystemExit) as ctx:
+            radio.cmd_account(self.conn, args)
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_move_without_a_session_just_switches(self):
+        self.run_account(
+            "add", "work", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex-work")
+        )
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex")
+        args = radio.build_parser().parse_args(["account", "move", "coder", "--to", "work"])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = radio.cmd_account(self.conn, args)
+        self.assertEqual(rc, 0)
+        self.assertIn("account changed only", buf.getvalue())
 
     def test_join_with_account_records_it(self):
         self.run_account(

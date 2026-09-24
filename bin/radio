@@ -1011,6 +1011,11 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         account and existing and existing["account"] and existing["account"] != account["name"]
     )
     recorded_session = None if account_changed else (existing["agent_session"] if existing else None)
+    if account_changed and existing and existing["agent_session"]:
+        print(
+            f'note: the recorded session belongs to account {existing["account"]}; it is not '
+            f'resumed here — move it with: radio account move {handle} --to {account["name"]}'
+        )
     if existing is not None and existing["workspace"] == "" and workspace:
         # A pre-scope row bound to this workspace: adopt it into the scope so
         # a rejoin never forks a duplicate row for the same pane.
@@ -1278,12 +1283,139 @@ def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     return 0
 
 
+def session_files(provider: str, home: Path, session_id: str) -> list[Path]:
+    """The files (or directories) that carry one provider session inside a
+    config home; empty when the provider's storage is unknown — callers then
+    refuse rather than silently losing the session."""
+    if provider == "codex":
+        return sorted(home.glob(f"sessions/**/*{session_id}*.jsonl"))
+    if provider == "claude":
+        return sorted(home.glob(f"projects/*/{session_id}.jsonl"))
+    if provider == "kimi":
+        return sorted(home.glob(f"sessions/wd_*/session_{session_id}"))
+    if provider == "pi":
+        found = []
+        for path in home.glob("**/*.jsonl"):
+            try:
+                with path.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if row.get("type") == "session" and str(row.get("id")) == session_id:
+                            found.append(path)
+                            break
+            except OSError:
+                continue
+        return sorted(found)
+    return []
+
+
+def _json_id(line: str) -> str:
+    """The 'id' field of a JSONL line, or '' when the line is not an object."""
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return ""
+    return str(row.get("id") or "") if isinstance(row, dict) else ""
+
+
+def _copy_codex_index_entry(source: Path, target: Path, session_id: str) -> None:
+    """Carry the codex session_index.jsonl entry over, so resume-by-name works
+    under the new account (the session file alone is not enough)."""
+    index = source / "session_index.jsonl"
+    try:
+        lines = index.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    entries = [line for line in lines if _json_id(line) == session_id]
+    if not entries:
+        return
+    target_index = target / "session_index.jsonl"
+    try:
+        known = {_json_id(line) for line in target_index.read_text(encoding="utf-8").splitlines()}
+    except OSError:
+        known = set()
+    with target_index.open("a", encoding="utf-8") as fh:
+        for line in entries:
+            if session_id not in known:
+                fh.write(line + "\n")
+                known.add(session_id)
+
+
+def account_move(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Copy a handle's session into another account's home and switch the
+    handle over. Copies, never moves: the old account keeps its data, and the
+    next join/restore resumes the same conversation under the new login."""
+    scope = current_workspace()
+    row = resolve_handle(conn, args.handle, scope)
+    if not row:
+        raise SystemExit(no_handle_message(conn, args.handle, scope))
+    if not row["agent"]:
+        raise SystemExit(f'{row["name"]} has no recorded provider — nothing to move')
+    target = resolve_account(conn, args.to)
+    if not target:
+        raise SystemExit(f"unknown account: {args.to} (radio account add {args.to} --provider <name>)")
+    if target["provider"] != row["agent"]:
+        raise SystemExit(
+            f'account {target["name"]} belongs to {target["provider"]}, not {row["agent"]}'
+        )
+    if (row["account"] or "") == target["name"]:
+        print(f'{row["name"]} already uses account {target["name"]}')
+        return 0
+    source_account = resolve_account(conn, row["account"]) if row["account"] else None
+    source_home = provider_home(row["agent"], source_account)
+    target_home = provider_home(row["agent"], target)
+    if source_home == target_home:
+        raise SystemExit(f'source and target homes are the same: {source_home}')
+    copied = 0
+    if row["agent_session"]:
+        files = session_files(row["agent"], source_home, row["agent_session"])
+        if not files:
+            raise SystemExit(
+                f'session {row["agent_session"][:8]} not found under {source_home} — '
+                f'moving sessions is not supported for {row["agent"]} yet; '
+                f'to switch anyway (starting fresh) run: radio join {row["name"]} --account {target["name"]}'
+            )
+        for path in files:
+            destination = target_home / path.relative_to(source_home)
+            try:
+                if path.is_dir():
+                    shutil.copytree(path, destination, dirs_exist_ok=True)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, destination)
+            except OSError as exc:
+                raise SystemExit(f"copy failed for {path}: {exc}")
+            copied += 1
+        if row["agent"] == "codex":
+            _copy_codex_index_entry(source_home, target_home, row["agent_session"])
+    conn.execute(
+        "UPDATE handles SET account=? WHERE workspace=? AND name=?",
+        (target["name"], row["workspace"], row["name"]),
+    )
+    conn.commit()
+    print(
+        f'{row["name"]}: account {row["account"] or "(provider default)"} -> {target["name"]} '
+        f'({source_home} -> {target_home})'
+    )
+    if row["agent_session"]:
+        print(f'  session {row["agent_session"][:8]}: {copied} file(s) copied')
+        print(f'  the next join/restore resumes it under {target["name"]}')
+    else:
+        print("  no recorded session — account changed only")
+    return 0
+
+
 def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Manage named provider accounts: several logins of one provider on the
     same machine. An account is a config home; joining with --account exports
     the provider's home variable so the agent runs that login, and restore
     brings the same login back because the handle records it."""
     command = getattr(args, "account_command", None)
+    if command == "move":
+        return account_move(conn, args)
     if command == "add":
         name = args.name.removeprefix("@")
         if not HANDLE_RE.match(name):
@@ -1492,13 +1624,15 @@ def handle_status(row: sqlite3.Row) -> str:
 def handle_line(row: sqlite3.Row) -> str:
     """One roster line plus an indented role snippet when a role is set."""
     provider = row["agent"] or "-"
-    if row["account"]:
-        provider = f'{provider}/{row["account"]}'
     session = (row["agent_session"] or "-")[:8]
     line = (
         f"  {row['name']:<20} {handle_status(row):<26} {row['session_ref']:<14} "
         f"{provider:<8} sess: {session:<8}"
     )
+    if row["account"]:
+        # The account is a property, not part of the identity: the handle name
+        # (the user's name) stays the one valid reference.
+        line += f" account: {row['account']}"
     role = row["role"] or ""
     if role:
         snippet = role[:80] + ("…" if len(role) > 80 else "")
@@ -2029,6 +2163,9 @@ def build_parser() -> argparse.ArgumentParser:
     acct.add_parser("list", help="list accounts with auth state")
     ap = acct.add_parser("remove", help="remove an unused account")
     ap.add_argument("name")
+    ap = acct.add_parser("move", help="copy a handle's session to another account and switch it")
+    ap.add_argument("handle")
+    ap.add_argument("--to", required=True, help="target account name")
 
     p = sub.add_parser("role", help="show, set, or clear a handle's role paragraph")
     p.add_argument("handle")
