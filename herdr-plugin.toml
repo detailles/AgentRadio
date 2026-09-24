@@ -1,24 +1,54 @@
 id = "radio"
 name = "Radio"
-version = "0.2.7"
+version = "0.2.8"
 min_herdr_version = "0.9.0"
 description = "Local message bus for agents running in Herdr panes"
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
+
+# Each entry is declared per platform: Herdr runs argv commands without a
+# shell, and Windows needs cmd/CreateProcess-compatible entrypoints instead of
+# sh scripts. Item-level `platforms` keeps the other platform's entries hidden.
 
 [[startup]]
 command = ["sh", "bin/autostart.sh"]
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["cmd", "/c", "bin\\autostart.cmd"]
+platforms = ["windows"]
 
 [[build]]
 command = ["sh", "bin/setup.sh"]
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cmd", "/c", "bin\\setup.cmd"]
+platforms = ["windows"]
 
 [[panes]]
 id = "view"
 title = "Radio"
 placement = "tab"
-command = ["sh", "bin/run-view.sh"]
+command = ["python3", "bin/run-view.py"]
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "view-win"
+title = "Radio"
+placement = "tab"
+command = ["cmd", "/c", "bin\\run-view.cmd"]
+platforms = ["windows"]
 
 [[actions]]
 id = "open-view"
 title = "Open Radio view"
 contexts = ["workspace"]
 command = ["herdr", "plugin", "pane", "open", "--plugin", "radio", "--entrypoint", "view"]
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open-view-win"
+title = "Open Radio view"
+contexts = ["workspace"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "radio", "--entrypoint", "view-win"]
+platforms = ["windows"]

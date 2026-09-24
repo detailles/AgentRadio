@@ -12,7 +12,9 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -745,6 +747,288 @@ class CrashSafeRelayTest(RadioTestCase):
         # going until the KeyboardInterrupt (not caught by `except Exception`).
         self.assertIn("relay tick error: boom", out)
         self.assertEqual(len(calls), 2)
+
+
+def load_bin_script(name: str, filename: str):
+    """Import one of bin/'s launcher scripts as a module (same loader pattern
+    the suite uses for bin/radio and bin/radio-view)."""
+    path = REPO / "bin" / filename
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_file_location(name, path, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ChoosePlainTest(unittest.TestCase):
+    """The line-based picker: Windows terminals have no termios, so choose()
+    falls back to numbered options read from stdin."""
+
+    def run_pick(self, keys, default=0):
+        buf = io.StringIO()
+        saved = sys.stdin
+        sys.stdin = io.StringIO(keys)
+        try:
+            with contextlib.redirect_stdout(buf):
+                idx = radio.choose_plain("pick", ["a", "b", "c"], default)
+        finally:
+            sys.stdin = saved
+        return idx, buf.getvalue()
+
+    def test_number_selects(self):
+        self.assertEqual(self.run_pick("2\n")[0], 1)
+
+    def test_enter_takes_the_default(self):
+        self.assertEqual(self.run_pick("\n", default=2)[0], 2)
+
+    def test_q_cancels(self):
+        self.assertEqual(self.run_pick("q\n")[0], None)
+
+    def test_closed_stdin_cancels(self):
+        self.assertEqual(self.run_pick("")[0], None)
+
+    def test_invalid_line_reprompts(self):
+        idx, out = self.run_pick("nope\n3\n")
+        self.assertEqual(idx, 2)
+        self.assertIn("invalid choice", out)
+
+    def test_choose_dispatches_when_termios_is_missing(self):
+        saved = radio.termios
+        self.addCleanup(setattr, radio, "termios", saved)
+        radio.termios = None
+        saved_stdin = sys.stdin
+        sys.stdin = io.StringIO("1\n")
+        self.addCleanup(setattr, sys, "stdin", saved_stdin)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(radio.choose("pick", ["a", "b"]), 0)
+
+
+class RelayLockTest(RadioTestCase):
+    """relay_lock: POSIX flock path, plus the Windows msvcrt fallback exercised
+    with a fake module (the suite itself runs on POSIX)."""
+
+    def _force_windows_lock(self, fake):
+        saved = radio.fcntl, radio.msvcrt
+        self.addCleanup(self._restore, saved)
+        radio.fcntl, radio.msvcrt = None, fake
+
+    @staticmethod
+    def _restore(saved):
+        radio.fcntl, radio.msvcrt = saved
+
+    def test_posix_second_lock_is_refused(self):
+        lock = radio.STATE_DIR / "relay.lock"
+        first, second = open(lock, "a+"), open(lock, "a+")
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        self.assertTrue(radio.relay_lock(first))
+        self.assertFalse(radio.relay_lock(second))
+
+    def test_windows_fallback_locks_one_byte(self):
+        calls = []
+
+        class FakeMsvcrt:
+            LK_NBLCK = 2
+
+            @staticmethod
+            def locking(fd, mode, size):
+                calls.append((mode, size))
+
+        self._force_windows_lock(FakeMsvcrt)
+        with open(radio.STATE_DIR / "relay.lock", "a+") as fd:
+            self.assertTrue(radio.relay_lock(fd))
+            self.assertEqual(calls, [(FakeMsvcrt.LK_NBLCK, 1)])
+            fd.seek(0)
+            self.assertEqual(fd.read(1), "1")  # region kept non-empty
+
+    def test_windows_fallback_reports_contention(self):
+        class BusyMsvcrt:
+            LK_NBLCK = 2
+
+            @staticmethod
+            def locking(fd, mode, size):
+                raise OSError("lock held")
+
+        self._force_windows_lock(BusyMsvcrt)
+        with open(radio.STATE_DIR / "relay.lock", "a+") as fd:
+            self.assertFalse(radio.relay_lock(fd))
+
+
+class AgentLaunchArgvTest(unittest.TestCase):
+    """agent_launch_argv: POSIX execs the resolved binary; Windows npm-style
+    .cmd/.bat shims cannot be CreateProcess'd and get wrapped in cmd /c."""
+
+    def setUp(self):
+        self._which = radio.shutil.which
+        self._name = radio.os.name
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        radio.shutil.which = self._which
+        radio.os.name = self._name
+
+    def test_posix_resolves_the_binary(self):
+        radio.shutil.which = lambda cmd: f"/usr/local/bin/{cmd}"
+        self.assertEqual(
+            radio.agent_launch_argv(["claude", "--name", "x"]),
+            ["/usr/local/bin/claude", "--name", "x"],
+        )
+
+    def test_windows_cmd_shim_is_wrapped(self):
+        radio.os.name = "nt"
+        radio.shutil.which = lambda cmd: r"C:\npm\claude.cmd"
+        self.assertEqual(
+            radio.agent_launch_argv(["claude", "--name", "x"]),
+            ["cmd.exe", "/c", r"C:\npm\claude.cmd", "--name", "x"],
+        )
+
+    def test_windows_exe_is_not_wrapped(self):
+        radio.os.name = "nt"
+        radio.shutil.which = lambda cmd: r"C:\tools\codex.exe"
+        self.assertEqual(radio.agent_launch_argv(["codex"]), [r"C:\tools\codex.exe"])
+
+
+class ExecOrWaitTest(unittest.TestCase):
+    """exec_or_wait: POSIX execs in place; Windows waits on a child, because
+    the CRT's exec emulation returns the shell prompt while the target runs."""
+
+    def setUp(self):
+        self._name = radio.os.name
+        self._run = radio.subprocess.run
+        self._execvpe = radio.os.execvpe
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        radio.os.name = self._name
+        radio.subprocess.run = self._run
+        radio.os.execvpe = self._execvpe
+
+    def test_posix_execs_in_place(self):
+        seen = {}
+
+        def fake_execvpe(path, argv, env):
+            seen["argv"] = argv
+            raise RuntimeError("exec")
+
+        radio.os.execvpe = fake_execvpe
+        with self.assertRaises(RuntimeError):
+            radio.exec_or_wait(["claude", "--name", "x"], {})
+        self.assertEqual(seen["argv"], ["claude", "--name", "x"])
+
+    def test_windows_waits_and_returns_the_exit_code(self):
+        radio.os.name = "nt"
+        radio.subprocess.run = lambda command, env=None: subprocess.CompletedProcess(command, 3)
+        self.assertEqual(radio.exec_or_wait(["cmd.exe", "/c", "claude.cmd"], {}), 3)
+
+    def test_windows_command_line_plain_binary(self):
+        self.assertEqual(
+            radio.windows_command_line([r"C:\tools\codex.exe", "--resume", "sid"]),
+            r"C:\tools\codex.exe --resume sid",
+        )
+
+    def test_windows_command_line_quotes_space_paths(self):
+        # cmd /c strips a lone outer pair; the extra pair keeps the path whole.
+        self.assertEqual(
+            radio.windows_command_line(
+                ["cmd.exe", "/c", r"C:\Program Files\npm\claude.cmd", "--name", "x"]
+            ),
+            'cmd.exe /c ""C:\\Program Files\\npm\\claude.cmd" --name x"',
+        )
+
+
+class WinShimTest(RadioTestCase):
+    """The Windows CLI shim writer (bin/win-shim.py): generated content,
+    marker-guarded overwrite (a foreign radio.cmd is never clobbered), refresh
+    on plugin-root change, and the PATH hint."""
+
+    def setUp(self):
+        super().setUp()
+        self.win_shim = load_bin_script("radio_win_shim", "win-shim.py")
+        self.link_dir = radio.STATE_DIR / "link-bin"
+
+    def test_shim_text_carries_root_and_marker(self):
+        text = self.win_shim.shim_text(Path(r"C:\plugins\radio-abc"))
+        self.assertTrue(text.startswith(self.win_shim.SHIM_MARKER))
+        self.assertIn(r'set "ROOT=C:\plugins\radio-abc"', text)
+        self.assertIn("find-python.cmd", text)
+
+    def test_ensure_shim_writes_then_refreshes(self):
+        msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
+        shim = self.link_dir / "radio.cmd"
+        self.assertTrue(shim.exists())
+        self.assertIn("radio.cmd ->", msg)
+        self.assertIn("radio-a", shim.read_text(encoding="utf-8"))
+        # Idempotent while the root is unchanged.
+        self.assertIn("already current", self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir))
+        # A new plugin root refreshes the shim.
+        self.win_shim.ensure_shim(Path(r"C:\plugins\radio-b"), self.link_dir)
+        self.assertIn("radio-b", shim.read_text(encoding="utf-8"))
+        self.assertNotIn("radio-a", shim.read_text(encoding="utf-8"))
+
+    def test_foreign_radio_cmd_is_left_alone(self):
+        self.link_dir.mkdir(parents=True, exist_ok=True)
+        shim = self.link_dir / "radio.cmd"
+        shim.write_text("@echo off\necho someone else's radio\n", encoding="utf-8")
+        msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
+        self.assertIn("left alone", msg)
+        self.assertIn("someone else's radio", shim.read_text(encoding="utf-8"))
+
+    def test_path_hint_only_when_missing(self):
+        saved = os.environ.get("PATH")
+        self.addCleanup(self._restore_path, saved)
+        os.environ["PATH"] = str(self.link_dir)
+        self.assertIsNone(self.win_shim.path_hint(self.link_dir))
+        os.environ["PATH"] = "/nowhere"
+        hint = self.win_shim.path_hint(self.link_dir)
+        self.assertIn(str(self.link_dir), hint)
+
+    @staticmethod
+    def _restore_path(saved):
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+
+
+class ViewPythonTest(unittest.TestCase):
+    """run-view.py: prefer the plugin venv interpreter (per-platform layout),
+    fall back to the launcher's own interpreter."""
+
+    def setUp(self):
+        self.run_view = load_bin_script("radio_run_view", "run-view.py")
+
+    def test_prefers_posix_venv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            venv_python = Path(tmp) / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("")
+            self.assertEqual(self.run_view.view_python(Path(tmp)), venv_python)
+
+    def test_prefers_windows_venv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            venv_python = Path(tmp) / ".venv" / "Scripts" / "python.exe"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("")
+            # Module-local fake os: patching the real os.name would make
+            # pathlib instantiate WindowsPath on this POSIX test host.
+            saved = self.run_view.os
+            self.addCleanup(setattr, self.run_view, "os", saved)
+            self.run_view.os = types.SimpleNamespace(name="nt")
+            self.assertEqual(self.run_view.view_python(Path(tmp)), venv_python)
+
+    def test_falls_back_when_venv_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.run_view.view_python(Path(tmp)), Path(sys.executable))
+
+
+class WindowsScriptsTest(unittest.TestCase):
+    """The Windows hook bodies must import and no-op cleanly off Windows."""
+
+    def test_noops_off_windows(self):
+        for filename in ("setup-win.py", "autostart-win.py"):
+            module = load_bin_script(Path(filename).stem.replace("-", "_"), filename)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(module.main(), 0)
 
 
 # The view module sys.exit()s at import when textual is missing; guard so the
