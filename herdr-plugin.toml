@@ -1,6 +1,6 @@
 id = "radio"
 name = "Radio"
-version = "0.2.8"
+version = "0.3.0"
 min_herdr_version = "0.9.0"
 description = "Local message bus for agents running in Herdr panes"
 platforms = ["linux", "macos", "windows"]
@@ -51,4 +51,17 @@ id = "open-view-win"
 title = "Open Radio view"
 contexts = ["workspace"]
 command = ["herdr", "plugin", "pane", "open", "--plugin", "radio", "--entrypoint", "view-win"]
+platforms = ["windows"]
+
+# Every new workspace gets its own scoped Radio view pane (worktree.create
+# emits workspace.created too, so worktree projects are covered).
+
+[[events]]
+on = "workspace.created"
+command = ["python3", "bin/workspace-created.py"]
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "workspace.created"
+command = ["cmd", "/c", "bin\\workspace-created.cmd"]
 platforms = ["windows"]

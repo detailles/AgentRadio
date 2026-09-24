@@ -53,19 +53,21 @@ class RadioTestCase(unittest.TestCase):
                 os.environ[key] = value
 
     def add_handle(self, name, ref="manual", agent=None, agent_session=None,
-                   last_seen=None):
+                   last_seen=None, workspace="", role=None):
         ts = last_seen or radio.now()
         self.conn.execute(
-            "INSERT INTO handles(name, session_ref, agent, agent_session, created_at, last_seen) "
-            "VALUES (?,?,?,?,?,?)",
-            (name, ref, agent, agent_session, ts, ts),
+            "INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, created_at, last_seen) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (workspace, name, ref, agent, agent_session, role, ts, ts),
         )
         self.conn.commit()
 
-    def pm(self, sender, to, text, ref=None, reply_required=False):
+    def pm(self, sender, to, text, ref=None, reply_required=False,
+           from_ws="", to_ws=""):
         mid = radio.record_message(self.conn, "pm", sender, text,
-                                   to_handle=to, ref=ref, reply_required=reply_required)
-        radio.enqueue_delivery(self.conn, mid, to)
+                                   to_handle=to, ref=ref, reply_required=reply_required,
+                                   from_ws=from_ws, to_ws=to_ws)
+        radio.enqueue_delivery(self.conn, mid, to, to_ws)
         self.conn.commit()
         return mid
 
@@ -430,16 +432,17 @@ class NormalizeHandleTest(RadioTestCase):
         self.assertEqual(row["to_handle"], "bob")
 
 
-def join_args(handle, pane=None):
+def join_args(handle, pane=None, role=None):
     return argparse.Namespace(handle=handle, pane=pane, provider=None,
-                              new=False, resume=False, model=None, no_launch=True)
+                              new=False, resume=False, model=None, role=role,
+                              no_launch=True)
 
 
 class ResolveHandleTest(RadioTestCase):
     def test_resolver_semantics(self):
         self.add_handle("bob")
-        self.assertEqual(radio.resolve_handle(self.conn, "bob"), "bob")
-        self.assertEqual(radio.resolve_handle(self.conn, "BOB"), "bob")
+        self.assertEqual(radio.resolve_handle(self.conn, "bob")["name"], "bob")
+        self.assertEqual(radio.resolve_handle(self.conn, "BOB")["name"], "bob")
         self.assertIsNone(radio.resolve_handle(self.conn, "ghost"))
 
     def test_ambiguous_case_variants_exit(self):
@@ -472,6 +475,368 @@ class ResolveHandleTest(RadioTestCase):
             "SELECT name FROM handles WHERE LOWER(name) = 'bob'"
         ).fetchall()
         self.assertEqual([r["name"] for r in rows], ["bob"])
+
+
+class WorkspaceScopeTest(RadioTestCase):
+    """Scoped identity: one name per workspace, resolution inside a workspace,
+    the unscoped fallback, and the internal qualified form scripts use."""
+
+    WS_LABELS = {
+        "result": {
+            "workspaces": [
+                {"workspace_id": "w1", "label": "BoilerRoom"},
+                {"workspace_id": "w2", "label": "Servers"},
+            ]
+        }
+    }
+
+    def stub_workspaces(self, data=None):
+        saved = radio.herdr_json
+        self.addCleanup(setattr, radio, "herdr_json", saved)
+        radio.herdr_json = lambda *args: (data if data is not None else self.WS_LABELS)
+
+    def test_same_name_in_two_workspaces(self):
+        self.add_handle("reviewer", workspace="w1")
+        self.add_handle("reviewer", workspace="w2")
+        row = radio.resolve_handle(self.conn, "reviewer", "w2")
+        self.assertEqual((row["workspace"], row["name"]), ("w2", "reviewer"))
+
+    def test_other_workspace_handle_is_unreachable(self):
+        self.add_handle("hede", workspace="w1")
+        self.assertIsNone(radio.resolve_handle(self.conn, "hede", "w2"))
+
+    def test_unscoped_handles_stay_reachable(self):
+        self.add_handle("bot")
+        self.add_handle("reviewer", workspace="w2")
+        self.assertEqual(radio.resolve_handle(self.conn, "bot", "w2")["workspace"], "")
+
+    def test_internal_qualified_form(self):
+        self.add_handle("reviewer", workspace="w1")
+        row = radio.resolve_handle(self.conn, "w1:reviewer", "")
+        self.assertEqual(row["workspace"], "w1")
+
+    def test_outside_scope_ambiguity_names_candidates(self):
+        self.add_handle("reviewer", workspace="w1")
+        self.add_handle("reviewer", workspace="w2")
+        with self.assertRaises(SystemExit) as ctx:
+            radio.resolve_handle(self.conn, "reviewer", "")
+        self.assertIn("w1:reviewer", str(ctx.exception))
+        self.assertIn("w2:reviewer", str(ctx.exception))
+
+    def test_miss_message_names_the_workspace(self):
+        self.stub_workspaces()
+        self.add_handle("hede", workspace="w1")
+        message = radio.no_handle_message(self.conn, "hede", "w2")
+        self.assertIn('no handle "hede"', message)
+        self.assertIn("Servers", message)
+        self.assertIn("BoilerRoom", message)
+
+    def test_workspace_spec_accepts_id_and_label(self):
+        self.stub_workspaces()
+        self.assertEqual(radio.resolve_workspace_spec("Servers", self.conn), "w2")
+        self.assertEqual(radio.resolve_workspace_spec("w1", self.conn), "w1")
+        with self.assertRaises(SystemExit):
+            radio.resolve_workspace_spec("Nope", self.conn)
+
+
+class ScopedPmTest(RadioTestCase):
+    """cmd_pm routes inside the sender's workspace and refuses to cross."""
+
+    def setUp(self):
+        super().setUp()
+        saved = radio.current_workspace
+        self.addCleanup(setattr, radio, "current_workspace", saved)
+        radio.current_workspace = lambda: "w2"
+        os.environ["RADIO_HANDLE"] = "alice"
+        self.addCleanup(os.environ.pop, "RADIO_HANDLE", None)
+        saved_json = radio.herdr_json
+        self.addCleanup(setattr, radio, "herdr_json", saved_json)
+        radio.herdr_json = lambda *args: {}
+
+    @staticmethod
+    def pm_args(to):
+        return argparse.Namespace(sender=None, to=to, text=["hi"], ref=None,
+                                  reply_required=False)
+
+    def test_pm_resolves_in_own_workspace(self):
+        self.add_handle("alice", workspace="w2")
+        self.add_handle("reviewer", workspace="w1")
+        self.add_handle("reviewer", workspace="w2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_pm(self.conn, self.pm_args("reviewer"))
+        row = self.conn.execute("SELECT * FROM messages").fetchone()
+        self.assertEqual((row["from_ws"], row["from_handle"]), ("w2", "alice"))
+        self.assertEqual((row["to_ws"], row["to_handle"]), ("w2", "reviewer"))
+
+    def test_pm_refuses_other_workspace(self):
+        self.add_handle("alice", workspace="w2")
+        self.add_handle("hede", workspace="w1")
+        with self.assertRaises(SystemExit) as ctx:
+            radio.cmd_pm(self.conn, self.pm_args("hede"))
+        message = str(ctx.exception)
+        self.assertIn('no handle "hede"', message)
+        self.assertIn("w2", message)
+
+
+class ScopedDeliveryTest(RadioTestCase):
+    """Deliveries carry the target workspace, and the relay refuses a pane
+    that lives in a different workspace."""
+
+    def _stub_panes(self, pane):
+        for name in ("fetch_pane", "push_to_pane"):
+            saved = getattr(radio, name)
+            self.addCleanup(setattr, radio, name, saved)
+        radio.fetch_pane = lambda pane_id: pane
+        self.pushed = []
+        radio.push_to_pane = lambda pane_id, text: (self.pushed.append(pane_id), (True, None))[1]
+
+    def test_delivery_records_target_workspace(self):
+        self.add_handle("bob", ref="herdr:w2:p1", workspace="w2")
+        mid = self.pm("alice", "bob", "hi", to_ws="w2")
+        self.assertEqual(self.delivery_row(mid)["target_ws"], "w2")
+        self.assertEqual(self.delivery_row(mid)["status"], "pending")
+
+    def test_relay_pushes_inside_the_workspace(self):
+        self.add_handle("bob", ref="herdr:w2:p1", workspace="w2")
+        mid = self.pm("alice", "bob", "hi", to_ws="w2")
+        self._stub_panes({"label": "bob", "workspace_id": "w2"})
+        radio.relay_tick(self.conn)
+        self.assertEqual(self.pushed, ["w2:p1"])
+        self.assertEqual(self.delivery_row(mid)["status"], "delivered")
+
+    def test_relay_refuses_foreign_workspace(self):
+        self.add_handle("bob", ref="herdr:w9:p1", workspace="w2")
+        mid = self.pm("alice", "bob", "hi", to_ws="w2")
+        self._stub_panes({"label": "bob", "workspace_id": "w9"})
+        radio.relay_tick(self.conn)
+        row = self.delivery_row(mid)
+        self.assertEqual(row["status"], "pull")
+        self.assertEqual(row["last_error"], "workspace changed")
+        self.assertEqual(self.pushed, [])
+
+
+class RoleTest(RadioTestCase):
+    """Roles are per-workspace ledger state: set/show/clear, scoped like every
+    other handle operation, and carried by the briefing."""
+
+    def setUp(self):
+        super().setUp()
+        saved = radio.current_workspace
+        self.addCleanup(setattr, radio, "current_workspace", saved)
+        radio.current_workspace = lambda: "w2"
+        saved_json = radio.herdr_json
+        self.addCleanup(setattr, radio, "herdr_json", saved_json)
+        radio.herdr_json = lambda *args: {}
+
+    def run_role(self, handle, text=(), clear=False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            radio.cmd_role(
+                self.conn,
+                argparse.Namespace(handle=handle, text=list(text), clear=clear),
+            )
+        return buf.getvalue()
+
+    def test_set_show_clear(self):
+        self.add_handle("reviewer", workspace="w2")
+        self.run_role("reviewer", ["test", "evidence", "gate"])
+        row = self.conn.execute(
+            "SELECT role FROM handles WHERE workspace='w2' AND name='reviewer'"
+        ).fetchone()
+        self.assertEqual(row["role"], "test evidence gate")
+        self.assertIn("test evidence gate", self.run_role("reviewer"))
+        self.assertIn("cleared", self.run_role("reviewer", clear=True))
+        row = self.conn.execute(
+            "SELECT role FROM handles WHERE workspace='w2' AND name='reviewer'"
+        ).fetchone()
+        self.assertIsNone(row["role"])
+
+    def test_role_is_scoped(self):
+        self.add_handle("reviewer", workspace="w1")
+        with self.assertRaises(SystemExit):
+            self.run_role("reviewer", ["nope"])
+
+    def test_briefing_carries_workspace_and_role(self):
+        radio.herdr_json = lambda *args: {
+            "result": {"workspaces": [{"workspace_id": "w2", "label": "Servers"}]}
+        }
+        text = radio.briefing_text("reviewer", "w2", "Test evidence gate")
+        self.assertIn('You are on Radio as "reviewer" in workspace "Servers"', text)
+        self.assertIn("Your role: Test evidence gate", text)
+        self.assertIn("scoped to this workspace", text)
+
+
+class ScopedJoinTest(RadioTestCase):
+    """join records the pane's workspace, keeps --role, and adopts pre-scope
+    rows instead of forking a duplicate identity."""
+
+    def setUp(self):
+        super().setUp()
+        saved_herdr = radio.herdr
+        self.addCleanup(setattr, radio, "herdr", saved_herdr)
+        radio.herdr = lambda *args, **kwargs: subprocess.CompletedProcess(
+            list(args), 0, stdout="", stderr=""
+        )
+        saved_fetch = radio.fetch_pane
+        self.addCleanup(setattr, radio, "fetch_pane", saved_fetch)
+        self.panes = {
+            "w2:p1": {"label": "reviewer", "workspace_id": "w2"},
+            "w1:p1": {"label": "reviewer", "workspace_id": "w1"},
+        }
+        radio.fetch_pane = lambda pane_id: self.panes.get(pane_id)
+
+    def test_join_records_workspace_and_role(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_join(self.conn, join_args("reviewer", pane="w2:p1",
+                                                role="test evidence gate"))
+        row = self.conn.execute("SELECT * FROM handles").fetchone()
+        self.assertEqual((row["workspace"], row["name"]), ("w2", "reviewer"))
+        self.assertEqual(row["role"], "test evidence gate")
+
+    def test_same_name_joins_in_two_workspaces(self):
+        for pane_id in ("w2:p1", "w1:p1"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                radio.cmd_join(self.conn, join_args("reviewer", pane=pane_id))
+        rows = self.conn.execute("SELECT workspace FROM handles ORDER BY workspace").fetchall()
+        self.assertEqual([r["workspace"] for r in rows], ["w1", "w2"])
+
+    def test_pre_scope_row_is_adopted(self):
+        self.add_handle("reviewer", ref="herdr:w2:p1")  # pre-scope: workspace ''
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_join(self.conn, join_args("reviewer", pane="w2:p1"))
+        rows = self.conn.execute("SELECT workspace, name FROM handles").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["workspace"], "w2")
+
+
+class ScopedRosterTest(RadioTestCase):
+    """The roster and log are workspace-scoped inside a pane; an explicit
+    workspace narrows them from outside."""
+
+    LABELS = {
+        "result": {
+            "workspaces": [
+                {"workspace_id": "w1", "label": "BoilerRoom"},
+                {"workspace_id": "w2", "label": "Servers"},
+            ]
+        }
+    }
+
+    def setUp(self):
+        super().setUp()
+        saved_ws = radio.current_workspace
+        self.addCleanup(setattr, radio, "current_workspace", saved_ws)
+        radio.current_workspace = lambda: "w2"
+        saved_fetch = radio.fetch_pane
+        self.addCleanup(setattr, radio, "fetch_pane", saved_fetch)
+        radio.fetch_pane = lambda pane_id: None
+        saved_json = radio.herdr_json
+        self.addCleanup(setattr, radio, "herdr_json", saved_json)
+        radio.herdr_json = lambda *args: self.LABELS
+
+    def capture(self, fn, *args):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(self.conn, *args)
+        return buf.getvalue()
+
+    def test_roster_shows_only_own_workspace(self):
+        self.add_handle("alice", workspace="w2")
+        self.add_handle("hede", workspace="w1")
+        out = self.capture(radio.cmd_handles, argparse.Namespace(workspace=None))
+        self.assertIn("alice", out)
+        self.assertNotIn("hede", out)
+        self.assertIn("Servers", out)
+
+    def test_roster_filter_by_label(self):
+        self.add_handle("alice", workspace="w2")
+        self.add_handle("hede", workspace="w1")
+        out = self.capture(radio.cmd_handles, argparse.Namespace(workspace="BoilerRoom"))
+        self.assertIn("hede", out)
+        self.assertNotIn("alice", out)
+
+    def test_log_is_scoped(self):
+        self.add_handle("alice", workspace="w2")
+        self.add_handle("hede", workspace="w1")
+        self.pm("alice", "alice", "own message", from_ws="w2", to_ws="w2")
+        self.pm("hede", "hede", "other message", from_ws="w1", to_ws="w1")
+        out = self.capture(radio.cmd_log, argparse.Namespace(limit=20))
+        self.assertIn("own message", out)
+        self.assertNotIn("other message", out)
+
+
+class ScopeMigrationTest(unittest.TestCase):
+    """A pre-scope ledger migrates to the scoped schema: rows survive as the
+    unscoped namespace, the new columns exist, and the same name can then be
+    joined again in another workspace."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="radio-legacy-"))
+        legacy = sqlite3.connect(self.tmp / "radio.db")
+        legacy.executescript(
+            """
+            CREATE TABLE handles(
+              name TEXT PRIMARY KEY,
+              session_ref TEXT NOT NULL DEFAULT 'manual',
+              kind TEXT NOT NULL DEFAULT 'terminal',
+              agent TEXT,
+              agent_session TEXT,
+              briefed_at TEXT,
+              created_at TEXT NOT NULL,
+              last_seen TEXT NOT NULL
+            );
+            CREATE TABLE messages(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL, kind TEXT NOT NULL,
+              from_handle TEXT NOT NULL, to_handle TEXT, text TEXT NOT NULL,
+              ref TEXT, reply_required INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE deliveries(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              message_id INTEGER NOT NULL,
+              target TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT, created_at TEXT NOT NULL,
+              delivered_at TEXT, last_attempt_at TEXT
+            );
+            INSERT INTO handles(name, session_ref, agent, created_at, last_seen)
+              VALUES ('bob', 'herdr:w1:p1', 'claude', '2026-01-01', '2026-01-01');
+            INSERT INTO messages(ts, kind, from_handle, to_handle, text)
+              VALUES ('2026-01-01', 'pm', 'alice', 'bob', 'hi');
+            INSERT INTO deliveries(message_id, target, created_at)
+              VALUES (1, 'bob', '2026-01-01');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+        saved = (radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH)
+        self.addCleanup(self._restore, saved)
+        radio.STATE_DIR = self.tmp
+        radio.DB_PATH = self.tmp / "radio.db"
+        radio.LOCK_PATH = self.tmp / "relay.lock"
+
+    @staticmethod
+    def _restore(saved):
+        radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = saved
+
+    def test_migration_preserves_rows_and_adds_scope(self):
+        conn = radio.connect()
+        self.addCleanup(conn.close)
+        row = conn.execute("SELECT * FROM handles").fetchone()
+        self.assertEqual((row["workspace"], row["name"], row["agent"]), ("", "bob", "claude"))
+        self.assertIsNone(row["role"])
+        message = conn.execute("SELECT * FROM messages").fetchone()
+        self.assertEqual((message["from_ws"], message["to_ws"]), ("", ""))
+        delivery = conn.execute("SELECT * FROM deliveries").fetchone()
+        self.assertEqual(delivery["target_ws"], "")
+        conn.execute(
+            "INSERT INTO handles(workspace, name, created_at, last_seen) "
+            "VALUES ('w2', 'bob', 't', 't')"
+        )
+        conn.commit()
+        count = conn.execute("SELECT COUNT(*) AS c FROM handles").fetchone()["c"]
+        self.assertEqual(count, 2)
 
 
 class CatchUpCompactionTest(RadioTestCase):
@@ -1021,6 +1386,52 @@ class ViewPythonTest(unittest.TestCase):
             self.assertEqual(self.run_view.view_python(Path(tmp)), Path(sys.executable))
 
 
+class WorkspaceCreatedHookTest(unittest.TestCase):
+    """The workspace.created hook reads the event payload defensively and
+    opens the platform-correct Radio view pane without stealing focus."""
+
+    def setUp(self):
+        self.hook = load_bin_script("radio_workspace_hook", "workspace-created.py")
+        for key in ("HERDR_PLUGIN_EVENT_JSON", "HERDR_WORKSPACE_ID", "HERDR_BIN_PATH"):
+            saved = os.environ.pop(key, None)
+            if saved is not None:
+                self.addCleanup(os.environ.__setitem__, key, saved)
+
+    def test_event_workspace_variants(self):
+        self.assertEqual(self.hook.event_workspace('{"workspace":{"workspace_id":"w7"}}'), "w7")
+        self.assertEqual(self.hook.event_workspace('{"workspace_id":"wA","x":1}'), "wA")
+        self.assertEqual(self.hook.event_workspace('{"items":[{"workspace_id":"w9"}]}'), "w9")
+        self.assertEqual(self.hook.event_workspace("not json"), "")
+        self.assertEqual(self.hook.event_workspace("{}"), "")
+
+    def test_main_opens_the_view_in_the_new_workspace(self):
+        calls = []
+
+        class FakeSubprocess:
+            TimeoutExpired = subprocess.TimeoutExpired
+
+            @staticmethod
+            def run(argv, **kwargs):
+                calls.append(argv)
+
+        saved = self.hook.subprocess
+        self.addCleanup(setattr, self.hook, "subprocess", saved)
+        self.hook.subprocess = FakeSubprocess
+        os.environ["HERDR_BIN_PATH"] = "/opt/herdr"
+        os.environ["HERDR_PLUGIN_EVENT_JSON"] = '{"workspace":{"workspace_id":"w7"}}'
+        self.hook.main()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[:5], ["/opt/herdr", "plugin", "pane", "open", "--plugin"])
+        self.assertIn("radio", argv)
+        self.assertIn("view", argv)
+        self.assertIn("w7", argv)
+        self.assertIn("--no-focus", argv)
+
+    def test_main_noops_without_a_workspace(self):
+        self.hook.main()  # no payload, no env: returns quietly
+
+
 class WindowsScriptsTest(unittest.TestCase):
     """The Windows hook bodies must import and no-op cleanly off Windows."""
 
@@ -1078,6 +1489,41 @@ class CompactRosterTest(RadioTestCase):
         handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
         roster = radio_view.compact_roster(handles, {})
         self.assertEqual(roster.plain, " +2")
+
+
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+class ViewScopeTest(RadioTestCase):
+    """The view starts scoped to its pane's workspace (`a` toggles all): the
+    scope comes from the herdr env and the query builders filter handles and
+    messages without leaking another workspace's traffic."""
+
+    def test_scope_from_herdr_env(self):
+        os.environ["HERDR_ENV"] = "1"
+        os.environ["HERDR_WORKSPACE_ID"] = "w2"
+        self.addCleanup(os.environ.pop, "HERDR_ENV", None)
+        self.addCleanup(os.environ.pop, "HERDR_WORKSPACE_ID", None)
+        self.assertEqual(radio_view.workspace_scope(), "w2")
+        os.environ.pop("HERDR_ENV")
+        self.assertEqual(radio_view.workspace_scope(), "")
+
+    def test_handles_query_scopes(self):
+        sql, params = radio_view.handles_query("w2", False)
+        self.assertIn("WHERE workspace = ?", sql)
+        self.assertEqual(params, ("w2",))
+        sql, params = radio_view.handles_query("w2", True)
+        self.assertNotIn("WHERE workspace", sql)
+        self.assertEqual(params, ())
+
+    def test_messages_query_scopes(self):
+        sql, params = radio_view.messages_query("w2", False, 5)
+        self.assertIn("from_ws = ? OR to_ws = ?", sql)
+        self.assertEqual(params, (5, "w2", "w2"))
+        sql, params = radio_view.messages_query("w2", True, 5)
+        self.assertNotIn("from_ws", sql)
+        self.assertEqual(params, (5,))
+        # Outside Herdr there is no scope to honor.
+        sql, params = radio_view.messages_query("", False, 5)
+        self.assertEqual(params, (5,))
 
 
 class WorkspaceDeliveryTest(RadioTestCase):
