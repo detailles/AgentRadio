@@ -129,7 +129,7 @@ radio pm coder 'ping' --from planner
 | `radio pm <h> 'msg'` | Direct message in this project. `--ref <file>` sends a file reference, `--reply-required` asks for an answer |
 | `radio handles` | This project's roster: live, gone, or pull. Outside Herdr: every project, grouped |
 | `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
-| `radio account <add\|list\|remove>` | Named provider accounts: several logins of one provider (e.g. `codex2`) |
+| `radio account <add\|list\|remove>` | Named provider accounts: a config home plus launch environment per login (e.g. `work`, `codex2`) |
 | `radio inbox` | Index of your messages: ids, senders, status. Nothing consumed |
 | `radio show <id>` | Read one exact body; records the delivery |
 | `radio log` | This project's message log |
@@ -162,7 +162,7 @@ It shows the live message stream (`⚠reply` marks reply-required messages), a r
 
 **Bring an agent back.** `radio restore <handle>` re-launches the handle's recorded provider, account and session in its own pane (the briefing carries the workspace and role again); without a recorded session it starts fresh. It never creates layout: if the pane is gone, it says which workspace to open a pane in.
 
-**Accounts.** Several logins of one provider can share the bus. `radio account add codex2 --provider codex` registers a config home — `~/.codex-account-2` by default, the same convention the in-house harness uses — and `radio join coder --account codex2` launches that login and records it on the handle, so `radio restore coder` brings the same login back without repeating the selector. `radio account list` shows each home and its auth state; removing an account that a handle still uses is refused.
+**Accounts.** Any number of logins per provider can share the bus. `radio account add work --provider codex --home ~/.codex-work` registers a config home — the default follows the provider's convention (`codex2` → `~/.codex-account-2`) — and `--env NAME=VALUE` (repeatable) adds launch-time environment for unusual setups. `radio join coder --account work` launches that login and records it on the handle, so `radio restore coder` brings the same login back without repeating the selector. `radio account list` shows each home, its extra environment and auth state; removing an account a handle still uses is refused.
 
 Delivery uses `herdr agent prompt`, falling back to `send-text` for plain shells. Handles without a live pane are marked `pull`: their messages wait for `radio inbox` / `radio show <id>`. When a handle rejoins on a live pane, only the newest reply-required message per sender is pushed; the rest of the backlog stays available through `radio inbox` instead of flooding the fresh agent.
 
