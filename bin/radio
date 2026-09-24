@@ -1405,6 +1405,13 @@ def account_move(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         print(f'  the next join/restore resumes it under {target["name"]}')
     else:
         print("  no recorded session — account changed only")
+    pane_id = pane_id_of(row["session_ref"])
+    pane = fetch_pane(pane_id) if pane_id else None
+    if pane and pane.get("agent"):
+        print(
+            f'  note: an agent is live in {pane_id}; it keeps the old login until the '
+            "next join or restore"
+        )
     return 0
 
 
