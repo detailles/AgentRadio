@@ -965,6 +965,75 @@ class AccountTest(RadioTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("account changed only", buf.getvalue())
 
+    def test_join_with_a_new_provider_drops_the_recorded_session(self):
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="claude",
+                        agent_session="claude-1")
+        args = join_args("coder", pane="w2:p1")
+        args.provider = "codex"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            radio.cmd_join(self.conn, args)
+        row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
+        self.assertEqual(row["agent"], "codex")
+        self.assertIsNone(row["agent_session"])
+        self.assertIn("not resumed under codex", buf.getvalue())
+
+    def test_join_with_a_new_account_drops_the_recorded_session(self):
+        self.run_account(
+            "add", "work", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex-work")
+        )
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex",
+                        agent_session="sess-1")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="work"))
+        row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
+        self.assertEqual(row["account"], "work")
+        self.assertIsNone(row["agent_session"])
+        self.assertIn("radio account move coder --to work", buf.getvalue())
+
+    def test_move_copies_claude_kimi_and_pi_layouts(self):
+        cases = [
+            ("claude", "projects/-x/abc.jsonl"),
+            ("kimi", "sessions/wd_1/session_abc/state.json"),
+            ("pi", "sessions/x/abc.jsonl"),
+        ]
+        for index, (provider, relative) in enumerate(cases):
+            source = radio.STATE_DIR / f"src-{provider}"
+            target = radio.STATE_DIR / f"dst-{provider}"
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"type": "session", "id": "abc"}\n')
+            self.run_account("add", f"s{index}", "--provider", provider, "--home", str(source))
+            self.run_account("add", f"t{index}", "--provider", provider, "--home", str(target))
+            self.add_handle(f"h{index}", ref="manual", workspace="w2", agent=provider,
+                            agent_session="abc", account=f"s{index}")
+            args = radio.build_parser().parse_args(
+                ["account", "move", f"h{index}", "--to", f"t{index}"]
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = radio.cmd_account(self.conn, args)
+            self.assertEqual(rc, 0, provider)
+            self.assertTrue((target / relative).exists(), f"{provider}: {relative}")
+
+    def test_kimi_probes_prefer_kimi_code_home(self):
+        tmp = radio.STATE_DIR / "kimi-home"
+        tmp.mkdir(parents=True, exist_ok=True)
+        (tmp / "config.toml").write_text("")
+        saved = {key: os.environ.get(key) for key in ("KIMI_CODE_HOME", "KIMI_HOME")}
+        self.addCleanup(self._restore_env, saved)
+        os.environ["KIMI_CODE_HOME"] = str(tmp)
+        os.environ.pop("KIMI_HOME", None)
+        self.assertEqual(radio.auth_status("kimi"), "configured")
+
+    @staticmethod
+    def _restore_env(saved):
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     def test_join_with_account_records_it(self):
         self.run_account(
             "add", "codex2", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex2-home")
@@ -1017,7 +1086,24 @@ class RestoreTest(RadioTestCase):
     def send_text_calls(self):
         return [call for call in self.calls if call[:2] == ("pane", "send-text")]
 
+    def add_account_with_session(self, session_id="sess-1"):
+        """A codex account whose home carries the recorded session, so restore
+        has something real to resume."""
+        home = radio.STATE_DIR / "codex-personal"
+        session_file = home / "sessions" / "2026" / "09" / f"rollout-x-{session_id}.jsonl"
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        session_file.write_text("{}\n")
+        self.conn.execute(
+            "INSERT INTO accounts(name, provider, home, created_at) "
+            "VALUES ('personal', 'codex', ?, 't')",
+            (str(home),),
+        )
+        self.conn.execute("UPDATE handles SET account='personal' WHERE name='coder'")
+        self.conn.commit()
+        return home
+
     def test_types_the_resume_command_into_the_pane(self):
+        self.add_account_with_session()
         self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
         rc, out = self.restore()
         self.assertEqual(rc, 0)
@@ -1027,6 +1113,28 @@ class RestoreTest(RadioTestCase):
         self.assertIn("radio join coder --provider codex --resume", calls[0][3])
         self.assertIn(("pane", "send-keys", "w2:p1", "enter"), self.calls)
         self.assertIn("restoring coder", out)
+
+    def test_restore_starts_fresh_when_the_session_is_missing(self):
+        self.conn.execute(
+            "INSERT INTO accounts(name, provider, home, created_at) "
+            "VALUES ('personal', 'codex', ?, 't')",
+            (str(radio.STATE_DIR / "codex-personal"),),
+        )
+        self.conn.execute("UPDATE handles SET account='personal' WHERE name='coder'")
+        self.conn.commit()
+        self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
+        rc, out = self.restore()
+        self.assertEqual(rc, 0)
+        self.assertIn("starting fresh", out)
+        self.assertNotIn("--resume", self.send_text_calls()[0][3])
+
+    def test_restore_refuses_when_the_pane_is_busy(self):
+        self.panes["w2:p1"] = {
+            "label": "coder", "workspace_id": "w2", "agent_status": "blocked"
+        }
+        with self.assertRaises(SystemExit) as ctx:
+            self.restore()
+        self.assertIn("busy", str(ctx.exception))
 
     def test_starts_fresh_without_a_recorded_session(self):
         self.conn.execute("UPDATE handles SET agent_session=NULL WHERE name='coder'")
@@ -1953,6 +2061,14 @@ class WorkspaceCreatedHookTest(unittest.TestCase):
         self.assertEqual(self.hook.event_workspace('{"items":[{"workspace_id":"w9"}]}'), "w9")
         self.assertEqual(self.hook.event_workspace("not json"), "")
         self.assertEqual(self.hook.event_workspace("{}"), "")
+
+    def test_targeted_keys_win_over_other_workspace_ids(self):
+        # A decoy list of workspaces must not steal the event's workspace.
+        payload = '{"workspace": {"workspace_id": "w7"}, "workspaces": [{"workspace_id": "w1"}]}'
+        self.assertEqual(self.hook.event_workspace(payload), "w7")
+        self.assertEqual(
+            self.hook.event_workspace('{"workspaces": [{"workspace_id": "w1"}]}'), "w1"
+        )
 
     def test_main_opens_the_view_in_the_new_workspace(self):
         calls = []

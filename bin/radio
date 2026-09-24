@@ -623,7 +623,10 @@ def auth_status(provider: str, home: Path | None = None) -> str:
             return "logged in"
         return f"not logged in — {base}/auth.json missing"
     if provider == "kimi":
-        base = home or Path(os.environ.get("KIMI_HOME", DEFAULT_HOMES["kimi"])).expanduser()
+        base = home or Path(
+            os.environ.get("KIMI_CODE_HOME")
+            or os.environ.get("KIMI_HOME", DEFAULT_HOMES["kimi"])
+        ).expanduser()
         if (base / "config.toml").exists():
             return "configured"
         return f"not configured — {base}/config.toml missing"
@@ -785,7 +788,13 @@ def find_named_session(provider: str, handle: str, home: Path | None = None) -> 
                 rows.append({"id": sid, "cwd": "", "updated": row.get("updated_at") or 0})
         return _named(rows)
     if provider == "kimi":
-        base = (home or Path(os.environ.get("KIMI_HOME", DEFAULT_HOMES["kimi"])).expanduser()) / "sessions"
+        base = (
+            home
+            or Path(
+                os.environ.get("KIMI_CODE_HOME")
+                or os.environ.get("KIMI_HOME", DEFAULT_HOMES["kimi"])
+            ).expanduser()
+        ) / "sessions"
         rows = []
         for path in base.glob("wd_*/session_*/state.json"):
             try:
@@ -1006,16 +1015,30 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         )
     if account:
         provider = account["provider"]
-    # A session recorded under another account cannot be resumed here.
-    account_changed = bool(
-        account and existing and existing["account"] and existing["account"] != account["name"]
+    # A recorded session belongs to one provider+account pair; changing either
+    # makes it stale for this launch (move it with `radio account move`).
+    provider_changed = bool(
+        existing and existing["agent"] and provider and existing["agent"] != provider
     )
-    recorded_session = None if account_changed else (existing["agent_session"] if existing else None)
-    if account_changed and existing and existing["agent_session"]:
-        print(
-            f'note: the recorded session belongs to account {existing["account"]}; it is not '
-            f'resumed here — move it with: radio account move {handle} --to {account["name"]}'
+    account_changed = bool(existing) and (
+        (existing["account"] or "") != (account["name"] if account else "")
+    )
+    session_stale = provider_changed or account_changed
+    recorded_session = None if session_stale else (existing["agent_session"] if existing else None)
+    if session_stale and existing and existing["agent_session"]:
+        previous = existing["agent"] + (
+            f', account {existing["account"]}' if existing["account"] else ""
         )
+        if account_changed and account:
+            print(
+                f'note: the recorded session belongs to {previous}; it is not resumed here — '
+                f'move it with: radio account move {handle} --to {account["name"]}'
+            )
+        else:
+            print(
+                f'note: the recorded session belongs to {previous}; it is not resumed under '
+                f"{provider} — start it again if you want it here"
+            )
     if existing is not None and existing["workspace"] == "" and workspace:
         # A pre-scope row bound to this workspace: adopt it into the scope so
         # a rejoin never forks a duplicate row for the same pane.
@@ -1342,6 +1365,18 @@ def _copy_codex_index_entry(source: Path, target: Path, session_id: str) -> None
             if session_id not in known:
                 fh.write(line + "\n")
                 known.add(session_id)
+
+
+KNOWN_SESSION_PROVIDERS = ("codex", "claude", "kimi", "pi")
+
+
+def session_present(provider: str, home: Path, session_id: str) -> bool | None:
+    """Whether the recorded session's files are still in this home: True/False
+    for providers with a known layout, None when the layout is unknown — the
+    caller then trusts the ledger."""
+    if provider not in KNOWN_SESSION_PROVIDERS:
+        return None
+    return bool(session_files(provider, home, session_id))
 
 
 def account_move(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -2365,11 +2400,26 @@ def cmd_restore(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             print(f'{row["name"]} is already running ({row["agent"]} in {pane_id})')
             return 0
         raise SystemExit(f'pane {pane_id} runs {live_agent}; part or clear it first')
-    if row["agent_session"]:
+    status = pane.get("agent_status") or "unknown"
+    if status in ("blocked", "working"):
+        # Typing now would land in a dialog or mid-turn; the relay defers the
+        # same way.
+        raise SystemExit(f'pane {pane_id} is busy ({status}); try again when it is idle')
+    session = row["agent_session"]
+    resumable = True
+    if session:
+        home = provider_home(row["agent"], account)
+        if session_present(row["agent"], home, session) is False:
+            print(
+                f'note: recorded session {session[:8]} is not in {home} — starting fresh'
+            )
+            resumable = False
+    if session and resumable:
         command = f'radio join {row["name"]} --provider {row["agent"]} --resume'
     else:
         command = f'radio join {row["name"]} --provider {row["agent"]}'
-        print(f'note: no recorded session for {row["name"]} — starting fresh')
+        if not session:
+            print(f'note: no recorded session for {row["name"]} — starting fresh')
     typed = herdr("pane", "send-text", pane_id, command)
     if typed.returncode != 0:
         raise SystemExit(f'could not type into {pane_id}: {(typed.stderr or typed.stdout or "").strip()}')
