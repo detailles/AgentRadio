@@ -1209,6 +1209,13 @@ def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     and queue its delivery; nudges toward --ref for long texts and restates
     the no-poll rule for reply-required sends."""
     from_ws, sender = resolve_identity(conn, args.sender, what="sender")
+    if _match_in_workspace(conn, from_ws, sender) is None:
+        # Sending as an unregistered name works, but the recipient cannot
+        # resolve it to reply — say so at the moment it matters.
+        print(
+            f'note: sender "{sender}" is not a joined handle — replies to it will not '
+            f'resolve until it joins (radio join {sender})'
+        )
     row = resolve_handle(conn, args.to, from_ws)
     if not row:
         raise SystemExit(no_handle_message(conn, args.to, from_ws))
