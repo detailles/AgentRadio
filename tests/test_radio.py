@@ -577,6 +577,19 @@ class ScopedPmTest(RadioTestCase):
         self.assertIn('no handle "hede"', message)
         self.assertIn("w2", message)
 
+    def test_pm_accepts_internal_qualified_form(self):
+        # Scripts outside herdr address a scoped handle as w1:name.
+        self.add_handle("bob", workspace="w1")
+        os.environ.pop("RADIO_HANDLE")
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_pm(
+                self.conn,
+                argparse.Namespace(sender="host", to="w1:bob", text=["hi"],
+                                   ref=None, reply_required=False),
+            )
+        row = self.conn.execute("SELECT * FROM messages").fetchone()
+        self.assertEqual((row["to_ws"], row["to_handle"]), ("w1", "bob"))
+
 
 class ScopedDeliveryTest(RadioTestCase):
     """Deliveries carry the target workspace, and the relay refuses a pane

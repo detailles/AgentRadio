@@ -1197,7 +1197,6 @@ def cmd_pm(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     and queue its delivery; nudges toward --ref for long texts and restates
     the no-poll rule for reply-required sends."""
     from_ws, sender = resolve_identity(conn, args.sender, what="sender")
-    args.to = normalize_handle(args.to)
     row = resolve_handle(conn, args.to, from_ws)
     if not row:
         raise SystemExit(no_handle_message(conn, args.to, from_ws))
