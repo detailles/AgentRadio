@@ -1302,33 +1302,43 @@ class ExecOrWaitTest(unittest.TestCase):
 
 
 class WinShimTest(RadioTestCase):
-    """The Windows CLI shim writer (bin/win-shim.py): generated content,
-    marker-guarded overwrite (a foreign radio.cmd is never clobbered), refresh
-    on plugin-root change, and the PATH hint."""
+    """The Windows CLI shim writer (bin/win-shim.py): a stable radio.cmd that
+    resolves the plugin root at run time through the cache and resolver, so a
+    moved plugin never leaves a dangling path; marker-guarded overwrite (a
+    foreign radio.cmd or radio-resolve.py is never clobbered); PATH hint."""
 
     def setUp(self):
         super().setUp()
         self.win_shim = load_bin_script("radio_win_shim", "win-shim.py")
         self.link_dir = radio.STATE_DIR / "link-bin"
 
-    def test_shim_text_carries_root_and_marker(self):
-        text = self.win_shim.shim_text(Path(r"C:\plugins\radio-abc"))
+    def test_shim_text_is_stable_and_bakes_no_root(self):
+        text = self.win_shim.shim_text()
         self.assertTrue(text.startswith(self.win_shim.SHIM_MARKER))
-        self.assertIn(r'set "ROOT=C:\plugins\radio-abc"', text)
-        self.assertIn("find-python.cmd", text)
+        self.assertIn(self.win_shim.ROOT_FILE, text)
+        self.assertIn(self.win_shim.RESOLVER_FILE, text)
+        self.assertNotIn("plugins\\radio-", text)  # no baked plugin path
 
-    def test_ensure_shim_writes_then_refreshes(self):
+    def test_resolver_text_queries_herdr(self):
+        text = self.win_shim.resolver_text()
+        self.assertIn(self.win_shim.RESOLVER_MARKER, text)
+        self.assertIn("plugin_root", text)
+        self.assertIn('"radio"', text)
+
+    def test_ensure_shim_writes_launcher_resolver_and_cache(self):
         msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
+        self.assertIn("radio.cmd ->", msg)
         shim = self.link_dir / "radio.cmd"
         self.assertTrue(shim.exists())
-        self.assertIn("radio.cmd ->", msg)
-        self.assertIn("radio-a", shim.read_text(encoding="utf-8"))
-        # Idempotent while the root is unchanged.
-        self.assertIn("already current", self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir))
-        # A new plugin root refreshes the shim.
+        self.assertTrue((self.link_dir / self.win_shim.RESOLVER_FILE).exists())
+        cache = self.link_dir / self.win_shim.ROOT_FILE
+        self.assertEqual(cache.read_text(encoding="utf-8").strip(), r"C:\plugins\radio-a")
+        # The launcher is stable across updates: a new root only refreshes the
+        # cache, so the installed shim never carries a stale path.
+        shim_before = shim.read_text(encoding="utf-8")
         self.win_shim.ensure_shim(Path(r"C:\plugins\radio-b"), self.link_dir)
-        self.assertIn("radio-b", shim.read_text(encoding="utf-8"))
-        self.assertNotIn("radio-a", shim.read_text(encoding="utf-8"))
+        self.assertEqual(shim.read_text(encoding="utf-8"), shim_before)
+        self.assertEqual(cache.read_text(encoding="utf-8").strip(), r"C:\plugins\radio-b")
 
     def test_foreign_radio_cmd_is_left_alone(self):
         self.link_dir.mkdir(parents=True, exist_ok=True)
@@ -1337,6 +1347,14 @@ class WinShimTest(RadioTestCase):
         msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
         self.assertIn("left alone", msg)
         self.assertIn("someone else's radio", shim.read_text(encoding="utf-8"))
+
+    def test_foreign_resolver_is_left_alone(self):
+        self.link_dir.mkdir(parents=True, exist_ok=True)
+        resolver = self.link_dir / self.win_shim.RESOLVER_FILE
+        resolver.write_text("print('someone else')\n", encoding="utf-8")
+        msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
+        self.assertIn("left alone", msg)
+        self.assertIn("someone else", resolver.read_text(encoding="utf-8"))
 
     def test_path_hint_only_when_missing(self):
         saved = os.environ.get("PATH")
