@@ -1601,6 +1601,17 @@ class ViewPythonTest(unittest.TestCase):
         os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
         self.assertEqual(self.run_view.state_dir(), Path("/tmp/radio-home-test"))
 
+    def test_detach_cwd_leaves_the_plugin_dir(self):
+        saved_home = os.environ.get("RADIO_HOME")
+        self.addCleanup(self._restore_env, saved_home)
+        os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
+        calls = []
+        saved_chdir = self.run_view.os.chdir
+        self.addCleanup(setattr, self.run_view.os, "chdir", saved_chdir)
+        self.run_view.os.chdir = lambda path: calls.append(path)
+        self.run_view.detach_cwd()
+        self.assertEqual(calls, [Path("/tmp/radio-home-test")])
+
     @staticmethod
     def _restore_env(saved):
         if saved is None:
