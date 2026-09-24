@@ -30,6 +30,7 @@ def main() -> int:
         # hook process.
         subprocess.Popen(
             [sys.executable, str(root / "bin" / "radio"), "relay"],
+            cwd=str(log_dir),  # never hold the plugin dir: it blocks updates
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,

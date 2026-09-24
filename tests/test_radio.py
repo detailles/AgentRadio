@@ -1182,6 +1182,28 @@ class TimeoutSplitTest(RadioTestCase):
         self.assertEqual(self.timeouts, [radio.HERDR_SEND_TIMEOUT])
 
 
+class RelayCwdTest(RadioTestCase):
+    """The relay must leave the plugin directory: a daemon cwd inside the
+    managed plugin dir blocks Herdr's install/update on Windows."""
+
+    def test_relay_chdirs_to_the_state_dir(self):
+        calls = []
+        saved_chdir = radio.os.chdir
+        saved_tick = radio.relay_tick
+        self.addCleanup(setattr, radio.os, "chdir", saved_chdir)
+        self.addCleanup(setattr, radio, "relay_tick", saved_tick)
+        radio.os.chdir = lambda path: calls.append(path)
+
+        def stop(_conn):
+            raise KeyboardInterrupt
+
+        radio.relay_tick = stop
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                radio.cmd_relay(argparse.Namespace(interval=0.01))
+        self.assertEqual(calls, [radio.STATE_DIR])
+
+
 class CrashSafeRelayTest(RadioTestCase):
     def test_tick_error_is_logged_and_the_daemon_survives(self):
         orig_tick = radio.relay_tick

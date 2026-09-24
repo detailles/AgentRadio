@@ -10,5 +10,8 @@ if [ -n "$HERDR_PLUGIN_ROOT" ]; then
 else
   RADIO_BIN="$(cd "$(dirname "$0")" && pwd)/radio"
 fi
+# Leave the plugin dir before spawning: a daemon whose cwd sits inside the
+# managed plugin dir blocks Herdr's install/update on Windows.
+cd "$LOG_DIR" 2>/dev/null || true
 nohup python3 "$RADIO_BIN" relay >> "$LOG_DIR/relay.log" 2>&1 &
 exit 0
