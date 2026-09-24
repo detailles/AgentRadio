@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS handles(
   PRIMARY KEY (workspace, name)
 );
 CREATE INDEX IF NOT EXISTS idx_handles_name ON handles(name);
+CREATE TABLE IF NOT EXISTS accounts(
+  name TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  dir TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
@@ -144,6 +150,7 @@ def connect() -> sqlite3.Connection:
               agent_session TEXT,
               briefed_at TEXT,
               role TEXT,
+              account TEXT,
               created_at TEXT NOT NULL,
               last_seen TEXT NOT NULL,
               PRIMARY KEY (workspace, name)
@@ -155,8 +162,12 @@ def connect() -> sqlite3.Connection:
             CREATE INDEX IF NOT EXISTS idx_handles_name ON handles(name);
             """
         )
-    elif "role" not in cols:
-        conn.execute("ALTER TABLE handles ADD COLUMN role TEXT")
+    # Columns added after the scoped rebuild (and to scoped ledgers written by
+    # earlier 0.3.x builds): add whatever is missing.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(handles)").fetchall()}
+    for column in ("role", "account"):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE handles ADD COLUMN {column} TEXT")
     msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     for column, ddl in (
         ("reply_required", "ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0"),
@@ -504,40 +515,98 @@ def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str,
 
 PROVIDERS = ("claude", "codex", "kimi", "pi", "gemini", "qwen", "opencode")
 
+# Named accounts: several logins of one provider on the same machine. Each
+# account is a config home; launching with the account exports the provider's
+# home variable so the agent runs that login (the harness convention this
+# mirrors: codex2 -> ~/.codex-account-2 with CODEX_HOME).
+ACCOUNT_ENV: dict[str, tuple[str, ...]] = {
+    "codex": ("CODEX_HOME",),
+    "claude": ("CLAUDE_CONFIG_DIR",),
+    "kimi": ("KIMI_CODE_HOME", "KIMI_HOME"),
+    "gemini": ("GEMINI_CLI_HOME",),
+    "qwen": ("QWEN_HOME",),
+    "pi": ("PI_CODING_AGENT_DIR",),
+    "opencode": ("XDG_DATA_HOME",),
+}
+DEFAULT_HOMES: dict[str, str] = {
+    "codex": "~/.codex",
+    "claude": "~/.claude",
+    "kimi": "~/.kimi-code",
+    "gemini": "~/.gemini",
+    "qwen": "~/.qwen",
+    "pi": "~/.pi/agent",
+    "opencode": "~/.local/share",
+}
 
-def auth_status(provider: str) -> str:
+
+def default_account_dir(provider: str, name: str) -> Path:
+    """The conventional home for an account: the provider's default dir when
+    the name is the provider itself, else ~/.<provider>-account-<suffix> —
+    matching the harness convention (~/.codex-account-2 for codex2)."""
+    if name == provider:
+        return Path(DEFAULT_HOMES[provider]).expanduser()
+    suffix = name[len(provider):].lstrip("-_") if name.startswith(provider) else name
+    return Path(f"~/.{provider}-account-{suffix}").expanduser()
+
+
+def resolve_account(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    """The registered account row by name (exact, then case-insensitive)."""
+    row = conn.execute("SELECT * FROM accounts WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row
+    rows = conn.execute(
+        "SELECT * FROM accounts WHERE LOWER(name) = LOWER(?)", (name,)
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def account_env(account: sqlite3.Row) -> dict[str, str]:
+    """The environment variables that point a provider at this account's home."""
+    return {var: account["dir"] for var in ACCOUNT_ENV.get(account["provider"], ())}
+
+
+def provider_home(provider: str, account: sqlite3.Row | None = None) -> Path:
+    """The config home for a provider launch/session search: the account's dir
+    when one is selected, else the provider's default home."""
+    if account:
+        return Path(account["dir"]).expanduser()
+    return Path(DEFAULT_HOMES.get(provider, "~")).expanduser()
+
+
+def auth_status(provider: str, home: Path | None = None) -> str:
     """Human-readable auth state for a provider, probed from its on-disk
-    credentials/config; 'auth unknown' for providers without a known probe."""
+    credentials/config; `home` overrides the provider's default config dir
+    (used by `radio account list`); 'auth unknown' without a known probe."""
     if provider == "claude":
-        home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
-        if (home / ".credentials.json").exists():
+        base = home or Path(os.environ.get("CLAUDE_CONFIG_DIR", DEFAULT_HOMES["claude"])).expanduser()
+        if (base / ".credentials.json").exists():
             return "logged in"
-        return "not logged in — ~/.claude/.credentials.json missing"
+        return f"not logged in — {base}/.credentials.json missing"
     if provider == "codex":
-        home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-        if (home / "auth.json").exists():
+        base = home or Path(os.environ.get("CODEX_HOME", DEFAULT_HOMES["codex"])).expanduser()
+        if (base / "auth.json").exists():
             return "logged in"
-        return "not logged in — ~/.codex/auth.json missing"
+        return f"not logged in — {base}/auth.json missing"
     if provider == "kimi":
-        home = Path(os.environ.get("KIMI_HOME", "~/.kimi-code")).expanduser()
-        if (home / "config.toml").exists():
+        base = home or Path(os.environ.get("KIMI_HOME", DEFAULT_HOMES["kimi"])).expanduser()
+        if (base / "config.toml").exists():
             return "configured"
-        return "not configured — ~/.kimi-code/config.toml missing"
+        return f"not configured — {base}/config.toml missing"
     if provider == "gemini":
-        home = Path(os.environ.get("GEMINI_CLI_HOME", "~/.gemini")).expanduser()
-        if (home / "oauth_creds.json").exists():
+        base = home or Path(os.environ.get("GEMINI_CLI_HOME", DEFAULT_HOMES["gemini"])).expanduser()
+        if (base / "oauth_creds.json").exists():
             return "logged in"
-        return "not logged in — ~/.gemini/oauth_creds.json missing"
+        return f"not logged in — {base}/oauth_creds.json missing"
     if provider == "qwen":
-        home = Path(os.environ.get("QWEN_HOME", "~/.qwen")).expanduser()
-        if (home / "oauth_creds.json").exists():
+        base = home or Path(os.environ.get("QWEN_HOME", DEFAULT_HOMES["qwen"])).expanduser()
+        if (base / "oauth_creds.json").exists():
             return "logged in"
-        return "not logged in — ~/.qwen/oauth_creds.json missing"
+        return f"not logged in — {base}/oauth_creds.json missing"
     if provider == "opencode":
-        auth = Path(
-            os.environ.get("XDG_DATA_HOME", "~/.local/share")
-        ).expanduser() / "opencode" / "auth.json"
-        if auth.exists():
+        base = home or Path(os.environ.get("XDG_DATA_HOME", DEFAULT_HOMES["opencode"])).expanduser()
+        if (base / "opencode" / "auth.json").exists():
             return "logged in"
         return "not logged in — run `opencode auth login`"
     return "auth unknown"
@@ -631,15 +700,16 @@ def _named(rows: list[dict]) -> dict | None:
     return best
 
 
-def find_named_session(provider: str, handle: str) -> dict | None:
-    """Latest saved provider session whose name matches the handle."""
+def find_named_session(provider: str, handle: str, home: Path | None = None) -> dict | None:
+    """Latest saved provider session whose name matches the handle, searched in
+    the account's home when one is selected."""
     wanted = handle.casefold()
     if provider == "claude":
         # The sessions/ registry only lists live processes; the durable name is
         # the agent-name record inside the project transcript.
-        home = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects"
+        base = home or Path(os.environ.get("CLAUDE_CONFIG_DIR", DEFAULT_HOMES["claude"])).expanduser()
         rows = []
-        for path in home.glob("*/*.jsonl"):
+        for path in (base / "projects").glob("*/*.jsonl"):
             name, sid, cwd = "", "", ""
             try:
                 with path.open(encoding="utf-8") as fh:
@@ -661,7 +731,8 @@ def find_named_session(provider: str, handle: str) -> dict | None:
                 rows.append({"id": sid, "cwd": cwd, "updated": path.stat().st_mtime})
         return _named(rows)
     if provider == "codex":
-        index = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "session_index.jsonl"
+        base = home or Path(os.environ.get("CODEX_HOME", DEFAULT_HOMES["codex"])).expanduser()
+        index = base / "session_index.jsonl"
         if not index.exists():
             return None
         rows = []
@@ -681,7 +752,7 @@ def find_named_session(provider: str, handle: str) -> dict | None:
                 rows.append({"id": sid, "cwd": "", "updated": row.get("updated_at") or 0})
         return _named(rows)
     if provider == "kimi":
-        base = Path(os.environ.get("KIMI_HOME", "~/.kimi-code")).expanduser() / "sessions"
+        base = (home or Path(os.environ.get("KIMI_HOME", DEFAULT_HOMES["kimi"])).expanduser()) / "sessions"
         rows = []
         for path in base.glob("wd_*/session_*/state.json"):
             try:
@@ -699,7 +770,7 @@ def find_named_session(provider: str, handle: str) -> dict | None:
                 rows.append({"id": sid, "cwd": row.get("cwd") or "", "updated": row.get("updatedAt") or 0})
         return _named(rows)
     if provider == "pi":
-        base = Path(
+        base = home or Path(
             os.environ.get("PI_CODING_AGENT_SESSION_DIR")
             or Path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")) / "sessions"
         ).expanduser()
@@ -889,6 +960,24 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     provider = args.provider or ""
     session_id = None
     existing = registered
+    account_name = args.account or (existing["account"] if existing else None)
+    account = resolve_account(conn, account_name) if account_name else None
+    if account_name and not account:
+        raise SystemExit(
+            f"unknown account: {account_name} — add it: "
+            f"radio account add {account_name} --provider <provider>"
+        )
+    if account and provider and provider != account["provider"]:
+        raise SystemExit(
+            f"account {account['name']} belongs to {account['provider']}, not {provider}"
+        )
+    if account:
+        provider = account["provider"]
+    # A session recorded under another account cannot be resumed here.
+    account_changed = bool(
+        account and existing and existing["account"] and existing["account"] != account["name"]
+    )
+    recorded_session = None if account_changed else (existing["agent_session"] if existing else None)
     if existing is not None and existing["workspace"] == "" and workspace:
         # A pre-scope row bound to this workspace: adopt it into the scope so
         # a rejoin never forks a duplicate row for the same pane.
@@ -936,13 +1025,13 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         and not args.new
         and existing
         and existing["agent"]
-        and existing["agent_session"]
+        and recorded_session
     ):
         # This handle already ran here: offer its recorded session before
         # asking for provider/session from scratch.
         idx = choose(
             f'"{handle}" already joined as {existing["agent"]} '
-            f"(session {existing['agent_session'][:8]}) — bring it back?",
+            f"(session {recorded_session[:8]}) — bring it back?",
             ["Bring it back — resume the recorded session",
              "Start over — pick provider and session again"],
         )
@@ -950,7 +1039,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             raise SystemExit("cancelled")
         if idx == 0:
             provider = existing["agent"]
-            session_id = existing["agent_session"]
+            session_id = recorded_session
 
     if interactive and not provider:
         provider = ask_provider(handle)
@@ -958,16 +1047,20 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         # Explicit --resume: the ledger's recorded session (backfilled from the
         # live pane) is authoritative; the provider disk search is the fallback.
         # Never silently start fresh — a missed resume is an error, not a new chat.
-        if existing and existing["agent"] == provider and existing["agent_session"]:
-            session_id = existing["agent_session"]
+        if existing and existing["agent"] == provider and recorded_session:
+            session_id = recorded_session
         else:
-            found = find_named_session(provider, handle)
+            found = find_named_session(provider, handle, home=provider_home(provider, account))
             if found:
                 session_id = found["id"]
             else:
                 raise SystemExit(f"no saved {provider} session named {handle}")
     elif provider and interactive and not session_id:
-        found = None if args.new else find_named_session(provider, handle)
+        found = (
+            None
+            if args.new
+            else find_named_session(provider, handle, home=provider_home(provider, account))
+        )
         if found:
             cwd = found["cwd"] or "cwd unknown"
             idx = choose(
@@ -999,7 +1092,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         # relay backfills the real id once the agent is up.
         agent_session = None
     else:
-        agent_session = pane_session or (existing["agent_session"] if existing else None)
+        agent_session = pane_session or recorded_session
     ref = f"herdr:{pane_id}" if pane else "manual"
     if ref == "manual" and existing and existing["session_ref"].startswith("herdr:"):
         old_pane = existing["session_ref"].removeprefix("herdr:")
@@ -1011,20 +1104,23 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     else:
         role = existing["role"] if existing else None
     ts = now()
+    account_value = account["name"] if account else (existing["account"] if existing else None)
     conn.execute(
-        """INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, created_at, last_seen)
-           VALUES (?,?,?,?,?,?,?,?)
+        """INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, account, created_at, last_seen)
+           VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(workspace, name) DO UPDATE SET session_ref=excluded.session_ref,
                                                       agent=excluded.agent,
                                                       agent_session=excluded.agent_session,
                                                       role=excluded.role,
+                                                      account=excluded.account,
                                                       last_seen=excluded.last_seen""",
-        (workspace, handle, ref, provider or None, agent_session, role, ts, ts),
+        (workspace, handle, ref, provider or None, agent_session, role, account_value, ts, ts),
     )
     conn.commit()
     session_note = f", {provider} session {agent_session[:8]}" if provider and agent_session else ""
+    account_note = f", account {account['name']}" if account else ""
     where_note = f" in workspace {workspace}" if workspace else ""
-    print(f"{handle} joined{where_note} ({ref}{session_note})")
+    print(f"{handle} joined{where_note} ({ref}{session_note}{account_note})")
 
     if ref != "manual":
         # Catch-up compaction: a handle rejoining on a live pane must not get
@@ -1068,6 +1164,8 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     argv = launch_argv(provider, handle, session_id, fresh=fresh, workspace=workspace, role=role)
     env = os.environ.copy()
     env["RADIO_HANDLE"] = handle
+    if account:
+        env.update(account_env(account))
     if provider == "opencode":
         # No append flag/hook channel; briefing ships as an `instructions`
         # file via a per-handle OPENCODE_CONFIG file. (OPENCODE_CONFIG_CONTENT
@@ -1144,6 +1242,72 @@ def cmd_part(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     )
     conn.commit()
     print(f"{row['name']} parted")
+    return 0
+
+
+def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Manage named provider accounts: several logins of one provider on the
+    same machine. An account is a config home; joining with --account exports
+    the provider's home variable so the agent runs that login, and restore
+    brings the same login back because the handle records it."""
+    command = getattr(args, "account_command", None)
+    if command == "add":
+        name = args.name.removeprefix("@")
+        if not HANDLE_RE.match(name):
+            raise SystemExit(f"invalid account name: {name!r} (allowed: letters, digits, _ . -)")
+        if resolve_account(conn, name):
+            raise SystemExit(f"account already exists: {name}")
+        directory = (
+            Path(args.dir).expanduser() if args.dir else default_account_dir(args.provider, name)
+        )
+        conn.execute(
+            "INSERT INTO accounts(name, provider, dir, created_at) VALUES (?,?,?,?)",
+            (name, args.provider, str(directory), now()),
+        )
+        conn.commit()
+        print(f"account {name} -> {args.provider} · {directory}")
+        print(f"  {auth_status(args.provider, directory)}")
+        if not directory.exists():
+            print("  note: the home does not exist yet — create it and log in before joining")
+        return 0
+    if command == "list":
+        rows = conn.execute("SELECT * FROM accounts ORDER BY provider, name").fetchall()
+        if not rows:
+            print("no accounts — add one: radio account add codex2 --provider codex")
+            return 0
+        for row in rows:
+            users = [
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM handles WHERE account = ? ORDER BY name", (row["name"],)
+                ).fetchall()
+            ]
+            print(f"{row['name']:<12} {row['provider']:<8} {row['dir']}")
+            print(f"  {auth_status(row['provider'], Path(row['dir']))}")
+            if users:
+                print(f"  used by: {', '.join(users)}")
+        return 0
+    if command == "remove":
+        row = resolve_account(conn, args.name)
+        if not row:
+            raise SystemExit(f"unknown account: {args.name}")
+        users = [
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM handles WHERE account = ? ORDER BY name", (row["name"],)
+            ).fetchall()
+        ]
+        if users:
+            raise SystemExit(
+                f"account {row['name']} is in use by: {', '.join(users)} — part or rejoin them first"
+            )
+        conn.execute("DELETE FROM accounts WHERE name = ?", (row["name"],))
+        conn.commit()
+        print(f"account {row['name']} removed")
+        return 0
+    print("usage: radio account add <name> --provider <provider> [--dir <path>]")
+    print("       radio account list")
+    print("       radio account remove <name>")
     return 0
 
 
@@ -1275,6 +1439,8 @@ def handle_status(row: sqlite3.Row) -> str:
 def handle_line(row: sqlite3.Row) -> str:
     """One roster line plus an indented role snippet when a role is set."""
     provider = row["agent"] or "-"
+    if row["account"]:
+        provider = f'{provider}/{row["account"]}'
     session = (row["agent_session"] or "-")[:8]
     line = (
         f"  {row['name']:<20} {handle_status(row):<26} {row['session_ref']:<14} "
@@ -1772,6 +1938,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("handle", nargs="?", help="defaults to the current pane label")
     p.add_argument("--pane", help="join a pane from outside (e.g. w1:p5)")
     p.add_argument("--provider", choices=PROVIDERS, help="agent provider to launch")
+    p.add_argument("--account", help="named account to launch with (implies its provider); "
+                                     "manage accounts with `radio account`")
     p.add_argument("--new", action="store_true", help="start a new session without asking")
     p.add_argument("--resume", action="store_true", help="resume the named session without asking")
     p.add_argument("--model", help="opencode: model to run (e.g. opencode/deepseek-v4-flash); "
@@ -1795,6 +1963,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("handles", help="list joined handles")
     p.add_argument("workspace", nargs="?", help="workspace id or label to list; inside a pane "
                                                 "the roster always shows this workspace only")
+
+    p = sub.add_parser("account", help="named provider accounts (several logins of one provider)")
+    acct = p.add_subparsers(dest="account_command")
+    ap = acct.add_parser("add", help="register an account home")
+    ap.add_argument("name")
+    ap.add_argument("--provider", required=True, choices=PROVIDERS)
+    ap.add_argument("--dir", help="config home; default: the provider's convention "
+                                  "(codex2 -> ~/.codex-account-2)")
+    acct.add_parser("list", help="list accounts with auth state")
+    ap = acct.add_parser("remove", help="remove an unused account")
+    ap.add_argument("name")
 
     p = sub.add_parser("role", help="show, set, or clear a handle's role paragraph")
     p.add_argument("handle")
@@ -1955,6 +2134,12 @@ def cmd_restore(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             f'{row["name"]} has no recorded provider — join it once with a provider: '
             f'radio join {row["name"]} --provider <name>'
         )
+    account = resolve_account(conn, row["account"]) if row["account"] else None
+    if row["account"] and not account:
+        raise SystemExit(
+            f'account {row["account"]} for {row["name"]} is no longer defined — add it back '
+            f'(radio account add {row["account"]} --provider {row["agent"]}) or part the handle'
+        )
     pane_id = pane_id_of(row["session_ref"])
     if not pane_id:
         raise SystemExit(
@@ -1994,6 +2179,8 @@ def cmd_restore(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     if entered.returncode != 0:
         raise SystemExit(f'could not submit the command in {pane_id}: {(entered.stderr or "").strip()}')
     print(f'restoring {row["name"]} in {pane_id}: {command}')
+    if account:
+        print(f'  account: {account["name"]} ({account["dir"]})')
     print('the agent boots in that pane; radio handles shows it live once detected')
     return 0
 
@@ -2049,6 +2236,7 @@ def main() -> int:
             "part": cmd_part,
             "pm": cmd_pm,
             "handles": cmd_handles,
+            "account": cmd_account,
             "role": cmd_role,
             "restore": cmd_restore,
             "briefing": cmd_briefing,
