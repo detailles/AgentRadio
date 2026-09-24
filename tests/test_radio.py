@@ -1348,6 +1348,22 @@ class WinShimTest(RadioTestCase):
         self.assertIn("left alone", msg)
         self.assertIn("someone else's radio", shim.read_text(encoding="utf-8"))
 
+    def test_append_path_entry_appends_and_dedupes(self):
+        target = r"C:\Users\x\.local\bin"
+        self.assertEqual(self.win_shim.append_path_entry("", target), target)
+        self.assertEqual(
+            self.win_shim.append_path_entry(r"C:\Windows;C:\Tools", target),
+            r"C:\Windows;C:\Tools;" + target,
+        )
+        self.assertIsNone(self.win_shim.append_path_entry(target + r";D:\x", target))
+        self.assertEqual(
+            self.win_shim.append_path_entry(r"C:\Windows;;", target),
+            r"C:\Windows;" + target,
+        )
+
+    def test_ensure_user_path_noop_off_windows(self):
+        self.assertIsNone(self.win_shim.ensure_user_path(self.link_dir))
+
     def test_foreign_resolver_is_left_alone(self):
         self.link_dir.mkdir(parents=True, exist_ok=True)
         resolver = self.link_dir / self.win_shim.RESOLVER_FILE
