@@ -9,7 +9,6 @@ plugin state dir (when running as a Herdr plugin command), $RADIO_HOME, or
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -17,13 +16,22 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import termios
 import time
-import tty
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:  # POSIX only: the relay's flock and the raw-key menu.
+    import fcntl
+    import termios
+    import tty
+except ImportError:  # Windows: see relay_lock and choose_plain for the fallbacks.
+    fcntl = termios = tty = None
+try:  # Windows only: byte-range file lock, the relay's single-instance primitive.
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 # Split timeouts: one wedged herdr must not stall the relay daemon — a
 # read-only pane lookup gets 2s, a real delivery (agent prompt / send-text /
@@ -32,7 +40,7 @@ HERDR_READ_TIMEOUT = 2
 HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
-VERSION = "0.2.7"  # keep in sync with herdr-plugin.toml
+VERSION = "0.2.8"  # keep in sync with herdr-plugin.toml
 
 
 def state_dir() -> Path:
@@ -336,7 +344,12 @@ def auth_status(provider: str) -> str:
 
 
 def choose(question: str, options: list[str], default: int = 0) -> int | None:
-    """Arrow-key menu on the tty. Returns the chosen index, or None if cancelled."""
+    """Pick one option interactively. POSIX terminals get the arrow-key menu;
+    platforms without termios (Windows) get the numbered line picker, so every
+    interactive flow (provider pick, resume prompts) works there too. Returns
+    the chosen index, or None if cancelled."""
+    if termios is None:
+        return choose_plain(question, options, default)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     idx = default
@@ -384,6 +397,29 @@ def choose(question: str, options: list[str], default: int = 0) -> int | None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\x1b[?25h")
         sys.stdout.flush()
+
+
+def choose_plain(question: str, options: list[str], default: int = 0) -> int | None:
+    """Numbered, line-based menu for terminals without raw-key support
+    (Windows). Enter takes the default, 'q' cancels, anything else re-prompts."""
+    while True:
+        sys.stdout.write(f"{question}\n")
+        for i, opt in enumerate(options, start=1):
+            mark = "*" if i - 1 == default else " "
+            sys.stdout.write(f"  {mark} {i}) {opt}\n")
+        sys.stdout.write(f"select 1-{len(options)} (Enter = {default + 1}, q = cancel): ")
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        if line == "":  # stdin closed mid-pick
+            return None
+        answer = line.strip()
+        if not answer:
+            return default
+        if answer in ("q", "Q"):
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return int(answer) - 1
+        sys.stdout.write("invalid choice\n")
 
 
 def _named(rows: list[dict]) -> dict | None:
@@ -548,6 +584,53 @@ def launch_argv(
         # see cmd_join. Session ids are server-generated; resume only.
         return ["opencode"] + (["--session", session_id] if session_id else [])
     raise SystemExit(f"unknown provider: {provider}")
+
+
+def agent_launch_argv(argv: list[str]) -> list[str]:
+    """Resolve the provider binary and adapt the argv for the OS: Windows
+    npm-style shims (.cmd/.bat) cannot be CreateProcess'd directly, so they run
+    through cmd /c; POSIX execs the resolved path."""
+    target = shutil.which(argv[0]) or argv[0]
+    if os.name == "nt" and Path(target).suffix.lower() in (".cmd", ".bat"):
+        return ["cmd.exe", "/c", target, *argv[1:]]
+    return [target, *argv[1:]]
+
+
+def windows_command_line(argv: list[str]) -> str:
+    """The command-line string for a Windows launch. A .cmd/.bat target runs
+    via cmd /c (CreateProcess cannot start batch files); cmd /c strips a lone
+    outer quote pair, so a space-bearing target path gets the documented extra
+    pair — otherwise cmd would split the path at its first space."""
+    if len(argv) >= 3 and Path(argv[0]).name.lower() == "cmd.exe" and argv[1].lower() == "/c":
+        target, rest = argv[2], subprocess.list2cmdline(argv[3:])
+        body = f'"{target}"' + (f" {rest}" if rest else "")
+        if " " in target:
+            body = f'"{body}"'
+        return f"cmd.exe /c {body}"
+    return subprocess.list2cmdline(argv)
+
+
+def exec_or_wait(argv: list[str], env: dict[str, str]) -> int:
+    """Hand the terminal to another program. POSIX execs in place — the pane's
+    foreground process becomes the target. Windows has no true exec (the CRT
+    spawns a process and exits, which would return the shell prompt while the
+    target still runs), so the target runs as a waited-for child instead."""
+    if os.name == "nt":
+        try:
+            return subprocess.run(windows_command_line(argv), env=env).returncode
+        except OSError as exc:
+            raise SystemExit(f"launch failed: {exc}")
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as exc:
+        raise SystemExit(f"launch failed: {exc}")
+    return 0  # unreachable
+
+
+def launch_agent(argv: list[str], env: dict[str, str]) -> int:
+    """Resolve the provider CLI for this OS (see agent_launch_argv) and hand
+    the terminal to it; returns only on the Windows wait path."""
+    return exec_or_wait(agent_launch_argv(argv), env)
 
 
 def ask_provider(handle: str) -> str:
@@ -781,11 +864,7 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     elif args.model:
         print(f"note: --model is only wired for opencode; ignoring for {provider}")
     print(f"launching: {' '.join(argv)}")
-    try:
-        os.execvpe(argv[0], argv, env)
-    except OSError as exc:
-        raise SystemExit(f"launch failed: {exc}")
-    return 0  # unreachable
+    return launch_agent(argv, env)
 
 
 def briefing_text(handle: str) -> str:
@@ -1214,10 +1293,10 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
 
 
 def cmd_view(_args: argparse.Namespace) -> int:
-    """Hand off to the Textual view (bin/radio-view) via run-view.sh; replaces this process."""
-    script = Path(__file__).resolve().parent / "run-view.sh"
-    os.execvp("sh", ["sh", str(script)])
-    return 0  # unreachable
+    """Hand off to the Textual view (bin/radio-view) through the cross-platform
+    launcher (bin/run-view.py picks the venv interpreter)."""
+    launcher = Path(__file__).resolve().parent / "run-view.py"
+    return exec_or_wait([sys.executable, str(launcher)], os.environ.copy())
 
 
 def changed_events(events: list[str], seen: dict[str, str]) -> list[str]:
@@ -1236,15 +1315,37 @@ def changed_events(events: list[str], seen: dict[str, str]) -> list[str]:
     return out
 
 
+def relay_lock(lock_fd) -> bool:
+    """Take the relay's single-instance lock without blocking: POSIX flock on
+    the open lock file, or a one-byte msvcrt.locking region on Windows (the
+    file is kept non-empty so the region exists). False when another relay
+    already holds it."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            lock_fd.seek(0)
+            if lock_fd.read(1) == "":
+                lock_fd.write("1")
+                lock_fd.flush()
+            lock_fd.seek(0)  # lock byte 0 regardless of the read position
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            raise SystemExit("radio relay: no file locking on this platform")
+        return True
+    except OSError:
+        return False
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
-    """Run the delivery relay daemon: single instance via flock, ticking
+    """Run the delivery relay daemon: single instance via relay_lock, ticking
     relay_tick on the interval, re-execing itself when the script changes on
     disk so a deploy never leaves stale code running."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(LOCK_PATH, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    # 'a+', not 'w': Windows refuses to truncate a file whose bytes another
+    # process holds locked, so the second relay must open without truncating.
+    lock_fd = open(LOCK_PATH, "a+")
+    if not relay_lock(lock_fd):
         print("radio relay already running (lock held)", file=sys.stderr)
         return 1
     print(f"radio relay · db: {DB_PATH} · interval {args.interval}s")

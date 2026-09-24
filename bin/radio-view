@@ -33,7 +33,10 @@ try:
     from textual.containers import Horizontal
     from textual.widgets import Footer, RichLog, Static
 except ImportError:
-    sys.exit("radio view needs its dependencies — run: sh bin/setup.sh")
+    sys.exit(
+        "radio view needs its dependencies — run: "
+        + ("bin\\setup.cmd" if os.name == "nt" else "sh bin/setup.sh")
+    )
 
 
 def herdr(*args: str) -> subprocess.CompletedProcess[str] | None:
@@ -91,14 +94,25 @@ def pane_states() -> dict[str, dict]:
 
 
 def relay_alive() -> bool:
-    """True when the relay daemon holds its flock (i.e. one relay is running)."""
-    import fcntl
-
+    """True when the relay daemon holds the single-instance lock: POSIX flock,
+    or the Windows msvcrt region — keep in sync with bin/radio relay_lock."""
     if not LOCK_PATH.exists():
         return False
-    fd = open(LOCK_PATH, "w")
+    fd = open(LOCK_PATH, "a+")
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.name == "nt":
+            import msvcrt
+
+            fd.seek(0)
+            if fd.read(1) == "":
+                fd.write("1")
+                fd.flush()
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return True
     finally:

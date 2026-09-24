@@ -6,10 +6,10 @@
   A local message bus for agents running in <a href="https://herdr.dev">Herdr</a> panes.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.7-7dcfff?style=flat-square" alt="version">
-  <img src="https://img.shields.io/badge/python-3.8%2B%20stdlib-bb9af7?style=flat-square" alt="python">
+  <img src="https://img.shields.io/badge/version-0.2.8-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/python-3.10%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
-  <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux-e0af68?style=flat-square" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux%20%7C%20windows-e0af68?style=flat-square" alt="platform">
 </p>
 
 <p align="center">
@@ -43,22 +43,30 @@ Deliberately excluded:
 
 ## Install
 
-Requires **herdr ≥ 0.9.0** and **python3 ≥ 3.10** — nothing else: the CLI and relay are pure stdlib, and the view's one dependency (Textual) is installed automatically into a plugin-local venv.
+Requires **herdr ≥ 0.9.0** and **Python 3.10+** — nothing else: the CLI and relay are pure stdlib, and the view's one dependency (Textual) is installed automatically into a plugin-local venv.
 
 ```bash
 herdr plugin install detailles/AgentRadio   # or: herdr plugin link /path/to/clone
 ```
 
-The install links `radio` into `~/.local/bin` when that directory exists, and the startup hook repairs that link on every Herdr start — the managed plugin dir is content-hashed and changes on every update, so a link made by hand would dangle. If `~/.local/bin` is not on your PATH, or you want the link elsewhere, point one at the plugin root yourself:
+On macOS and Linux the install links `radio` into `~/.local/bin` when that directory exists, and the startup hook repairs that link on every Herdr start — the managed plugin dir is content-hashed and changes on every update, so a link made by hand would dangle. If `~/.local/bin` is not on your PATH, or you want the link elsewhere, point one at the plugin root yourself:
 
 ```bash
 ROOT="$(herdr plugin list --json | python3 -c 'import json,sys; print(next(p["plugin_root"] for p in json.load(sys.stdin)["result"]["plugins"] if p["plugin_id"]=="radio"))')"
 ln -s "$ROOT/bin/radio" ~/.local/bin/radio
 ```
 
-The relay starts itself via the plugin's startup hook. If the view's venv step is skipped during install (no PyPI access, no pip/uv), the install still succeeds — CLI and relay work, and the view activates later with `sh bin/setup.sh`.
+On Windows the install writes a generated `radio.cmd` shim into `%USERPROFILE%\.local\bin` and the startup hook refreshes it on every update. The shim probes for `py -3`, `python`, then `python3` — Python 3.10+ must be on PATH. Add the shim directory to your user PATH once, then open a new terminal:
 
-To update an installed plugin, run the same install command again — Herdr replaces the managed copy in place and the startup hook re-points the CLI link; no uninstall is needed.
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:USERPROFILE + '\.local\bin', 'User')
+```
+
+Herdr's plugin support is **preview on Windows**: CLI, push delivery, and the view work; the gemini/kimi briefing hooks are POSIX-only and are not installed there.
+
+The relay starts itself via the plugin's startup hook. If the view's venv step is skipped during install (no PyPI access, no pip/uv), the install still succeeds — CLI and relay work, and the view activates later with `sh bin/setup.sh` (Windows: `bin\setup.cmd`).
+
+To update an installed plugin, run the same install command again — Herdr replaces the managed copy in place and the startup hook refreshes the CLI link or shim; no uninstall is needed.
 
 ## Quick start
 
@@ -139,7 +147,7 @@ The bus layer is provider-agnostic. `radio join` can launch an agent CLI into th
 | qwen | `--append-system-prompt` | `--resume <id>` | written, untested |
 | pi | — | `--session <id>` | written, untested |
 
-For gemini and qwen, join assigns the session id itself, so resume is exact.
+For gemini and qwen, join assigns the session id itself, so resume is exact. The gemini and kimi briefing hooks are installed on macOS/Linux only.
 
 ### Security notes
 
@@ -158,6 +166,7 @@ The ledger lives at `$RADIO_HOME/radio.db`, or `~/.local/share/herdr-radio/radio
 ## Known issues
 
 - **Herdr agent detection vs. bundled CLIs.** Providers that ship as one bundled binary (gemini, qwen) aren't yet recognized as agents by Herdr's pane detection. Consequence: such a handle can show as `gone` while its pane is alive, and delivery falls back to `send-text`. Radio still works; the status column is the casualty. Herdr-side gap, to be fixed there.
+- **Windows (preview).** Herdr's plugin surface is preview on Windows: Radio's CLI, relay, and view work there, but the gemini/kimi briefing hooks are POSIX-only, and a radio-launched agent that ships as a `.cmd` shim starts through `cmd /c`.
 
 ## License
 
