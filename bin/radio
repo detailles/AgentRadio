@@ -41,6 +41,7 @@ HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 VERSION = "0.3.0"  # keep in sync with herdr-plugin.toml
+SCHEMA_VERSION = 1  # PRAGMA user_version this build writes; a newer ledger needs a newer radio
 
 
 def state_dir() -> Path:
@@ -107,10 +108,20 @@ def now() -> str:
 
 def connect() -> sqlite3.Connection:
     """Open the SQLite ledger (creating it and the schema as needed), apply
-    any pending migrations, and return a Row-factory connection."""
+    any pending migrations, and return a Row-factory connection. A ledger
+    written by a newer radio is refused with a clear message instead of a
+    traceback; `radio repair --reset` is the way out."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version > SCHEMA_VERSION:
+        conn.close()
+        raise SystemExit(
+            f"this ledger was written by a newer radio (schema {version}, this build "
+            f"knows {SCHEMA_VERSION}); update the plugin, or run "
+            "`radio repair --reset` to start from an empty ledger"
+        )
     conn.executescript(SCHEMA)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(handles)").fetchall()}
     # Pre-scope ledgers first: the rebuild below copies these columns, so they
@@ -169,6 +180,7 @@ def connect() -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_deliveries_scope ON deliveries(target_ws, target, status)"
     )
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
     return conn
 
@@ -1759,8 +1771,121 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("relay", help="run the delivery relay daemon")
     p.add_argument("--interval", type=float, default=0.5)
 
+    p = sub.add_parser("repair", help="diagnose the ledger, or --reset it (a backup is kept)")
+    p.add_argument("--reset", action="store_true",
+                   help="replace the ledger with a fresh empty one; the old files stay as backups")
+    p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+
     sub.add_parser("view", help="live roster + message stream TUI")
     return parser
+
+
+def relay_running() -> bool:
+    """True when the relay daemon holds its lock (probe only: a lock this
+    probe takes is released immediately)."""
+    if not LOCK_PATH.exists():
+        return False
+    fd = open(LOCK_PATH, "a+")
+    try:
+        return not relay_lock(fd)
+    finally:
+        fd.close()
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    """Diagnose the ledger (default) or replace it with a fresh one (--reset).
+    Repair is the supported way out of a broken state — a corrupt database, a
+    ledger written by a newer radio, or a half-applied migration. --reset
+    snapshots the old ledger beside it first, so nothing is destroyed."""
+    if args.reset:
+        return repair_reset(args)
+    return repair_check()
+
+
+def repair_check() -> int:
+    """Print a short ledger health report; exit 1 when --reset is warranted."""
+    problems: list[str] = []
+    counts = {"handles": 0, "messages": 0, "deliveries": 0}
+    integrity = "unreadable"
+    version = -1
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+            for table in counts:
+                try:
+                    counts[table] = int(
+                        conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()[0]
+                    )
+                except sqlite3.Error:
+                    problems.append(f"table unreadable: {table}")
+    except sqlite3.Error as exc:
+        problems.append(f"cannot open the ledger: {exc}")
+    if version > SCHEMA_VERSION:
+        problems.append(
+            f"ledger schema {version} is newer than this radio ({SCHEMA_VERSION})"
+        )
+    if integrity != "ok":
+        problems.append(f"integrity check: {integrity}")
+    print(f"ledger:    {DB_PATH}")
+    print(f"schema:    {version if version >= 0 else '?'} (this radio: {SCHEMA_VERSION})")
+    print(f"integrity: {integrity}")
+    print(
+        f"handles: {counts['handles']} · messages: {counts['messages']} · "
+        f"deliveries: {counts['deliveries']}"
+    )
+    print(f"relay:     {'running' if relay_running() else 'not running'}")
+    if problems:
+        for problem in problems:
+            print(f"problem:   {problem}")
+        print("recover:   radio repair --reset   (keeps a backup beside the ledger)")
+        return 1
+    print("verdict:   healthy")
+    return 0
+
+
+def repair_reset(args: argparse.Namespace) -> int:
+    """Snapshot the ledger and rebuild an empty schema. The snapshot uses
+    SQLite's online backup API, so a running relay cannot corrupt it; when the
+    tables cannot be dropped (corrupt database), the files are moved aside
+    instead. Data is never deleted without a backup beside it."""
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise SystemExit("radio repair --reset needs --yes when not interactive")
+        answer = input(
+            f"Replace {DB_PATH} with an empty ledger? A backup is kept beside it. [y/N] "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("cancelled")
+            return 0
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup = DB_PATH.with_name(f"{DB_PATH.name}.bak-{stamp}")
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=10)) as src, closing(
+            sqlite3.connect(backup, timeout=10)
+        ) as dst:
+            src.backup(dst)
+        print(f"backup:    {backup}")
+    except sqlite3.Error as exc:
+        print(f"backup:    failed ({exc}) — the old files are kept as-is")
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+            for table in ("deliveries", "messages", "handles"):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            # The version marker lives in the file header, not the tables: a
+            # newer-schema ledger must lose it too, or connect() refuses again.
+            conn.execute("PRAGMA user_version = 0")
+            conn.commit()
+    except sqlite3.Error:
+        # Corrupt database: move the files aside and start over.
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(DB_PATH) + suffix)
+            if path.exists():
+                path.rename(Path(f"{path}.bak-{stamp}"))
+    with closing(connect()):
+        pass  # rebuilds the schema and stamps the current version
+    print(f"fresh:     {DB_PATH}")
+    return 0
 
 
 def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -1792,6 +1917,8 @@ def main() -> int:
         return cmd_relay(args)
     if args.command == "view":
         return cmd_view(args)
+    if args.command == "repair":
+        return cmd_repair(args)
     with closing(connect()) as conn:
         handler = {
             "join": cmd_join,
