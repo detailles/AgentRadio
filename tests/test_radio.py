@@ -432,10 +432,10 @@ class NormalizeHandleTest(RadioTestCase):
         self.assertEqual(row["to_handle"], "bob")
 
 
-def join_args(handle, pane=None, role=None):
+def join_args(handle, pane=None, role=None, account=None):
     return argparse.Namespace(handle=handle, pane=pane, provider=None,
                               new=False, resume=False, model=None, role=role,
-                              no_launch=True)
+                              account=account, no_launch=True)
 
 
 class ResolveHandleTest(RadioTestCase):
@@ -801,6 +801,92 @@ class ScopedJoinTest(RadioTestCase):
         self.assertEqual(rows[0]["workspace"], "w2")
 
 
+class AccountTest(RadioTestCase):
+    """Named provider accounts: several logins of one provider, recorded on the
+    handle so restore brings the same login back."""
+
+    def setUp(self):
+        super().setUp()
+        saved_herdr = radio.herdr
+        self.addCleanup(setattr, radio, "herdr", saved_herdr)
+        radio.herdr = lambda *args, **kwargs: subprocess.CompletedProcess(
+            list(args), 0, stdout="", stderr=""
+        )
+        saved_fetch = radio.fetch_pane
+        self.addCleanup(setattr, radio, "fetch_pane", saved_fetch)
+        self.panes = {"w2:p1": {"label": "coder", "workspace_id": "w2"}}
+        radio.fetch_pane = lambda pane_id: self.panes.get(pane_id)
+
+    def run_account(self, *argv):
+        buf = io.StringIO()
+        args = radio.build_parser().parse_args(["account", *argv])
+        with contextlib.redirect_stdout(buf):
+            rc = radio.cmd_account(self.conn, args)
+        return rc, buf.getvalue()
+
+    def test_default_dirs_follow_the_harness_convention(self):
+        self.assertEqual(radio.default_account_dir("codex", "codex"), Path.home() / ".codex")
+        self.assertEqual(
+            radio.default_account_dir("codex", "codex2"), Path.home() / ".codex-account-2"
+        )
+        self.assertEqual(
+            radio.default_account_dir("claude", "claude3"), Path.home() / ".claude-account-3"
+        )
+
+    def test_account_env_maps_provider_homes(self):
+        self.assertEqual(
+            radio.account_env({"provider": "codex", "dir": r"C:\x"}), {"CODEX_HOME": r"C:\x"}
+        )
+        self.assertEqual(
+            radio.account_env({"provider": "claude", "dir": "/x"}),
+            {"CLAUDE_CONFIG_DIR": "/x"},
+        )
+        self.assertEqual(
+            radio.account_env({"provider": "kimi", "dir": "/x"}),
+            {"KIMI_CODE_HOME": "/x", "KIMI_HOME": "/x"},
+        )
+
+    def test_add_list_remove(self):
+        rc, out = self.run_account("add", "codex2", "--provider", "codex")
+        self.assertEqual(rc, 0)
+        self.assertIn("codex-account-2", out)
+        row = self.conn.execute("SELECT * FROM accounts WHERE name='codex2'").fetchone()
+        self.assertEqual(row["provider"], "codex")
+        rc, out = self.run_account("list")
+        self.assertIn("codex2", out)
+        self.assertIn(row["dir"], out)
+        rc, out = self.run_account("remove", "codex2")
+        self.assertIn("removed", out)
+        self.assertIsNone(self.conn.execute("SELECT * FROM accounts").fetchone())
+
+    def test_duplicate_and_in_use_guards(self):
+        self.run_account("add", "codex2", "--provider", "codex")
+        with self.assertRaises(SystemExit):
+            self.run_account("add", "codex2", "--provider", "codex")
+        self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex")
+        self.conn.execute("UPDATE handles SET account='codex2' WHERE name='coder'")
+        self.conn.commit()
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_account("remove", "codex2")
+        self.assertIn("in use by: coder", str(ctx.exception))
+
+    def test_join_with_account_records_it(self):
+        self.run_account("add", "codex2", "--provider", "codex")
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="codex2"))
+        row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
+        self.assertEqual((row["agent"], row["account"]), ("codex", "codex2"))
+
+    def test_join_rejects_unknown_account_and_provider_conflict(self):
+        with self.assertRaises(SystemExit):
+            radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="ghost"))
+        self.run_account("add", "codex2", "--provider", "codex")
+        args = join_args("coder", pane="w2:p1", account="codex2")
+        args.provider = "claude"
+        with self.assertRaises(SystemExit):
+            radio.cmd_join(self.conn, args)
+
+
 class RestoreTest(RadioTestCase):
     """radio restore: verify the pane still belongs to the handle, then type
     the join/resume command into it; never creates layout."""
@@ -873,6 +959,25 @@ class RestoreTest(RadioTestCase):
         self.add_handle("plain", ref="herdr:w2:p2", workspace="w2")
         with self.assertRaises(SystemExit):
             self.restore("plain")
+
+    def test_restore_reports_the_recorded_account(self):
+        self.conn.execute("UPDATE handles SET account='codex2' WHERE name='coder'")
+        self.conn.execute(
+            "INSERT INTO accounts(name, provider, dir, created_at) "
+            "VALUES ('codex2', 'codex', '/tmp/codex2', 't')"
+        )
+        self.conn.commit()
+        self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
+        rc, out = self.restore()
+        self.assertEqual(rc, 0)
+        self.assertIn("account: codex2", out)
+
+    def test_restore_reports_a_removed_account(self):
+        self.conn.execute("UPDATE handles SET account='codex2' WHERE name='coder'")
+        self.conn.commit()
+        with self.assertRaises(SystemExit) as ctx:
+            self.restore()
+        self.assertIn("no longer defined", str(ctx.exception))
 
 
 class ScopedRosterTest(RadioTestCase):
