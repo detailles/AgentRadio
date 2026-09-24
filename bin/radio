@@ -40,7 +40,7 @@ HERDR_READ_TIMEOUT = 2
 HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
-VERSION = "0.2.9"  # keep in sync with herdr-plugin.toml
+VERSION = "0.2.10"  # keep in sync with herdr-plugin.toml
 
 
 def state_dir() -> Path:

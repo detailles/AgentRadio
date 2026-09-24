@@ -142,12 +142,7 @@ def path_hint(link_dir: Path | None = None) -> str | None:
     """A one-line PATH hint when the shim directory is not on PATH (Windows
     PATH matching is case-insensitive); None when it is already reachable."""
     link_dir = link_dir or Path.home() / ".local" / "bin"
-    entries = {
-        os.path.normcase(os.path.normpath(part))
-        for part in os.environ.get("PATH", "").split(os.pathsep)
-        if part
-    }
-    if os.path.normcase(os.path.normpath(str(link_dir))) in entries:
+    if _on_path(link_dir):
         return None
     return (
         f"note: if `radio` is not recognized, add {link_dir} to PATH "
@@ -155,15 +150,86 @@ def path_hint(link_dir: Path | None = None) -> str | None:
     )
 
 
+def _norm_path(part: str) -> str:
+    """One PATH entry normalized for comparison (case-insensitive, with
+    %VAR%/$VAR references expanded, surrounding quotes dropped)."""
+    return os.path.normcase(os.path.normpath(os.path.expandvars(part.strip().strip('"'))))
+
+
+def _on_path(link_dir: Path, path: str | None = None) -> bool:
+    """True when link_dir is already visible in the given PATH (defaults to
+    the process PATH)."""
+    entries = (os.environ.get("PATH", "") if path is None else path).split(os.pathsep)
+    wanted = _norm_path(str(link_dir))
+    return any(_norm_path(entry) == wanted for entry in entries if entry.strip())
+
+
+def append_path_entry(existing: str, target: str) -> str | None:
+    """The user PATH string with target appended, or None when it already
+    contains target. Empty entries are dropped so the registry value stays
+    clean; every other entry is preserved verbatim."""
+    parts = [part.strip() for part in existing.split(";") if part.strip()]
+    if any(_norm_path(part) == _norm_path(target) for part in parts):
+        return None
+    return ";".join(parts + [str(target).strip()])
+
+
+def _broadcast_environment_change() -> None:
+    """Tell running shells and Explorer the environment changed. Best effort:
+    new processes read the registry anyway."""
+    import ctypes
+
+    try:
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 0x2, 5000, None)
+    except OSError:
+        pass
+
+
+def ensure_user_path(link_dir: Path | None = None) -> str | None:
+    """Windows only: append the shim directory to the user PATH (registry
+    HKCU\\Environment) when it is missing anywhere, so `radio` works without a
+    manual PATH command. Returns a status line, or None when nothing had to
+    change. A running terminal keeps its old environment — new ones see it."""
+    if os.name != "nt":
+        return None
+    import winreg
+
+    link_dir = link_dir or Path.home() / ".local" / "bin"
+    if _on_path(link_dir):
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as key:
+            try:
+                value, kind = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                value, kind = "", winreg.REG_EXPAND_SZ
+        updated = append_path_entry(str(value), str(link_dir))
+        if updated is None:
+            return None
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.SetValueEx(key, "Path", 0, kind, updated)
+    except OSError as exc:
+        return f"could not add {link_dir} to the user PATH: {exc}"
+    _broadcast_environment_change()
+    return f"added {link_dir} to the user PATH — restart the terminal once"
+
+
 def main() -> int:
-    """Refresh the shim and cache on Windows; a silent no-op elsewhere."""
+    """Refresh the shim, cache and user PATH on Windows; a silent no-op
+    elsewhere."""
     if os.name != "nt":
         return 0
     root = Path(os.environ.get("HERDR_PLUGIN_ROOT") or Path(__file__).resolve().parent.parent)
     print(ensure_shim(root))
-    hint = path_hint()
-    if hint:
-        print(hint)
+    added = ensure_user_path()
+    if added:
+        print(added)
+    else:
+        hint = path_hint()
+        if hint:
+            print(hint)
     return 0
 
 
