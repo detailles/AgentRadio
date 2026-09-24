@@ -1801,6 +1801,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text", nargs="*", help="the role paragraph; omitted, the current role prints")
     p.add_argument("--clear", action="store_true", help="remove the role")
 
+    p = sub.add_parser("restore", help="bring a handle's agent back into its pane")
+    p.add_argument("handle")
+
     p = sub.add_parser("briefing", help=argparse.SUPPRESS)  # used by provider hooks
     p.add_argument("handle")
 
@@ -1938,6 +1941,63 @@ def repair_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_restore(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Bring a handle's agent back into its own pane: verify the pane still
+    belongs to the handle, then type the join/resume command into it so the
+    normal launch path (briefing, provider env, recorded session) does the
+    work. Never creates layout — a missing pane is reported with what to do."""
+    scope = current_workspace()
+    row = resolve_handle(conn, args.handle, scope)
+    if not row:
+        raise SystemExit(no_handle_message(conn, args.handle, scope))
+    if not row["agent"]:
+        raise SystemExit(
+            f'{row["name"]} has no recorded provider — join it once with a provider: '
+            f'radio join {row["name"]} --provider <name>'
+        )
+    pane_id = pane_id_of(row["session_ref"])
+    if not pane_id:
+        raise SystemExit(
+            f'{row["name"]} is not bound to a pane — open a pane in '
+            f'{workspace_display(row["workspace"])} and run: '
+            f'radio join {row["name"]} --provider {row["agent"]}'
+        )
+    pane = fetch_pane(pane_id)
+    if not pane:
+        raise SystemExit(
+            f'pane {pane_id} is gone — open a pane in {workspace_display(row["workspace"])} '
+            f'and run: radio join {row["name"]} --provider {row["agent"]}'
+        )
+    if (pane.get("label") or "") != row["name"]:
+        raise SystemExit(
+            f'pane {pane_id} no longer belongs to {row["name"]} '
+            f'(label: {pane.get("label") or "none"})'
+        )
+    if row["workspace"] and (pane.get("workspace_id") or "") != row["workspace"]:
+        raise SystemExit(f'pane {pane_id} is in another workspace now')
+    live_agent = pane.get("agent")
+    if live_agent:
+        if live_agent == row["agent"]:
+            print(f'{row["name"]} is already running ({row["agent"]} in {pane_id})')
+            return 0
+        raise SystemExit(f'pane {pane_id} runs {live_agent}; part or clear it first')
+    if row["agent_session"]:
+        command = f'radio join {row["name"]} --provider {row["agent"]} --resume'
+    else:
+        command = f'radio join {row["name"]} --provider {row["agent"]}'
+        print(f'note: no recorded session for {row["name"]} — starting fresh')
+    typed = herdr("pane", "send-text", pane_id, command)
+    if typed.returncode != 0:
+        raise SystemExit(f'could not type into {pane_id}: {(typed.stderr or typed.stdout or "").strip()}')
+    time.sleep(0.4)  # let the paste land before Enter
+    entered = herdr("pane", "send-keys", pane_id, "enter")
+    if entered.returncode != 0:
+        raise SystemExit(f'could not submit the command in {pane_id}: {(entered.stderr or "").strip()}')
+    print(f'restoring {row["name"]} in {pane_id}: {command}')
+    print('the agent boots in that pane; radio handles shows it live once detected')
+    return 0
+
+
 def cmd_briefing(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Print the opening briefing for a handle. Single source of truth: the
     launch flags (claude/codex) and provider hooks (kimi/gemini) all render
@@ -1990,6 +2050,7 @@ def main() -> int:
             "pm": cmd_pm,
             "handles": cmd_handles,
             "role": cmd_role,
+            "restore": cmd_restore,
             "briefing": cmd_briefing,
             "log": cmd_log,
             "inbox": cmd_inbox,

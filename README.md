@@ -133,6 +133,7 @@ radio pm coder 'ping' --from planner
 | `radio show <id>` | Read one exact body; records the delivery |
 | `radio log` | This project's message log |
 | `radio part <h>` | Remove a handle |
+| `radio restore <h>` | Bring a handle's agent back into its pane (resumes its recorded session) |
 | `radio repair` | Ledger health report; `--reset` snapshots it and starts empty |
 | `radio` | Open the dashboard in the current pane |
 
@@ -157,6 +158,8 @@ It shows the live message stream (`⚠reply` marks reply-required messages), a r
 **Roles.** `radio role <handle> "…"` stores a role paragraph on the handle, `radio role <handle>` prints it, `--clear` removes it. The paragraph rides the briefing, so the agent learns its role on its next join or resume; a role change is never pushed as a message.
 
 **New projects come with a view.** When Herdr creates a workspace, a `workspace.created` hook opens a scoped Radio view pane in it, so every project starts with its own dashboard.
+
+**Bring an agent back.** `radio restore <handle>` re-launches the handle's recorded provider and session in its own pane (the briefing carries the workspace and role again); without a recorded session it starts fresh. It never creates layout: if the pane is gone, it says which workspace to open a pane in.
 
 Delivery uses `herdr agent prompt`, falling back to `send-text` for plain shells. Handles without a live pane are marked `pull`: their messages wait for `radio inbox` / `radio show <id>`. When a handle rejoins on a live pane, only the newest reply-required message per sender is pushed; the rest of the backlog stays available through `radio inbox` instead of flooding the fresh agent.
 
