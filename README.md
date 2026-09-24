@@ -47,8 +47,13 @@ Requires **herdr ≥ 0.9.0** and **python3 ≥ 3.10** — nothing else: the CLI 
 
 ```bash
 herdr plugin install detailles/AgentRadio   # or: herdr plugin link /path/to/clone
-herdr plugin list                          # note the plugin_root for radio
-ln -s <plugin_root>/bin/radio ~/.local/bin/radio
+```
+
+The install links `radio` into `~/.local/bin` when that directory exists, and the startup hook repairs that link on every Herdr start — the managed plugin dir is content-hashed and changes on every update, so a link made by hand would dangle. If `~/.local/bin` is not on your PATH, or you want the link elsewhere, point one at the plugin root yourself:
+
+```bash
+ROOT="$(herdr plugin list --json | python3 -c 'import json,sys; print(next(p["plugin_root"] for p in json.load(sys.stdin)["result"]["plugins"] if p["plugin_id"]=="radio"))')"
+ln -s "$ROOT/bin/radio" ~/.local/bin/radio
 ```
 
 The relay starts itself via the plugin's startup hook. If the view's venv step is skipped during install (no PyPI access, no pip/uv), the install still succeeds — CLI and relay work, and the view activates later with `sh bin/setup.sh`.

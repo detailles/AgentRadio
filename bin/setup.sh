@@ -7,6 +7,9 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Make the CLI reachable right after install (see bin/link-cli.sh).
+sh "$ROOT/bin/link-cli.sh"
+
 view_ready() {
   [ -x .venv/bin/python ] && .venv/bin/python -c "import textual" >/dev/null 2>&1
 }

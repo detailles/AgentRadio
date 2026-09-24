@@ -3,6 +3,8 @@
 # The relay itself holds an flock, so a second spawn exits harmlessly.
 LOG_DIR="${RADIO_HOME:-$HOME/.local/share/herdr-radio}"
 mkdir -p "$LOG_DIR"
+# Keep the `radio` CLI reachable after updates (see bin/link-cli.sh).
+sh "$(cd "$(dirname "$0")" && pwd)/link-cli.sh"
 if [ -n "$HERDR_PLUGIN_ROOT" ]; then
   RADIO_BIN="$HERDR_PLUGIN_ROOT/bin/radio"
 else
