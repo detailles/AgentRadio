@@ -477,6 +477,70 @@ class ResolveHandleTest(RadioTestCase):
         self.assertEqual([r["name"] for r in rows], ["bob"])
 
 
+class RepairTest(RadioTestCase):
+    """radio repair: a health report and --reset with a backup — the supported
+    way out of a corrupt ledger or one written by a newer radio."""
+
+    def run_repair(self, reset=False, yes=False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = radio.cmd_repair(argparse.Namespace(reset=reset, yes=yes))
+        return rc, buf.getvalue()
+
+    def test_health_report_on_a_fresh_ledger(self):
+        rc, out = self.run_repair()
+        self.assertEqual(rc, 0)
+        self.assertIn("verdict:   healthy", out)
+        self.assertIn(f"schema:    {radio.SCHEMA_VERSION}", out)
+
+    def test_newer_schema_is_reported_and_connect_refuses(self):
+        self.conn.execute("PRAGMA user_version = 99")
+        self.conn.commit()
+        rc, out = self.run_repair()
+        self.assertEqual(rc, 1)
+        self.assertIn("newer", out)
+        self.assertIn("radio repair --reset", out)
+        with self.assertRaises(SystemExit) as ctx:
+            radio.connect()
+        self.assertIn("newer radio", str(ctx.exception))
+
+    def test_reset_requires_yes_when_not_interactive(self):
+        saved = sys.stdin
+        sys.stdin = io.StringIO("")
+        self.addCleanup(setattr, sys, "stdin", saved)
+        with self.assertRaises(SystemExit):
+            self.run_repair(reset=True)
+
+    def test_reset_recovers_from_a_newer_schema(self):
+        self.conn.execute("PRAGMA user_version = 99")
+        self.conn.commit()
+        rc, out = self.run_repair(reset=True, yes=True)
+        self.assertEqual(rc, 0)
+        fresh = radio.connect()
+        self.addCleanup(fresh.close)
+        self.assertEqual(
+            fresh.execute("PRAGMA user_version").fetchone()[0], radio.SCHEMA_VERSION
+        )
+
+    def test_reset_keeps_a_backup_and_creates_an_empty_ledger(self):
+        self.add_handle("bob")
+        self.pm("alice", "bob", "hi")
+        rc, out = self.run_repair(reset=True, yes=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("backup:", out)
+        self.assertIn("fresh:", out)
+        backups = list(radio.STATE_DIR.glob("radio.db.bak-*"))
+        self.assertEqual(len(backups), 1)
+        backup = sqlite3.connect(backups[0])
+        self.addCleanup(backup.close)
+        names = [r[0] for r in backup.execute("SELECT name FROM handles")]
+        self.assertEqual(names, ["bob"])
+        fresh = radio.connect()
+        self.addCleanup(fresh.close)
+        self.assertEqual(fresh.execute("SELECT COUNT(*) AS c FROM handles").fetchone()["c"], 0)
+        self.assertEqual(fresh.execute("PRAGMA user_version").fetchone()[0], radio.SCHEMA_VERSION)
+
+
 class WorkspaceScopeTest(RadioTestCase):
     """Scoped identity: one name per workspace, resolution inside a workspace,
     the unscoped fallback, and the internal qualified form scripts use."""
