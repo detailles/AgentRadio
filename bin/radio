@@ -1260,6 +1260,10 @@ def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         directory = (
             Path(args.dir).expanduser() if args.dir else default_account_dir(args.provider, name)
         )
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"  note: could not create the home: {exc}")
         conn.execute(
             "INSERT INTO accounts(name, provider, dir, created_at) VALUES (?,?,?,?)",
             (name, args.provider, str(directory), now()),
@@ -1267,8 +1271,8 @@ def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         conn.commit()
         print(f"account {name} -> {args.provider} · {directory}")
         print(f"  {auth_status(args.provider, directory)}")
-        if not directory.exists():
-            print("  note: the home does not exist yet — create it and log in before joining")
+        print(f"  log in inside this home before relying on it "
+              f"(e.g. {ACCOUNT_ENV.get(args.provider, ('<ENV>',))[0]}={directory} {args.provider} login)")
         return 0
     if command == "list":
         rows = conn.execute("SELECT * FROM accounts ORDER BY provider, name").fetchall()

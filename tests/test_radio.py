@@ -847,11 +847,14 @@ class AccountTest(RadioTestCase):
         )
 
     def test_add_list_remove(self):
-        rc, out = self.run_account("add", "codex2", "--provider", "codex")
+        tmp_home = str(radio.STATE_DIR / "codex2-home")
+        rc, out = self.run_account("add", "codex2", "--provider", "codex", "--dir", tmp_home)
         self.assertEqual(rc, 0)
-        self.assertIn("codex-account-2", out)
+        self.assertIn("codex2", out)
         row = self.conn.execute("SELECT * FROM accounts WHERE name='codex2'").fetchone()
         self.assertEqual(row["provider"], "codex")
+        self.assertEqual(row["dir"], tmp_home)
+        self.assertTrue(Path(tmp_home).is_dir())  # the home is created for login
         rc, out = self.run_account("list")
         self.assertIn("codex2", out)
         self.assertIn(row["dir"], out)
@@ -860,7 +863,9 @@ class AccountTest(RadioTestCase):
         self.assertIsNone(self.conn.execute("SELECT * FROM accounts").fetchone())
 
     def test_duplicate_and_in_use_guards(self):
-        self.run_account("add", "codex2", "--provider", "codex")
+        self.run_account(
+            "add", "codex2", "--provider", "codex", "--dir", str(radio.STATE_DIR / "codex2-home")
+        )
         with self.assertRaises(SystemExit):
             self.run_account("add", "codex2", "--provider", "codex")
         self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex")
@@ -871,7 +876,9 @@ class AccountTest(RadioTestCase):
         self.assertIn("in use by: coder", str(ctx.exception))
 
     def test_join_with_account_records_it(self):
-        self.run_account("add", "codex2", "--provider", "codex")
+        self.run_account(
+            "add", "codex2", "--provider", "codex", "--dir", str(radio.STATE_DIR / "codex2-home")
+        )
         with contextlib.redirect_stdout(io.StringIO()):
             radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="codex2"))
         row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
@@ -880,7 +887,9 @@ class AccountTest(RadioTestCase):
     def test_join_rejects_unknown_account_and_provider_conflict(self):
         with self.assertRaises(SystemExit):
             radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="ghost"))
-        self.run_account("add", "codex2", "--provider", "codex")
+        self.run_account(
+            "add", "codex2", "--provider", "codex", "--dir", str(radio.STATE_DIR / "codex2-home")
+        )
         args = join_args("coder", pane="w2:p1", account="codex2")
         args.provider = "claude"
         with self.assertRaises(SystemExit):
