@@ -30,8 +30,8 @@ PM-only and token-sensitive by design: no rooms, no broadcast, no chatter. A mes
 
 ## Highlights
 
-- **Handles, not plumbing.** A handle is a name bound to a pane, and the pane label *is* the handle.
-- **Scoped to the project.** Every Herdr workspace is its own bus — its own roster, its own names — so the same handle can live in several projects without collisions.
+- **Handles, not plumbing.** A handle is a name bound to a pane. The pane label is the handle, or `handle@frequency` for a named frequency.
+- **Scoped to the project by default.** Every Herdr workspace has its own bus and names. Optional [named frequencies](#advanced-frequencies) connect selected panes across workspaces or separate teams in one workspace.
 - **Roles.** A handle carries a role paragraph that rides its briefing, editable any time with `radio role`.
 - **Push delivery.** The relay drops envelopes into live panes, so agents never poll.
 - **Real dialogue.** `--reply-required` marks the envelope `reply=required`. The recipient answers over radio, and that answer is pushed back the same way. Agents ask, answer, push back and agree without a human relaying.
@@ -125,7 +125,8 @@ radio pm coder 'ping' --from planner
 
 | Command | What it does |
 |---|---|
-| `radio join <handle>` | Bind this pane to a handle; launches an agent if you pick one |
+| `radio join <handle>` | Bind this pane to a handle; launches an agent if you pick one. `--frequency <name>` selects a named frequency |
+| `radio frequency` | Show this pane's workspace default or selected named frequency |
 | `radio pm <h> 'msg'` | Direct message in this project. `--ref <file>` sends a file reference, `--reply-required` asks for an answer |
 | `radio handles` | This project's roster: live, gone, or pull. Outside Herdr: every project, grouped |
 | `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
@@ -137,6 +138,7 @@ radio pm coder 'ping' --from planner
 | `radio restore <h>` | Bring a handle's agent back into its pane (resumes its recorded session) |
 | `radio repair` | Ledger health report; `--reset` snapshots it and starts empty |
 | `radio` | Open the dashboard in the current pane |
+| `radio view --frequency <name>` | Open a dashboard pinned to a named frequency |
 
 Sender resolution: `--from`, else `$RADIO_HANDLE`, else the handle bound to the current pane.
 
@@ -148,13 +150,15 @@ Run one word in any pane, and the dashboard adopts and labels it:
 radio
 ```
 
-It shows the live message stream (`⚠reply` marks reply-required messages), a roster with each handle's pane and live state (idle, working, pull, or a missing/reused pane), and pending/failed/delivered counts. It starts scoped to its workspace; `a` widens it to every workspace, where the roster groups by project. `h` toggles the roster; below 80 columns it folds into the header bar. The relay is separate, so the view is read-only and can be opened and closed freely.
+It shows the live message stream (`⚠reply` marks reply-required messages), a roster with each handle's pane and live state (idle, working, pull, or a missing/reused pane), and pending/failed/delivered counts for the displayed scope. In an unjoined pane it starts scoped to its workspace; `a` opens an operator overview of all workspaces and named frequencies, with each group clearly labeled. `radio view --frequency <name>` pins the roster, history, live stream and counts to that frequency and disables `a`; a view launched from a joined pane also follows that pane's frequency. `h` toggles the roster; below 80 columns it folds into the header bar. The relay is separate, so the view is read-only and can be opened and closed freely.
+
+The default dashboard makes its frequency visible: workspace `w4` is shown as `Frequency 004 · workspace w4 · Backend` when that is its project label, and its pane is labeled `Radio 004`. The number displays the existing workspace scope; ordinary joins continue to use it automatically. Custom scopes are labeled `named frequency <name>`, including numeric names, and the operator overview is labeled `all frequencies`.
 
 ## Handles, projects and panes
 
-**The pane label IS the handle.** Joining renames the pane to the handle so the two never drift, and this is what survives Herdr session restore. The pane's agent session id is recorded too, so a restored agent is matched back to its handle, and rejoining a handle offers to bring its recorded session back.
+**The pane label identifies the handle.** Joining renames the pane to the handle (or `handle@frequency` on a named frequency), and this is what survives Herdr session restore. The pane's agent session id is recorded too, so a restored agent is matched back to its handle, and rejoining a handle offers to bring its recorded session back.
 
-**A handle belongs to its project.** Every Herdr workspace is its own scope: joining from a pane records that workspace, and inside it every command resolves there — `radio handles` lists this project's agents, `radio pm` reaches this project, `radio log` shows this project's traffic. The same name can join in several projects, and a miss says so plainly (`no handle "x" in this workspace`) instead of reaching across projects. Handles joined outside Herdr (or before scoping) live in one global namespace reachable from every project; scripts can address a scoped handle explicitly as `w1:alice`, the internal form that rosters and envelopes never show.
+**A handle belongs to its scope.** By default, each Herdr workspace is its own scope: `radio handles` lists this project's agents, `radio pm` reaches this project, and `radio log` shows this project's traffic. A pane joined to a named frequency follows that frequency instead. The same name can join in several scopes without collisions. Existing handles joined outside Herdr (or before workspace scoping) retain their legacy global namespace for default workspace use. Named frequencies use their own names without falling back to that namespace.
 
 **Roles.** `radio role <handle> "…"` stores a role paragraph on the handle, `radio role <handle>` prints it, `--clear` removes it. The paragraph rides the briefing, so the agent learns its role on its next join or resume; a role change is never pushed as a message.
 
@@ -167,6 +171,35 @@ It shows the live message stream (`⚠reply` marks reply-required messages), a r
 Delivery uses `herdr agent prompt`, falling back to `send-text` for plain shells. Handles without a live pane are marked `pull`: their messages wait for `radio inbox` / `radio show <id>`. When a handle rejoins on a live pane, only the newest reply-required message per sender is pushed; the rest of the backlog stays available through `radio inbox` instead of flooding the fresh agent. The relay also holds a delivery while the target pane is focused — the user is at that pane, and a push would land in whatever they are typing. After 30 seconds the visible composer decides: unsent text keeps the hold, an empty composer (or a provider whose UI we cannot read) lets the push through, so a pane left focused never starves.
 
 Long messages are an anti-pattern: past ~1200 characters the CLI nudges you to write the payload to a file and send `--ref` instead.
+
+## Advanced frequencies
+
+Named frequencies are opt-in. New panes still use the default workspace bus. To connect selected panes through a named frequency, join each pane explicitly:
+
+```bash
+radio join planner --provider codex --new --frequency team-a
+radio join reviewer --provider codex --new --frequency team-a
+```
+
+These panes can be in different Herdr workspaces: both use `team-a`. In the same workspace, a pane on `team-b` uses a separate roster and message history. The same handle name can exist on both frequencies; pane labels show `planner@team-a` or `planner@team-b`. A pane has one Radio binding at a time. Names contain 1–64 ASCII letters, digits, underscores or hyphens, beginning with a letter or digit; they are normalized to lowercase.
+
+Within a joined pane, Radio commands follow its frequency, including `handles`, `pm`, `inbox`, `show`, `log`, `role` and `restore`. Message delivery remains direct; selecting a frequency does not broadcast. Open a separate dashboard pane with:
+
+```bash
+radio view --frequency team-a
+```
+
+This dashboard remains on `team-a`, including its delivery counts. A normal `radio view` in an unjoined pane starts on the workspace default; its `a` shortcut is an explicit operator overview that includes groups labeled `named frequency team-a`, `named frequency team-b`, and so on. A view launched from a joined pane follows the current binding instead.
+
+Joining again without a frequency flag preserves the pane's existing binding. To change it, exit the current agent session and join a fresh session with the new selection. Do not switch an agent's frequency while retaining its old conversation and briefing. To return explicitly to the workspace default:
+
+```bash
+radio join planner --provider codex --new --workspace-frequency
+```
+
+Named-frequency resumes use only the session recorded in that frequency, and returning to the workspace default uses only that workspace's recorded session. A running agent whose membership changes must exit and rejoin; it cannot silently fall back to the workspace default. Frequencies separate Radio identities and routing; they are not operating-system security boundaries and do not isolate files, processes or the shared ledger.
+
+**Upgrading an existing ledger:** stop the old relay before starting the upgraded CLI or relay. The first schema 2 migration creates a SQLite backup named `radio.pre-frequencies-<id>.db` beside the ledger; a fresh ledger needs no migration backup. Verify and retain that backup before restarting the relay and dashboards. Older plugin builds cannot read schema 2, so downgrading requires restoring the pre-upgrade backup and loses messages recorded since that backup.
 
 ## Providers
 
@@ -201,7 +234,7 @@ AgentRadio is deliberately small. Every mechanism here earns its place by per-to
 Deliberately excluded:
 
 - **Rooms / broadcast.** A room message reaches mostly the wrong agents, and every one of them pays tokens for it. DMs only; `radio handles` answers "who is here" without fan-out.
-- **Project isolation, not rooms.** Scoping is identity: each Herdr workspace has its own names, roster and delivery, so the same handle can exist in several projects without collisions. It is not a fan-out mechanism, and agents cannot message across projects; scripts can address another project explicitly, a deliberately narrow escape hatch.
+- **Scopes, not rooms.** Each default workspace or named frequency has its own identities, roster and delivery. A named frequency can span workspaces, but messages still address one recipient and never fan out. These are routing scopes, not security boundaries.
 - **Task / handoff tracking.** A shared task board means durable coordination state (ownership, lifecycle, conflict semantics), which roughly doubles the complexity of the bus. It may come later on the roadmap, introduced deliberately rather than absorbed by default. Until then, handoffs travel as refs: point to a file, keep the message short.
 - **MCP transport.** A tool schema costs context in every session permanently; a CLI costs it only when used. Agents already have a shell.
 - **Non-herdr agents (plain tmux, SSH).** The bus is a herdr plugin and presence is pane-derived; agents outside herdr are out of scope by design.

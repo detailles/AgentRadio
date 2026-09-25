@@ -2734,7 +2734,9 @@ class WorkspaceDeliveryTest(RadioTestCase):
         radio.push_to_pane = lambda pane_id, text: (pushed.append(pane_id), (True, None))[1]
         radio.relay_tick(self.conn)
         # The workspace-prefixed id travels unchanged from ledger to herdr.
-        self.assertEqual(fetched, ["w2:p1"])
+        # Delivery rechecks the pane under the retune lock before pushing.
+        self.assertTrue(fetched)
+        self.assertEqual(set(fetched), {"w2:p1"})
         self.assertEqual(pushed, ["w2:p1"])
         self.assertEqual(self.delivery_row(mid)["status"], "delivered")
 

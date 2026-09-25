@@ -76,17 +76,62 @@ def workspace_ids() -> list[str] | None:
 
 
 def workspace_scope() -> str:
-    """The project this view is scoped to: the pane's workspace id inside
-    Herdr, else '' (outside — the view then shows every workspace)."""
+    """An explicitly selected frequency, else the pane's default workspace.
+    Outside Herdr an unscoped view is the operator's all-workspaces overview."""
+    frequency = os.environ.get("RADIO_VIEW_FREQUENCY")
+    if frequency:
+        return f"freq.{frequency}"
     if os.environ.get("HERDR_ENV") == "1":
         return os.environ.get("HERDR_WORKSPACE_ID", "")
     return ""
 
 
+def is_named_frequency(scope: str) -> bool:
+    """Distinguish named frequencies from physical workspace ids."""
+    return scope.startswith("freq.")
+
+
+def all_scopes(scope: str, show_all: bool) -> bool:
+    """A named-frequency view stays pinned, even if show_all is set."""
+    return not is_named_frequency(scope) and (show_all or not scope)
+
+
+def scope_label(scope: str, labels: dict[str, str]) -> str:
+    """Render the logical scope explicitly, including numeric frequency names."""
+    if is_named_frequency(scope):
+        return f"named frequency {scope.removeprefix('freq.')}"
+    return labels.get(scope) or scope or "no workspace"
+
+
+def frequency_number(scope: str) -> str:
+    """Display a Herdr workspace number without changing its routing id."""
+    match = re.fullmatch(r"w([0-9]+)", scope)
+    return (match[1].lstrip("0") or "0").zfill(3) if match else scope
+
+
+def header_scope_label(scope: str, show_all: bool, labels: dict[str, str]) -> str:
+    """Describe the dashboard's current workspace, frequency, or overview."""
+    if all_scopes(scope, show_all):
+        return "all frequencies"
+    if is_named_frequency(scope):
+        return scope_label(scope, labels)
+    caption = f"Frequency {frequency_number(scope)} · workspace {scope}"
+    label = labels.get(scope)
+    return f"{caption} · {label}" if label and label != scope else caption
+
+
+def handle_label(handle: sqlite3.Row) -> str:
+    """Match the label installed by join; a logical frequency is not a pane id."""
+    scope = handle["workspace"] if "workspace" in handle.keys() else ""
+    if is_named_frequency(scope):
+        return f"{handle['name']}@{scope.removeprefix('freq.')}"
+    return handle["name"]
+
+
 def handles_query(scope: str, show_all: bool) -> tuple[str, tuple]:
     """(sql, params) for the roster: one workspace unless show_all or the view
     runs outside Herdr (no scope to honor)."""
-    if show_all or not scope:
+    if all_scopes(scope, show_all):
         return "SELECT * FROM handles ORDER BY workspace, name", ()
     return "SELECT * FROM handles WHERE workspace = ? ORDER BY name", (scope,)
 
@@ -95,11 +140,33 @@ def messages_query(scope: str, show_all: bool, after_id: int) -> tuple[str, tupl
     """(sql, params) for messages newer than after_id: only this workspace's
     traffic unless show_all/outside. The watermark is the global id, so
     another workspace's mail never advances what this scope has seen."""
-    if show_all or not scope:
+    if all_scopes(scope, show_all):
         return "SELECT * FROM messages WHERE id > ? ORDER BY id", (after_id,)
     return (
         "SELECT * FROM messages WHERE id > ? AND (from_ws = ? OR to_ws = ?) ORDER BY id",
         (after_id, scope, scope),
+    )
+
+
+def history_query(scope: str, show_all: bool, limit: int) -> tuple[str, tuple]:
+    """The recent stream uses exactly the same scope as live messages."""
+    if all_scopes(scope, show_all):
+        return "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)
+    return (
+        "SELECT * FROM messages WHERE from_ws = ? OR to_ws = ? "
+        "ORDER BY id DESC LIMIT ?",
+        (scope, scope, limit),
+    )
+
+
+def counts_query(scope: str, show_all: bool) -> tuple[str, tuple]:
+    """Delivery totals belong to the displayed bus, not the whole ledger."""
+    if all_scopes(scope, show_all):
+        return "SELECT status, count(*) AS c FROM deliveries GROUP BY status", ()
+    return (
+        "SELECT status, count(*) AS c FROM deliveries "
+        "WHERE target_ws = ? GROUP BY status",
+        (scope,),
     )
 
 
@@ -129,6 +196,8 @@ def pane_states(labels: dict[str, str] | None = None) -> dict[str, dict]:
         return _pane_list()
     states: dict[str, dict] = {}
     for wid in ids:
+        if is_named_frequency(wid):
+            continue
         states.update(_pane_list("--workspace", wid))
     return states
 
@@ -172,8 +241,13 @@ def adopt_pane() -> None:
         label = json.loads(result.stdout)["result"]["pane"].get("label") or ""
     except (json.JSONDecodeError, KeyError):
         return
-    if label != "Radio":
-        herdr("pane", "rename", pane_id, "Radio")
+    scope = workspace_scope()
+    wanted = (
+        f"Radio@{scope.removeprefix('freq.')}" if is_named_frequency(scope)
+        else f"Radio {frequency_number(scope)}" if scope else "Radio"
+    )
+    if label != wanted:
+        herdr("pane", "rename", pane_id, wanted)
 
 
 def connect() -> sqlite3.Connection:
@@ -194,7 +268,7 @@ def dot_for(handle: sqlite3.Row, states: dict[str, dict]) -> tuple[Text, str]:
     pane = states.get(pane_id)
     if pane is None:
         return Text("✗", style="red"), "no pane"
-    if (pane.get("label") or "") != handle["name"]:
+    if (pane.get("label") or "") != handle_label(handle):
         return Text("✗", style="grey50"), "reused"
     live_agent = pane.get("agent")
     if handle["agent"] and live_agent and live_agent != handle["agent"]:
@@ -227,7 +301,7 @@ def compact_roster(handles: list, states: dict[str, dict]) -> Text:
             if line.plain:
                 line.append(" ")
             line.append_text(dot)
-            line.append(str(h["name"]), style="bold")
+            line.append(handle_label(h), style="bold")
         else:
             dead += 1
     if dead:
@@ -235,7 +309,8 @@ def compact_roster(handles: list, states: dict[str, dict]) -> Text:
     return line
 
 
-def fmt_message(m: sqlite3.Row) -> Text:
+def fmt_message(m: sqlite3.Row, *, show_scope: bool = False,
+                labels: dict[str, str] | None = None) -> Text:
     """One styled stream line for a message row; bodies are truncated to
     MAX_BODY_CHARS and path-like spans highlighted so refs stand out."""
     try:
@@ -245,6 +320,13 @@ def fmt_message(m: sqlite3.Row) -> Text:
     target, target_style = m["to_handle"], "cyan"
     line = Text()
     line.append(f"{stamp} ", style="grey50")
+    if show_scope:
+        labels = labels or {}
+        source, dest = m["from_ws"], m["to_ws"]
+        caption = scope_label(source, labels)
+        if source != dest:
+            caption += f" → {scope_label(dest, labels)}"
+        line.append(f"[{caption}] ", style="grey50")
     line.append(str(m["from_handle"]), style="bold magenta")
     line.append(" → ", style="grey50")
     line.append(str(target), style=f"bold {target_style}")
@@ -301,13 +383,13 @@ class RadioView(App):
         ("q", "quit", "quit"),
         ("r", "refresh", "refresh"),
         ("h", "toggle_handles", "handles"),
-        ("a", "toggle_all", "all workspaces"),
+        ("a", "toggle_all", "all frequencies"),
     ]
 
     def __init__(self) -> None:
         """Set up tail state: last_message_id tracks the stream watermark.
-        The view starts scoped to the pane's workspace; `a` widens it to every
-        workspace (outside Herdr there is no scope, so it starts wide)."""
+        The default view can widen to every workspace. An explicitly selected
+        named frequency stays pinned (including when opened outside Herdr)."""
         super().__init__()
         self.last_message_id = 0
         self.scope = workspace_scope()
@@ -342,20 +424,19 @@ class RadioView(App):
     def reload_stream(self) -> None:
         """Clear the stream and load this scope's recent history; used on
         mount and whenever the all-workspaces toggle changes the scope."""
-        if self.show_all or not self.scope:
-            sql = "SELECT * FROM messages ORDER BY id DESC LIMIT ?"
-            params: tuple = (STREAM_HISTORY,)
-        else:
-            sql = ("SELECT * FROM messages WHERE from_ws = ? OR to_ws = ? "
-                   "ORDER BY id DESC LIMIT ?")
-            params = (self.scope, self.scope, STREAM_HISTORY)
+        sql, params = history_query(self.scope, self.show_all, STREAM_HISTORY)
         with connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         stream = self.query_one("#stream", RichLog)
         stream.clear()
         for row in reversed(rows):
-            stream.write(fmt_message(row))
+            stream.write(self.render_message(row))
         self.last_message_id = max((r["id"] for r in rows), default=0)
+
+    def render_message(self, row: sqlite3.Row) -> Text:
+        return fmt_message(
+            row, show_scope=all_scopes(self.scope, self.show_all), labels=self.labels,
+        )
 
     def on_resize(self, event) -> None:
         """Re-apply the sidebar policy when the terminal is resized."""
@@ -383,28 +464,33 @@ class RadioView(App):
             return
         stream = self.query_one("#stream", RichLog)
         for row in rows:
-            stream.write(fmt_message(row))
+            stream.write(self.render_message(row))
         self.last_message_id = rows[-1]["id"]
 
     def action_toggle_all(self) -> None:
         """The `a` key: switch between this workspace and every workspace."""
+        if is_named_frequency(self.scope):
+            return
         self.show_all = not self.show_all
         self.reload_stream()
         self.refresh_handles()
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide the overview shortcut when this dashboard is pinned."""
+        if action == "toggle_all" and is_named_frequency(self.scope):
+            return False
+        return super().check_action(action, parameters)
+
     def refresh_header(self) -> None:
         """Redraw the header bar: current scope, relay liveness, and
         per-status delivery counts."""
-        scope_name = "all workspaces" if self.show_all or not self.scope else (
-            self.labels.get(self.scope) or self.scope
-        )
+        scope_name = header_scope_label(self.scope, self.show_all, self.labels)
         self.query_one("#bar-left", Static).update(f"◈ Radio · {scope_name}")
         with connect() as conn:
+            sql, params = counts_query(self.scope, self.show_all)
             counts = {
                 row["status"]: row["c"]
-                for row in conn.execute(
-                    "SELECT status, count(*) AS c FROM deliveries GROUP BY status"
-                ).fetchall()
+                for row in conn.execute(sql, params).fetchall()
             }
         up = relay_alive()
         relay = Text("relay up", style="green") if up else Text("relay DOWN", style="bold red")
@@ -432,10 +518,10 @@ class RadioView(App):
             lines = Text("Handles\n", style="bold #7dd3fc")
             last_ws = None
             for h in handles:
-                if self.show_all and h["workspace"] != last_ws:
+                if all_scopes(self.scope, self.show_all) and h["workspace"] != last_ws:
                     last_ws = h["workspace"]
                     lines.append(
-                        f"{self.labels.get(last_ws) or last_ws or 'no workspace'}\n",
+                        f"{scope_label(last_ws, self.labels)}\n",
                         style="bold #7dd3fc",
                     )
                 pane_id = (
