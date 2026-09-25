@@ -4,12 +4,14 @@ and relay delivery outcomes. herdr and pane I/O are monkeypatched — no test
 spawns a process, execs, or touches the real ~/.local/share/herdr-radio."""
 
 import argparse
+import atexit
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,8 +25,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Must be set before import: bin/radio resolves STATE_DIR at module load.
-os.environ["RADIO_HOME"] = tempfile.mkdtemp(prefix="radio-test-home-")
+# Must be set before import: bin/radio resolves STATE_DIR at module load. The
+# directory is removed when the interpreter exits, so a suite run leaves
+# nothing behind in the temp dir.
+_SUITE_HOME = tempfile.mkdtemp(prefix="radio-test-home-")
+os.environ["RADIO_HOME"] = _SUITE_HOME
+atexit.register(shutil.rmtree, _SUITE_HOME, ignore_errors=True)
 
 # spec_from_file_location alone returns None for an extensionless file, so the
 # source loader is passed explicitly.
@@ -46,18 +52,21 @@ class RadioTestCase(unittest.TestCase):
         self._saved_env = {k: os.environ.pop(k, None)
                            for k in ("HERDR_ENV", "HERDR_PANE_ID", "RADIO_HANDLE")}
         tmp = Path(tempfile.mkdtemp(prefix="radio-test-"))
+        self.tmp = tmp
         radio.STATE_DIR = tmp
         radio.DB_PATH = tmp / "radio.db"
         radio.LOCK_PATH = tmp / "relay.lock"
         self.conn = radio.connect()
 
     def tearDown(self):
-        """Close the ledger and restore the module paths and environment the test found."""
+        """Close the ledger, drop the temp state dir, and restore the module
+        paths and environment the test found."""
         self.conn.close()
         radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = self._saved
         for key, value in self._saved_env.items():
             if value is not None:
                 os.environ[key] = value
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def add_handle(self, name, ref="manual", agent=None, agent_session=None,
                    last_seen=None, workspace="", role=None, account=None):
@@ -1687,6 +1696,7 @@ class AccountsMigrationTest(unittest.TestCase):
     def test_old_accounts_shape_converges(self):
         """A dir-shaped accounts table is renamed to home with an empty env."""
         tmp = Path(tempfile.mkdtemp(prefix="radio-accounts-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         db = tmp / "radio.db"
         legacy = sqlite3.connect(db)
         legacy.executescript(
@@ -1728,6 +1738,7 @@ class ScopeMigrationTest(unittest.TestCase):
     def setUp(self):
         """Build a pre-scope ledger with one handle, message and delivery."""
         self.tmp = Path(tempfile.mkdtemp(prefix="radio-legacy-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         legacy = sqlite3.connect(self.tmp / "radio.db")
         legacy.executescript(
             """
