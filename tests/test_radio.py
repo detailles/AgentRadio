@@ -2543,8 +2543,6 @@ class WinShimTest(RadioTestCase):
                     with self.assertRaises(AssertionError):
                         exec(check, {"sys": fake})
 
-
-
     def test_resolver_text_queries_herdr(self):
         """The resolver asks herdr for the plugin root."""
         text = self.win_shim.resolver_text()
@@ -2837,7 +2835,6 @@ class CompactRosterTest(RadioTestCase):
         self.assertEqual(roster.plain, " +2")
 
 
-@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
 @unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
 class ViewLedgerStateTest(RadioTestCase):
     """radio-view on a ledger that is not there yet: an empty state, no

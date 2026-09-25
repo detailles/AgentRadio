@@ -465,7 +465,8 @@ class RadioView(App):
 
     def reload_stream(self) -> None:
         """Clear the stream and load this scope's recent history; used on
-        mount and whenever the all-workspaces toggle changes the scope."""
+        mount and whenever the all-workspaces toggle changes the scope. A
+        ledger that is not there yet is an empty state, not an error."""
         rows = read_rows(*history_query(self.scope, self.show_all, STREAM_HISTORY))
         stream = self.query_one("#stream", RichLog)
         stream.clear()
