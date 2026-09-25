@@ -42,7 +42,7 @@ MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
-VERSION = "0.4.0"  # keep in sync with herdr-plugin.toml
+VERSION = "0.4.1"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 1  # PRAGMA user_version this build writes; a newer ledger needs a newer radio
 
 
