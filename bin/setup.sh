@@ -6,7 +6,8 @@
 # lights up after a manual `sh bin/setup.sh`.
 # The venv deliberately lives outside the plugin dir: a running view pane must
 # never hold the managed plugin directory (Windows then refuses updates).
-# No `set -e`: failures are handled explicitly per section.
+# No `set -e`: failures are handled explicitly per section, and the script
+# always exits 0 — a build hook must never fail the install.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE="${RADIO_HOME:-$HOME/.local/share/herdr-radio}"
 VENV="$STATE/venv"
@@ -16,10 +17,20 @@ cd "$ROOT"
 # Make the CLI reachable right after install (see bin/link-cli.sh).
 sh "$ROOT/bin/link-cli.sh"
 
-# A pre-0.3.1 venv lived inside the plugin dir; drop it (best effort).
-if [ -d "$ROOT/.venv" ]; then
-  rm -rf "$ROOT/.venv" 2>/dev/null || true
-fi
+# A pre-0.3.1 venv lived inside the managed plugin dir; drop it (best effort).
+# A developer clone keeps its own venv: only the managed copy is cleaned.
+case "$ROOT" in
+  */herdr/plugins/*)
+    if [ -d "$ROOT/.venv" ]; then
+      rm -rf "$ROOT/.venv" 2>/dev/null || true
+    fi
+    ;;
+  *)
+    if [ -d "$ROOT/.venv" ]; then
+      echo "note: $ROOT/.venv is a development venv; left in place." >&2
+    fi
+    ;;
+esac
 
 view_ready() {
   [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import textual" >/dev/null 2>&1
@@ -31,7 +42,10 @@ else
   rm -rf "$VENV"  # a partial venv would short-circuit the readiness check above
   if command -v uv >/dev/null 2>&1; then
     uv venv "$VENV" && uv pip install --python "$VENV/bin/python" "textual>=1.0"
-  else
+  fi
+  # A broken uv must not disable the view path: fall back to the stdlib venv.
+  if ! view_ready && command -v python3 >/dev/null 2>&1; then
+    rm -rf "$VENV"
     python3 -m venv "$VENV" && "$VENV/bin/pip" install "textual>=1.0"
   fi
   if view_ready; then
@@ -54,10 +68,13 @@ if command -v kimi >/dev/null 2>&1; then
   if [ -f "$KIMI_CONFIG" ] && grep -qF "radio-kimi-hook.sh" "$KIMI_CONFIG"; then
     echo "kimi hook already installed"
   else
-    mkdir -p "$(dirname "$KIMI_CONFIG")"
-    touch "$KIMI_CONFIG"
-    printf '\n[[hooks]]\nevent = "UserPromptSubmit"\n%s\n' "$HOOK_LINE" >> "$KIMI_CONFIG"
-    echo "kimi hook installed into $KIMI_CONFIG"
+    mkdir -p "$(dirname "$KIMI_CONFIG")" 2>/dev/null
+    touch "$KIMI_CONFIG" 2>/dev/null
+    if printf '\n[[hooks]]\nevent = "UserPromptSubmit"\n%s\n' "$HOOK_LINE" >> "$KIMI_CONFIG" 2>/dev/null; then
+      echo "kimi hook installed into $KIMI_CONFIG"
+    else
+      echo "WARNING: could not write the kimi hook to $KIMI_CONFIG" >&2
+    fi
   fi
 else
   echo "kimi not found; skipping kimi hook"
@@ -65,25 +82,40 @@ fi
 
 # Gemini CLI briefing hook: SessionStart additionalContext (documented
 # injection channel). Merged into ~/.gemini/settings.json idempotently.
-# Skipped when gemini is not installed.
+# Skipped when gemini is not installed, and a settings file that cannot be
+# parsed is reported and left untouched — the user's own config always wins.
 if command -v gemini >/dev/null 2>&1; then
   GEMINI_SETTINGS="${GEMINI_CLI_HOME:-$HOME/.gemini}/settings.json"
-  mkdir -p "$(dirname "$GEMINI_SETTINGS")"
-  python3 - "$GEMINI_SETTINGS" "$ROOT/bin/radio-gemini-hook.sh" <<'PYEOF'
+  mkdir -p "$(dirname "$GEMINI_SETTINGS")" 2>/dev/null
+  python3 - "$GEMINI_SETTINGS" "$ROOT/bin/radio-gemini-hook.sh" <<'PYEOF' || echo "WARNING: gemini hook not installed" >&2
 import json
+import os
 import sys
+import tempfile
 
 path, command = sys.argv[1], sys.argv[2]
-try:
-    with open(path, encoding="utf-8") as fh:
-        settings = json.load(fh)
-except (OSError, json.JSONDecodeError):
-    settings = {}
-hooks = settings.setdefault("hooks", {})
-entries = hooks.setdefault("SessionStart", [])
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARNING: leaving {path} alone: {exc}", file=sys.stderr)
+        sys.exit(0)
+    if not isinstance(settings, dict):
+        print(f"WARNING: leaving {path} alone: not a JSON object", file=sys.stderr)
+        sys.exit(0)
+if not isinstance(settings.get("hooks"), dict):
+    settings["hooks"] = {}
+hooks = settings["hooks"]
+if not isinstance(hooks.get("SessionStart"), list):
+    hooks["SessionStart"] = []
+entries = hooks["SessionStart"]
 for entry in entries:
+    if not isinstance(entry, dict):
+        continue
     for hook in entry.get("hooks", []):
-        if "radio-gemini-hook.sh" in str(hook.get("command", "")):
+        if isinstance(hook, dict) and "radio-gemini-hook.sh" in str(hook.get("command", "")):
             print("gemini hook already installed")
             sys.exit(0)
 for matcher in ("startup", "resume", "clear"):
@@ -91,11 +123,28 @@ for matcher in ("startup", "resume", "clear"):
         "matcher": matcher,
         "hooks": [{"name": "radio-briefing", "type": "command", "command": command}],
     })
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(settings, fh, indent=2)
-    fh.write("\n")
+# Write through a sibling temp file: a crash mid-write must never truncate the
+# user's settings, and the original file mode is preserved.
+mode = (os.stat(path).st_mode & 0o777) if os.path.exists(path) else 0o600
+directory = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=directory, prefix=".settings-", suffix=".json")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+except OSError as exc:
+    print(f"WARNING: could not write {path}: {exc}", file=sys.stderr)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(0)
 print(f"gemini hook installed into {path}")
 PYEOF
 else
   echo "gemini not found; skipping gemini hook"
 fi
+
+exit 0
