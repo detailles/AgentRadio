@@ -16,6 +16,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1566,6 +1567,22 @@ class ChangedEventsTest(RadioTestCase):
         self.assertEqual(radio.changed_events(["tick done"], seen), ["tick done"])
 
 
+class HerdrConsoleTest(unittest.TestCase):
+    def test_background_calls_capture_output_without_a_windows_console(self):
+        for platform, flags in (("nt", 0x08000000), ("posix", 0)):
+            with self.subTest(platform=platform), \
+                    patch.object(radio, "os", types.SimpleNamespace(name=platform)), \
+                    patch.object(radio, "herdr_bin", return_value="herdr"), \
+                    patch.object(radio.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+                    patch.object(radio.subprocess, "run") as run:
+                result = radio.herdr("pane", "get", "w1:p1", timeout=3)
+                run.assert_called_once_with(
+                    ["herdr", "pane", "get", "w1:p1"],
+                    text=True, capture_output=True, timeout=3, creationflags=flags,
+                )
+                self.assertIs(result, run.return_value)
+
+
 class TimeoutSplitTest(RadioTestCase):
     def setUp(self):
         super().setUp()
@@ -1583,6 +1600,7 @@ class TimeoutSplitTest(RadioTestCase):
         class Stub:
             TimeoutExpired = real_subprocess.TimeoutExpired
             CompletedProcess = real_subprocess.CompletedProcess
+            CREATE_NO_WINDOW = getattr(real_subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
             @staticmethod
             def run(cmd, **kwargs):

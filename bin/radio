@@ -219,7 +219,9 @@ def herdr(*args: str, timeout: float = HERDR_READ_TIMEOUT) -> subprocess.Complet
     take the short read timeout (default); delivery paths pass the send
     timeout explicitly — one wedged herdr must not stall the relay."""
     return subprocess.run(
-        [herdr_bin(), *args], text=True, capture_output=True, timeout=timeout
+        [herdr_bin(), *args], text=True, capture_output=True, timeout=timeout,
+        # A detached Windows relay must not open a console for each lookup.
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
 
 
