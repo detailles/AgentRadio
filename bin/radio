@@ -1785,7 +1785,14 @@ def cmd_account(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             except (TypeError, ValueError):
                 overrides = {}
             if isinstance(overrides, dict) and overrides:
-                print("  env: " + ", ".join(f"{key}={value}" for key, value in overrides.items()))
+                # Names by default: an account's environment may carry a
+                # token, and this output often lands in a shared terminal or a
+                # pasted log. --show-env prints the values.
+                if getattr(args, "show_env", False):
+                    pairs = ", ".join(f"{key}={value}" for key, value in overrides.items())
+                else:
+                    pairs = ", ".join(overrides) + "  (values: --show-env)"
+                print("  env: " + pairs)
             if users:
                 print(f"  used by: {', '.join(users)}")
         return 0
@@ -3543,7 +3550,10 @@ def build_parser() -> argparse.ArgumentParser:
                                    "(codex2 -> ~/.codex-account-2)")
     ap.add_argument("--env", action="append", metavar="NAME=VALUE",
                     help="extra environment for the launch; repeatable")
-    acct.add_parser("list", help="list accounts with auth state")
+    acct.add_parser("list", help="list accounts with auth state").add_argument(
+        "--show-env", action="store_true",
+        help="print environment values, not just their names",
+    )
     ap = acct.add_parser("remove", help="remove an unused account")
     ap.add_argument("name")
     ap = acct.add_parser("move", help="copy a handle's session to another account and switch it")

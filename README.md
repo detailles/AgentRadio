@@ -168,7 +168,7 @@ Any number of logins per provider can share the bus.
 - `radio join coder --account work` launches that login and records it on the handle, so `radio restore coder` brings the same login back.
 - The account is a property, never part of the name: the roster shows it as a separate `account:` field.
 - `radio account move coder --to personal` copies the session files into the target home (codex, claude, kimi and pi) and switches the handle over; the old account keeps its data.
-- `radio account list` shows each home, its extra environment and auth state; removing an account a handle still uses is refused.
+- `radio account list` shows each home, its extra environment (names by default; `--show-env` for values) and auth state; removing an account a handle still uses is refused.
 
 ## Provider usage and calm
 

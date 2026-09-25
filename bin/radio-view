@@ -30,6 +30,7 @@ PATH_RE = re.compile(r"(?:[\w.@~-]+/)+[\w.@-]+")
 
 try:
     from rich.text import Text
+    from textual import work
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal
     from textual.widgets import Footer, RichLog, Static
@@ -47,7 +48,14 @@ def herdr(*args: str) -> subprocess.CompletedProcess[str] | None:
     if not binary:
         return None
     try:
-        return subprocess.run([binary, *args], text=True, capture_output=True, timeout=10)
+        return subprocess.run(
+            [binary, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -204,10 +212,15 @@ def pane_states(labels: dict[str, str] | None = None) -> dict[str, dict]:
 
 def relay_alive() -> bool:
     """True when the relay daemon holds the single-instance lock: POSIX flock,
-    or the Windows msvcrt region — keep in sync with bin/radio relay_lock."""
+    or the Windows msvcrt region — keep in sync with bin/radio relay_lock.
+    A probe that cannot even open the lock file reports no relay instead of
+    crashing the header."""
     if not LOCK_PATH.exists():
         return False
-    fd = open(LOCK_PATH, "a+")
+    try:
+        fd = open(LOCK_PATH, "a+")
+    except OSError:
+        return False
     try:
         if os.name == "nt":
             import msvcrt
@@ -255,6 +268,35 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ledger_ready(conn: sqlite3.Connection) -> bool:
+    """True when the ledger carries the radio tables; a missing, foreign or
+    half-initialized file is an empty state, not an error."""
+    try:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.DatabaseError:
+        return False
+    return {"messages", "handles", "deliveries"} <= names
+
+
+def read_rows(sql: str, params: tuple = ()) -> list[sqlite3.Row] | None:
+    """Run one scoped read against the ledger.
+
+    None means the ledger does not exist or is not initialized yet: the view
+    shows its empty state and never creates the file, so a dashboard opened
+    before radio has run leaves no empty radio.db behind."""
+    if not DB_PATH.exists():
+        return None
+    conn = connect()
+    try:
+        if not ledger_ready(conn):
+            return None
+        return conn.execute(sql, params).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
 
 
 def dot_for(handle: sqlite3.Row, states: dict[str, dict]) -> tuple[Text, str]:
@@ -424,11 +466,13 @@ class RadioView(App):
     def reload_stream(self) -> None:
         """Clear the stream and load this scope's recent history; used on
         mount and whenever the all-workspaces toggle changes the scope."""
-        sql, params = history_query(self.scope, self.show_all, STREAM_HISTORY)
-        with connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+        rows = read_rows(*history_query(self.scope, self.show_all, STREAM_HISTORY))
         stream = self.query_one("#stream", RichLog)
         stream.clear()
+        if rows is None:
+            stream.write(Text("ledger not ready — waiting for radio", style="grey50"))
+            self.last_message_id = 0
+            return
         for row in reversed(rows):
             stream.write(self.render_message(row))
         self.last_message_id = max((r["id"] for r in rows), default=0)
@@ -458,9 +502,7 @@ class RadioView(App):
     def poll_messages(self) -> None:
         """Append messages newer than the watermark to the stream, honoring
         the current scope."""
-        with connect() as conn:
-            sql, params = messages_query(self.scope, self.show_all, self.last_message_id)
-            rows = conn.execute(sql, params).fetchall()
+        rows = read_rows(*messages_query(self.scope, self.show_all, self.last_message_id))
         if not rows:
             return
         stream = self.query_one("#stream", RichLog)
@@ -487,12 +529,13 @@ class RadioView(App):
         per-status delivery counts."""
         scope_name = header_scope_label(self.scope, self.show_all, self.labels)
         self.query_one("#bar-left", Static).update(f"◈ Radio · {scope_name}")
-        with connect() as conn:
-            sql, params = counts_query(self.scope, self.show_all)
-            counts = {
-                row["status"]: row["c"]
-                for row in conn.execute(sql, params).fetchall()
-            }
+        rows = read_rows(*counts_query(self.scope, self.show_all))
+        if rows is None:
+            self.query_one("#bar-right", Static).update(
+                Text("ledger not ready — waiting for radio", style="bold yellow")
+            )
+            return
+        counts = {row["status"]: row["c"] for row in rows}
         up = relay_alive()
         relay = Text("relay up", style="green") if up else Text("relay DOWN", style="bold red")
         stats = Text.assemble(
@@ -506,15 +549,43 @@ class RadioView(App):
         self.query_one("#bar-right", Static).update(stats)
 
     def refresh_handles(self) -> None:
-        """Redraw the roster (sidebar when visible, compact line for the header
-        bar when hidden) with liveness dots from live pane state. In the
-        all-workspaces view the roster groups rows under their workspace."""
-        self.labels = workspace_labels()
-        self.states = pane_states(self.labels)
-        with connect() as conn:
-            sql, params = handles_query(self.scope, self.show_all)
-            handles = conn.execute(sql, params).fetchall()
-        self.compact = compact_roster(handles, self.states)
+        """Schedule a roster refresh. The herdr pane scan costs one call per
+        workspace, each with its own timeout, so it runs on a worker thread
+        and the finished scan is applied back on the UI thread."""
+        self.scan_handles()
+
+    def collect_handles(self) -> tuple[dict[str, str], dict[str, dict], list[sqlite3.Row] | None]:
+        """The slow half of a roster refresh: workspace labels, live pane
+        states and the roster rows for the current scope. Safe to call off the
+        UI thread; the caller applies the result with apply_handles."""
+        labels = workspace_labels()
+        states = pane_states(labels)
+        handles = read_rows(*handles_query(self.scope, self.show_all))
+        return labels, states, handles
+
+    @work(thread=True, exclusive=True, group="handles")
+    def scan_handles(self) -> None:
+        """Worker: collect one roster snapshot and hand it to the UI thread."""
+        labels, states, handles = self.collect_handles()
+        self.call_from_thread(self.apply_handles, labels, states, handles)
+
+    def apply_handles(self, labels: dict[str, str], states: dict[str, dict],
+                      handles: list[sqlite3.Row] | None) -> None:
+        """Apply one finished scan on the UI thread: the roster sidebar (or
+        the compact header line) with liveness dots from live pane state, and
+        the empty state while the ledger is missing. In the all-workspaces
+        view the roster groups rows under their workspace."""
+        self.labels = labels
+        self.states = states
+        if handles is None:
+            self.compact = Text()
+            if self._sidebar_visible:
+                roster = Text("Handles\n", style="bold #7dd3fc")
+                roster.append("ledger not ready\n", style="grey50")
+                self.query_one("#handles", Static).update(roster)
+            self.refresh_header()
+            return
+        self.compact = compact_roster(handles, states)
         if self._sidebar_visible:
             lines = Text("Handles\n", style="bold #7dd3fc")
             last_ws = None
@@ -544,8 +615,20 @@ class RadioView(App):
         self.refresh_handles()
 
 
+def utf8_streams() -> None:
+    """Force UTF-8 on stdout/stderr, mirroring bin/radio: Windows pipes
+    default to the locale codec (cp1252), which cannot encode the view's dots
+    and arrows. No-op on POSIX and for replaced streams (tests)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main() -> int:
     """Run the RadioView app until the user quits."""
+    utf8_streams()
     RadioView().run()
     return 0
 

@@ -1279,6 +1279,10 @@ class AccountTest(RadioTestCase):
         row = self.conn.execute("SELECT * FROM accounts WHERE name='proxy'").fetchone()
         self.assertEqual(json.loads(row["env"]), {"HTTPS_PROXY": "http://p", "FOO": "bar"})
         rc, out = self.run_account("list")
+        # Names by default: an account's environment may carry a token.
+        self.assertIn("HTTPS_PROXY", out)
+        self.assertNotIn("http://p", out)
+        rc, out = self.run_account("list", "--show-env")
         self.assertIn("HTTPS_PROXY=http://p", out)
         with self.assertRaises(SystemExit):
             self.run_account("add", "bad", "--provider", "codex", "--env", "NOVALUE")
@@ -2785,6 +2789,124 @@ class CompactRosterTest(RadioTestCase):
         handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
         roster = radio_view.compact_roster(handles, {})
         self.assertEqual(roster.plain, " +2")
+
+
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+class ViewLedgerStateTest(RadioTestCase):
+    """radio-view on a ledger that is not there yet: an empty state, no
+    created file, and a relay probe that never crashes."""
+
+    def setUp(self):
+        """Point the view module at a path this test controls."""
+        super().setUp()
+        self._saved_view = (radio_view.DB_PATH, radio_view.LOCK_PATH)
+        self.addCleanup(self._restore_view)
+        radio_view.DB_PATH = radio.STATE_DIR / "view-state" / "radio.db"
+        radio_view.LOCK_PATH = radio.STATE_DIR / "view-state" / "relay.lock"
+
+    def _restore_view(self):
+        """Put the view's paths back."""
+        radio_view.DB_PATH, radio_view.LOCK_PATH = self._saved_view
+
+    def test_missing_ledger_reads_as_none_and_is_not_created(self):
+        """A dashboard opened before radio leaves no empty radio.db behind."""
+        self.assertFalse(radio_view.DB_PATH.exists())
+        self.assertIsNone(radio_view.read_rows("SELECT 1"))
+        self.assertFalse(radio_view.DB_PATH.exists())
+
+    def test_empty_and_foreign_files_read_as_none(self):
+        """An empty or foreign file is the empty state, not a traceback."""
+        radio_view.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        radio_view.DB_PATH.write_text("", encoding="utf-8")
+        self.assertIsNone(radio_view.read_rows("SELECT 1"))
+        radio_view.DB_PATH.write_bytes(b"not a database at all")
+        self.assertIsNone(radio_view.read_rows("SELECT 1"))
+
+    def test_initialized_ledger_reads_rows(self):
+        """An initialized ledger reads normally through the same helper."""
+        radio_view.DB_PATH = radio.DB_PATH
+        self.add_handle("bob")
+        rows = radio_view.read_rows("SELECT name FROM handles")
+        self.assertEqual([row["name"] for row in rows], ["bob"])
+
+    def test_relay_probe_is_total(self):
+        """A missing, held or unreadable lock reports a state, never raises."""
+        self.assertFalse(radio_view.relay_alive())
+        radio_view.LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        radio_view.LOCK_PATH.write_text("", encoding="utf-8")
+        self.assertFalse(radio_view.relay_alive())  # nobody holds it
+        if os.name != "nt":
+            import fcntl
+
+            holder = open(radio_view.LOCK_PATH, "a+")
+            self.addCleanup(holder.close)
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(radio_view.relay_alive())  # a holder means up
+            holder.close()
+        radio_view.LOCK_PATH.chmod(0o000)
+        self.assertFalse(radio_view.relay_alive())  # cannot even open it
+        radio_view.LOCK_PATH.chmod(0o600)
+
+
+@unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")
+class ViewWorkerTest(unittest.IsolatedAsyncioTestCase):
+    """The roster scan runs on a worker thread: a slow herdr — one call per
+    workspace, each with its own timeout — must not freeze the dashboard. The
+    synchronous query tests cannot catch a scan moving back onto the event
+    loop."""
+
+    async def asyncSetUp(self):
+        """Point the view at a temp ledger with one handle and a slow herdr."""
+        self.tmp = tempfile.TemporaryDirectory(prefix="radio-view-worker-")
+        self.addCleanup(self.tmp.cleanup)
+        env = patch.dict(os.environ, {
+            "HERDR_ENV": "", "HERDR_WORKSPACE_ID": "", "RADIO_VIEW_FREQUENCY": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        for name, value in (("DB_PATH", Path(self.tmp.name) / "radio.db"),
+                            ("LOCK_PATH", Path(self.tmp.name) / "relay.lock")):
+            self.addCleanup(setattr, radio_view, name, getattr(radio_view, name))
+            setattr(radio_view, name, value)
+        conn = sqlite3.connect(radio_view.DB_PATH)
+        conn.executescript("""
+            CREATE TABLE handles (workspace TEXT, name TEXT, session_ref TEXT,
+                                  pane_workspace TEXT, agent TEXT);
+            CREATE TABLE messages (id INTEGER PRIMARY KEY, from_ws TEXT, to_ws TEXT,
+                                   from_handle TEXT, to_handle TEXT, ts TEXT, text TEXT);
+            CREATE TABLE deliveries (target_ws TEXT, status TEXT);
+        """)
+        conn.execute("INSERT INTO handles VALUES ('w1','bob','herdr:w1:p1','','codex')")
+        conn.commit()
+        conn.close()
+        self.addCleanup(setattr, radio_view, "herdr", radio_view.herdr)
+
+        def slow_herdr(*args, **kwargs):
+            """A herdr stub that sleeps 0.3s per call and reports bob's pane."""
+            time.sleep(0.3)
+            payload = {"result": {"workspaces": [{"workspace_id": "w1", "label": "Main"}]}}
+            if args[:2] == ("pane", "list"):
+                payload = {"result": {"panes": [{
+                    "pane_id": "w1:p1", "label": "bob", "workspace_id": "w1",
+                    "agent": "codex", "agent_status": "idle",
+                }]}}
+            return subprocess.CompletedProcess(list(args), 0, json.dumps(payload), "")
+
+        radio_view.herdr = slow_herdr
+        self.app = radio_view.RadioView()
+
+    async def test_scan_returns_immediately_and_still_lands(self):
+        """refresh_handles schedules instead of scanning, and the scan lands."""
+        async with self.app.run_test() as pilot:
+            await pilot.pause(0.1)
+            start = time.perf_counter()
+            self.app.refresh_handles()
+            self.assertLess(time.perf_counter() - start, 0.2)
+            await pilot.pause(1.5)
+            sidebar = self.app.query_one("#handles").render().plain
+            self.assertIn("bob", sidebar)
+            self.assertIn("w1:p1 idle", sidebar)
 
 
 @unittest.skipUnless(HAS_VIEW, "view deps (textual) not installed")

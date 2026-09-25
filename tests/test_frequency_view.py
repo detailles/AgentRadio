@@ -69,6 +69,10 @@ class FrequencyViewTest(unittest.TestCase):
         """Run a query tuple and return its rows."""
         return self.conn.execute(*query).fetchall()
 
+    def read_rows(self, sql, params=()):
+        """read_rows stub: run one scoped read on this test's ledger."""
+        return self.conn.execute(sql, params).fetchall()
+
     def make_app(self, frequency="alpha"):
         """Build a RadioView scoped to the given frequency inside herdr."""
         with patch.dict(os.environ, {
@@ -178,7 +182,7 @@ class FrequencyViewTest(unittest.TestCase):
         """The header names the frequency and shows only its counts."""
         app = self.make_app()
         widgets = {"#bar-left": Mock(), "#bar-right": Mock()}
-        with patch.object(view, "connect", return_value=self.conn), \
+        with patch.object(view, "read_rows", side_effect=self.read_rows), \
                 patch.object(view, "relay_alive", return_value=True), \
                 patch.object(app, "query_one", side_effect=lambda name, *_: widgets[name]):
             app.refresh_header()
@@ -191,7 +195,7 @@ class FrequencyViewTest(unittest.TestCase):
         app = self.make_app()
         app.show_all = True  # Query guards must also protect reload/poll callers.
         stream = Mock()
-        with patch.object(view, "connect", return_value=self.conn), \
+        with patch.object(view, "read_rows", side_effect=self.read_rows), \
                 patch.object(app, "query_one", return_value=stream):
             app.reload_stream()
             self.assertEqual(app.last_message_id, 4)
@@ -211,12 +215,12 @@ class FrequencyViewTest(unittest.TestCase):
         app.show_all = True
         roster = Mock()
         labels = {"w1": "Main", "w2": "Other"}
-        with patch.object(view, "connect", return_value=self.conn), \
+        with patch.object(view, "read_rows", side_effect=self.read_rows), \
                 patch.object(view, "workspace_labels", return_value=labels), \
                 patch.object(view, "pane_states", return_value={}) as pane_states, \
                 patch.object(app, "query_one", return_value=roster), \
                 patch.object(app, "refresh_header"):
-            app.refresh_handles()
+            app.apply_handles(*app.collect_handles())
         pane_states.assert_called_once_with(labels)
         rendered = roster.update.call_args.args[0].plain
         self.assertIn("named frequency alpha\n", rendered)
