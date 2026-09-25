@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -36,6 +38,10 @@ try:  # Windows only: byte-range file lock, the relay's single-instance primitiv
     import msvcrt
 except ImportError:
     msvcrt = None
+try:  # POSIX only: the calm animation's terminal control.
+    import curses
+except ImportError:  # Windows: `radio tools calm` reports it is unavailable.
+    curses = None
 
 # Split timeouts: one wedged herdr must not stall the relay daemon — a
 # read-only pane lookup gets 2s, a real delivery (agent prompt / send-text /
@@ -3220,6 +3226,187 @@ def cmd_tools_usage(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         time.sleep(max(args.interval, 1.0))
 
 
+# ---------------------------------------------------------------------------
+# Calm
+#
+# A quiet terminal animation: slow colour currents, twinkling stars and a few
+# drifting motes. It is self-contained on purpose — curses is stdlib — and
+# independent of any user script: `radio tools calm` always runs this code.
+# ---------------------------------------------------------------------------
+
+CALM_FPS = 6.0
+CALM_STAR_DENSITY = 0.0028
+CALM_FLOW_COLORS = (24, 25, 31, 60, 61, 67, 68, 74, 97, 98, 104, 105)
+CALM_STAR_COLORS = (238, 242, 247, 252)
+CALM_ACCENT_COLORS = (37, 80, 111, 141, 176, 209, 221, 150)
+CALM_MOTE_GLYPHS = ("○", "◇", "✧", "•")
+
+
+class CalmStar:
+    """One twinkling star: a fixed position whose phase and speed drive its glow.
+
+    A plain class on purpose: the tests load this file as a module that never
+    enters sys.modules, and @dataclass requires that registration."""
+
+    def __init__(self, x: float, y: float, phase: float, speed: float) -> None:
+        self.x = x
+        self.y = y
+        self.phase = phase
+        self.speed = speed
+
+
+class CalmMote:
+    """One drifting mote: it crosses the scene slowly and pulses on the way.
+
+    A plain class for the same reason as CalmStar."""
+
+    def __init__(self, x: float, y: float, phase: float, speed: float, color: int, glyph: str) -> None:
+        self.x = x
+        self.y = y
+        self.phase = phase
+        self.speed = speed
+        self.color = color
+        self.glyph = glyph
+
+
+def calm_stars(width: int, height: int) -> list[CalmStar]:
+    """Seed the star field from the screen size; never fewer than twelve."""
+    count = max(12, int(width * height * CALM_STAR_DENSITY))
+    return [
+        CalmStar(
+            x=random.random(),
+            y=random.random(),
+            phase=random.random() * math.tau,
+            speed=random.uniform(0.20, 0.48),
+        )
+        for _ in range(count)
+    ]
+
+
+def calm_motes(width: int, height: int) -> list[CalmMote]:
+    """Seed the few accent motes that drift across the scene."""
+    count = max(6, min(14, width * height // 280))
+    return [
+        CalmMote(
+            x=random.random(),
+            y=random.uniform(0.12, 0.88),
+            phase=random.random() * math.tau,
+            speed=random.uniform(0.0025, 0.007),
+            color=random.randrange(len(CALM_ACCENT_COLORS)),
+            glyph=random.choice(CALM_MOTE_GLYPHS),
+        )
+        for _ in range(count)
+    ]
+
+
+def calm_add(screen, y: int, x: int, char: str, style: int) -> None:
+    """Write one cell, ignoring the edges curses refuses to paint."""
+    try:
+        screen.addstr(y, x, char, style)
+    except curses.error:
+        pass
+
+
+def calm_render(screen) -> None:
+    """Draw the calm scene until q, Escape or Ctrl-C; the caller owns the screen."""
+    curses.curs_set(0)
+    screen.nodelay(True)
+    screen.keypad(True)
+    curses.use_default_colors()
+    palette = (*CALM_FLOW_COLORS, *CALM_STAR_COLORS, *CALM_ACCENT_COLORS)
+    for pair, color in enumerate(palette[: curses.COLOR_PAIRS - 1], start=1):
+        curses.init_pair(pair, color, -1)
+
+    old_size = (0, 0)
+    stars: list[CalmStar] = []
+    motes: list[CalmMote] = []
+    started = time.monotonic()
+    while True:
+        key = screen.getch()
+        if key in (ord("q"), ord("Q"), 27, 3):
+            return
+        height, width = screen.getmaxyx()
+        if (width, height) != old_size:
+            stars = calm_stars(width, height)
+            motes = calm_motes(width, height)
+            old_size = (width, height)
+        now = time.monotonic() - started
+        screen.erase()
+
+        if width >= 12 and height >= 5:
+            usable_height = height - 1
+
+            # Three dim currents cross the screen at slightly different speeds.
+            for band in range(3):
+                center = usable_height * (0.30 + band * 0.20)
+                amplitude = max(1.0, usable_height * (0.045 + band * 0.008))
+                for x in range(0, width, 2):
+                    wave = math.sin(x * 0.055 + now * (0.11 + band * 0.025) + band * 2.1)
+                    drift = math.sin(x * 0.016 - now * 0.055 + band) * amplitude * 0.55
+                    y = int(center + wave * amplitude + drift)
+                    pair = 1 + int(x * 0.035 + now * 0.20 + band * 3.0) % len(CALM_FLOW_COLORS)
+                    calm_add(
+                        screen,
+                        y,
+                        x,
+                        "·" if (x + band) % 6 else "~",
+                        curses.color_pair(pair) | curses.A_DIM,
+                    )
+
+            star_offset = len(CALM_FLOW_COLORS)
+            for star in stars:
+                x = min(width - 1, int(star.x * width))
+                y = min(usable_height - 1, int(star.y * usable_height))
+                glow = (math.sin(star.phase + now * star.speed) + 1.0) / 2.0
+                level = min(3, int(glow * 4))
+                style = curses.color_pair(1 + star_offset + level)
+                if level == 3:
+                    style |= curses.A_BOLD
+                calm_add(screen, y, x, ("·", "·", "*", "✦")[level], style)
+
+            # Sparse coloured motes drift across the scene over several minutes.
+            accent_offset = len(CALM_FLOW_COLORS) + len(CALM_STAR_COLORS)
+            for mote in motes:
+                x = int(((mote.x + now * mote.speed) % 1.0) * width)
+                bob = math.sin(mote.phase + now * 0.16) * 1.4
+                y = min(usable_height - 1, max(0, int(mote.y * usable_height + bob)))
+                pulse = (math.sin(mote.phase + now * 0.24) + 1.0) / 2.0
+                style = curses.color_pair(1 + accent_offset + mote.color)
+                if pulse < 0.38:
+                    style |= curses.A_DIM
+                elif pulse > 0.82:
+                    style |= curses.A_BOLD
+                calm_add(screen, y, x, mote.glyph, style)
+
+            hint = " q: quit "
+            calm_add(
+                screen,
+                height - 1,
+                max(0, width - len(hint) - 1),
+                hint,
+                curses.color_pair(1 + len(CALM_FLOW_COLORS)) | curses.A_DIM,
+            )
+
+        screen.refresh()
+        time.sleep(1 / CALM_FPS)
+
+
+def cmd_tools_calm(args: argparse.Namespace) -> int:
+    """Run the calm animation in the current terminal.
+
+    Self-contained and read-only: it touches neither the ledger nor any user
+    script, and needs nothing but a terminal."""
+    if curses is None:
+        raise SystemExit("calm needs a POSIX terminal (curses is unavailable here)")
+    if not sys.stdout.isatty():
+        raise SystemExit("calm needs a terminal; run it in a pane")
+    try:
+        curses.wrapper(calm_render)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI parser: one subcommand per ledger operation, plus relay/view."""
     parser = argparse.ArgumentParser(prog="radio", description=__doc__)
@@ -3321,6 +3508,8 @@ def build_parser() -> argparse.ArgumentParser:
     tp.add_argument("--json", action="store_true", help="print one machine-readable snapshot and exit")
     tp.add_argument("--interval", type=float, default=30.0, help="seconds between ticker redraws (default 30)")
     p.set_defaults(func=cmd_tools_usage)
+    cp = tools.add_parser("calm", help="a quiet terminal animation (q quits)")
+    cp.set_defaults(func=cmd_tools_calm)
 
     return parser
 
@@ -3564,6 +3753,8 @@ def main() -> int:
         return cmd_view(args)
     if args.command == "repair":
         return cmd_repair(args)
+    if args.command == "tools" and getattr(args, "tools_command", None) == "calm":
+        return cmd_tools_calm(args)
     with closing(connect()) as conn:
         handler = {
             "join": cmd_join,

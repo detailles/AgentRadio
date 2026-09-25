@@ -2984,6 +2984,33 @@ class UsageToolsTest(RadioTestCase):
         self.assertEqual(args.func, radio.cmd_tools_usage)
 
 
+class ToolsCalmTest(RadioTestCase):
+    """radio tools calm: a self-contained terminal animation, no ledger or deps."""
+
+    def test_parser_wires_the_calm_command(self):
+        """The CLI surface: tools calm parses to its own handler."""
+        args = radio.build_parser().parse_args(["tools", "calm"])
+        self.assertEqual(args.func, radio.cmd_tools_calm)
+
+    def test_no_terminal_is_a_clear_message(self):
+        """Without a tty the command explains itself instead of a curses traceback."""
+        saved = sys.stdout
+        sys.stdout = io.StringIO()
+        self.addCleanup(setattr, sys, "stdout", saved)
+        with self.assertRaises(SystemExit) as ctx:
+            radio.cmd_tools_calm(argparse.Namespace())
+        self.assertIn("terminal", str(ctx.exception))
+
+    def test_scene_is_seeded_from_the_screen(self):
+        """Stars and motes scale with the screen and stay inside its bounds."""
+        stars = radio.calm_stars(80, 24)
+        self.assertGreaterEqual(len(stars), 12)
+        motes = radio.calm_motes(80, 24)
+        self.assertTrue(motes)
+        self.assertTrue(all(0.0 <= mote.x <= 1.0 and 0.0 <= mote.y <= 1.0 for mote in motes))
+        self.assertTrue(all(mote.glyph in radio.CALM_MOTE_GLYPHS for mote in motes))
+
+
 if __name__ == "__main__":
     unittest.main()
 

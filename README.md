@@ -132,6 +132,7 @@ radio pm coder 'ping' --from planner
 | `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
 | `radio account <add\|list\|remove\|move>` | Named provider accounts: a config home plus launch environment per login; `move` carries a session to another account |
 | `radio tools usage` | Provider quota per account (Codex, Claude, Kimi): a ticker by default, `--table` / `--once` / `--json` for one-shot reads |
+| `radio tools calm` | A quiet terminal animation — slow colour currents and twinkling stars; `q` quits |
 | `radio inbox` | Index of your messages: ids, senders, status. Nothing consumed |
 | `radio show <id>` | Read one exact body; records the delivery |
 | `radio log` | This project's message log |
