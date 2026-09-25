@@ -221,9 +221,16 @@ def herdr_bin() -> str:
 def herdr(*args: str, timeout: float = HERDR_READ_TIMEOUT) -> subprocess.CompletedProcess[str]:
     """Run one herdr CLI invocation with captured output. Read-only lookups
     take the short read timeout (default); delivery paths pass the send
-    timeout explicitly — one wedged herdr must not stall the relay."""
+    timeout explicitly — one wedged herdr must not stall the relay. Output is
+    decoded as UTF-8 (herdr's own encoding): the Windows locale codec cannot
+    represent the box/prompt glyphs in pane reads."""
     return subprocess.run(
-        [herdr_bin(), *args], text=True, capture_output=True, timeout=timeout
+        [herdr_bin(), *args],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -1834,7 +1841,12 @@ def format_for_pane(message: sqlite3.Row) -> str:
 
 AGENT_BOOT_GRACE_S = 30.0
 
-COMPOSER_PROMPTS = {"codex": "»", "claude": "❯"}
+COMPOSER_PROMPTS = {
+    # codex renders its prompt glyph differently per terminal/font (» on
+    # macOS, Γ in the Windows VM's capture); accept the observed set.
+    "codex": ("»", "›", "Γ"),
+    "claude": ("❯",),
+}
 COMPOSER_PLACEHOLDERS = {"codex": ("Ask Codex to do anything",)}
 _COMPOSER_DECORATION = " \t⠀⠁⠂⠄⠆⠈⠐⠒⠔⠠⠢⠤⠦⡀⡄⡠⢀⣀"
 _composer_cache: dict[str, tuple[float, bool | None]] = {}
@@ -1845,8 +1857,8 @@ def composer_has_draft(provider: str, pane_id: str) -> bool | None:
     providers whose prompt line we know, None when we cannot tell (the caller
     then pushes). Results are cached per pane for COMPOSER_CHECK_INTERVAL_S so
     a held delivery does not spawn a read on every relay tick."""
-    marker = COMPOSER_PROMPTS.get(provider)
-    if not marker or not pane_id:
+    markers = COMPOSER_PROMPTS.get(provider)
+    if not markers or not pane_id:
         return None
     cached = _composer_cache.get(pane_id)
     if cached and time.monotonic() - cached[0] < COMPOSER_CHECK_INTERVAL_S:
@@ -1855,9 +1867,15 @@ def composer_has_draft(provider: str, pane_id: str) -> bool | None:
     try:
         result = herdr("pane", "read", pane_id, "--source", "visible", "--format", "text")
         if result.returncode == 0:
-            lines = [line for line in result.stdout.splitlines() if marker in line]
-            if lines:
-                after = lines[-1].split(marker, 1)[1]
+            found = [
+                (line, marker)
+                for line in result.stdout.splitlines()
+                for marker in markers
+                if marker in line
+            ]
+            if found:
+                line, marker = found[-1]
+                after = line.split(marker, 1)[1]
                 if any(
                     placeholder in after
                     for placeholder in COMPOSER_PLACEHOLDERS.get(provider, ())

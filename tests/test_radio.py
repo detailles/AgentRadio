@@ -265,6 +265,14 @@ class ComposerDraftTest(RadioTestCase):
         self.visible = "»⠁yarım taslak⡀\n"
         self.assertTrue(radio.composer_has_draft("codex", "w1:p1"))
 
+    def test_codex_prompt_glyph_variants_are_recognized(self):
+        # The Windows VM capture renders the prompt as Γ; macOS as ».
+        self.visible = "Γ yarim taslak\n"
+        self.assertTrue(radio.composer_has_draft("codex", "w1:p1"))
+        radio._composer_cache.clear()
+        self.visible = "› Ask Codex to do anything\n"
+        self.assertFalse(radio.composer_has_draft("codex", "w1:p1"))
+
     def test_claude_marker_only_is_empty(self):
         self.visible = "❯\n─────\n"
         self.assertFalse(radio.composer_has_draft("claude", "w1:p1"))
