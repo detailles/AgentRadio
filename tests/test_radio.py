@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -2844,5 +2845,147 @@ class WorkspacePaneStatesTest(RadioTestCase):
         self.assertEqual((dot.plain, note), ("●", "idle"))  # w2's pane, not w1's
 
 
+class UsageToolsTest(RadioTestCase):
+    """radio tools usage: provider quota read in-process from each provider's
+    own files, bounded by one cache and one lock — never a poll."""
+
+    def setUp(self):
+        """Stub the provider reads so no test reaches a provider."""
+        super().setUp()
+        self._read = radio.read_provider_usage
+        self.addCleanup(setattr, radio, "read_provider_usage", self._read)
+        self.reads = []
+
+    def entry(self, remaining=61.0):
+        """A minimal provider entry shaped like the real readers return."""
+        return {
+            "plan": "test",
+            "windows": [
+                {"id": "primary", "label": "Week", "remainingPercent": remaining, "resetsAt": None}
+            ],
+        }
+
+    def install(self, value=None, fail=False):
+        """Record each provider read and answer with the configured value."""
+        def read(target):
+            self.reads.append(target["label"])
+            return None if fail else (value or self.entry())
+        radio.read_provider_usage = read
+
+    def add_account(self, name, provider, home):
+        """Insert one account row, as `radio account add` would."""
+        self.conn.execute(
+            "INSERT INTO accounts(name, provider, home, env, created_at) VALUES (?,?,?,?,?)",
+            (name, provider, home, "{}", radio.now()),
+        )
+        self.conn.commit()
+
+    def backdate_cache(self, seconds=radio.USAGE_CACHE_TTL_S + 60):
+        """Age every cache entry past the TTL so the next refresh must read again."""
+        path = radio.usage_cache_path()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for entry in payload["entries"].values():
+            entry["observedAt"] = time.time() - seconds
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def run_usage(self, **flags):
+        """Run cmd_tools_usage with stdout captured and return the printed text."""
+        buf = io.StringIO()
+        args = radio.build_parser().parse_args(["tools", "usage"])
+        for key, value in flags.items():
+            setattr(args, key, value)
+        with contextlib.redirect_stdout(buf):
+            radio.cmd_tools_usage(self.conn, args)
+        return buf.getvalue()
+
+    def test_targets_cover_defaults_and_named_accounts(self):
+        """Every codex/kimi account row is read; Claude's shared login stays one entry."""
+        self.add_account("work", "codex", "/tmp/codex-work")
+        self.add_account("personal", "kimi", "/tmp/kimi-personal")
+        self.add_account("alt", "claude", "/tmp/claude-alt")
+        labels = [target["label"] for target in radio.usage_targets(self.conn)]
+        self.assertIn("Codex", labels)
+        self.assertIn("Claude", labels)
+        self.assertIn("Kimi", labels)
+        self.assertIn("Codex · work", labels)
+        self.assertIn("Kimi · personal", labels)
+        self.assertNotIn("Claude · alt", labels)
+
+    def test_refresh_reads_once_per_window(self):
+        """A second refresh inside the TTL reads nothing; an aged cache reads again."""
+        self.install()
+        radio.refresh_usage_cache(self.conn)
+        first = len(self.reads)
+        self.assertEqual(first, len(radio.usage_targets(self.conn)))
+        radio.refresh_usage_cache(self.conn)
+        self.assertEqual(len(self.reads), first)
+        self.backdate_cache()
+        radio.refresh_usage_cache(self.conn)
+        self.assertEqual(len(self.reads), first * 2)
+
+    def test_failed_read_keeps_the_previous_value(self):
+        """A provider failure keeps the cached value; a missing one is recorded once."""
+        self.install()
+        radio.refresh_usage_cache(self.conn)
+        self.backdate_cache()
+        kept = radio.load_usage_cache()["Codex"]
+        self.install(fail=True)
+        entries = radio.refresh_usage_cache(self.conn)
+        self.assertEqual(entries["Codex"], kept)
+        path = radio.usage_cache_path()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["entries"].pop("Kimi")
+        payload["entries"]["Claude"]["observedAt"] = time.time() - radio.USAGE_CACHE_TTL_S - 60
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        entries = radio.refresh_usage_cache(self.conn)
+        self.assertEqual(entries["Kimi"]["windows"], [])
+        self.assertIn("unavailable", entries["Kimi"]["detail"])
+
+    def test_line_table_and_json_render_the_cache(self):
+        """The three renderers read the same cache entries."""
+        entries = {
+            "Codex": {"provider": "codex", "observedAt": time.time(), "windows": [
+                {"id": "primary", "label": "5h", "remainingPercent": 98.0, "resetsAt": None},
+                {"id": "secondary", "label": "Week", "remainingPercent": 61.0, "resetsAt": None},
+            ]},
+            "Claude": {"provider": "claude", "observedAt": time.time(), "windows": [
+                {"id": "seven_day", "label": "Week", "remainingPercent": 85.0, "resetsAt": None},
+            ]},
+            "Kimi": {"provider": "kimi", "observedAt": time.time(),
+                     "detail": "credentials or endpoint unavailable", "windows": []},
+        }
+        radio.save_usage_cache(entries)
+        self.install()
+        line = self.run_usage(once=True).strip()
+        self.assertIn("Codex: Week 61%", line)
+        self.assertIn("Kimi: unavailable", line)
+        table = self.run_usage(table=True)
+        self.assertIn("Codex", table)
+        self.assertIn("Week", table)
+        payload = json.loads(self.run_usage(json=True))
+        self.assertEqual(
+            [account["label"] for account in payload["accounts"]], ["Codex", "Claude", "Kimi"]
+        )
+        self.assertEqual(payload["accounts"][0]["windows"][1]["remainingPercent"], 61.0)
+
+    def test_json_reports_cache_age_and_staleness(self):
+        """The snapshot carries the observation time and a stale flag."""
+        payload = radio.usage_payload({
+            "Codex": {"provider": "codex", "observedAt": time.time() - 1200,
+                      "windows": [{"id": "primary", "label": "Week", "remainingPercent": 61.0, "resetsAt": None}]}
+        })
+        self.assertTrue(payload["stale"])
+        self.assertGreater(payload["ageSeconds"], radio.USAGE_CACHE_TTL_S)
+
+    def test_parser_wires_the_tools_usage_command(self):
+        """The CLI surface: tools usage with its one-shot flags."""
+        args = radio.build_parser().parse_args(["tools", "usage", "--table"])
+        self.assertTrue(args.table)
+        self.assertEqual(args.func, radio.cmd_tools_usage)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+

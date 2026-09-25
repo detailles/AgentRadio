@@ -9,6 +9,7 @@ plugin state dir (when running as a Herdr plugin command), $RADIO_HOME, or
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -44,6 +48,23 @@ FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask th
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
 VERSION = "0.5.0"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pane workspace.
+
+# Provider usage: each provider's own quota endpoint is read here, in Python,
+# from that provider's own credential files — the plugin depends on no other
+# tool. One local cache bounds the cost to at most one read per account per TTL
+# window, shared by every caller through a lock, so a ticker or several panes
+# can never poll a provider or trip its rate limit.
+USAGE_CACHE_TTL_S = 600.0
+USAGE_HTTP_TIMEOUT_S = 12.0
+USAGE_MAX_BODY_BYTES = 512 * 1024
+CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/codex/usage"
+CLAUDE_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_DEFAULT_OAUTH_KEY = "oauth/kimi-code"
+KIMI_MAINLAND_OAUTH_HOST = "https://auth.kimi.com"
+KIMI_MAINLAND_BASE_URL = "https://api.kimi.com/coding/v1"
+KIMI_GLOBAL_OAUTH_HOST = "https://auth.kimi.ai"
+KIMI_GLOBAL_BASE_URL = "https://api.kimi.ai/coding/v1"
 
 
 def state_dir() -> Path:
@@ -2546,6 +2567,659 @@ def cmd_relay(args: argparse.Namespace) -> int:
             return 0
 
 
+# ---------------------------------------------------------------------------
+# Provider usage
+#
+# Every credential path and endpoint below is read here, in Python, from the
+# provider's own files: the plugin depends on no other tool. One local cache
+# bounds the cost — at most one read per account per TTL window, shared by
+# every caller through a lock — so a ticker or several panes can never poll a
+# provider or trip its rate limit. A failed read keeps the last value and is
+# retried on the next window, never in a loop.
+# ---------------------------------------------------------------------------
+
+USAGE_USER_AGENT = f"radio/{VERSION}"
+
+
+def usage_cache_path() -> Path:
+    """The usage cache file, resolved per call so RADIO_HOME and tests apply."""
+    return STATE_DIR / "usage-cache.json"
+
+
+def usage_lock_path() -> Path:
+    """The usage refresh lock: one refresher at a time across panes."""
+    return STATE_DIR / "usage.lock"
+
+
+def usage_read_json(path: Path) -> dict | None:
+    """Read one JSON file; missing, unreadable or non-object content reads as None."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def usage_http_request(request: urllib.request.Request) -> tuple[int, dict | None]:
+    """Perform one HTTP request and decode a bounded JSON body.
+
+    Returns (status, payload); status 0 means the request never completed and
+    payload is None whenever the response was empty, oversized or not JSON."""
+    try:
+        with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT_S) as response:
+            data = response.read(USAGE_MAX_BODY_BYTES + 1)
+            status = int(response.status)
+    except urllib.error.HTTPError as error:
+        return int(error.code), None
+    except OSError:
+        return 0, None
+    if len(data) > USAGE_MAX_BODY_BYTES:
+        return status, None
+    try:
+        payload = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        return status, None
+    return status, payload if isinstance(payload, dict) else None
+
+
+def usage_http_get_json(url: str, headers: dict[str, str]) -> tuple[int, dict | None]:
+    """GET one endpoint with the shared Accept header."""
+    request = urllib.request.Request(url, headers={"Accept": "application/json", **headers})
+    return usage_http_request(request)
+
+
+def usage_http_post_form(url: str, form: dict[str, str]) -> tuple[int, dict | None]:
+    """POST one form-encoded body (the Kimi token refresh) and decode JSON."""
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(form).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USAGE_USER_AGENT,
+        },
+        method="POST",
+    )
+    return usage_http_request(request)
+
+
+def usage_remaining_percent(used_percent) -> float | None:
+    """Remaining percent clamped to 0..100; None when the provider sent no number."""
+    if not isinstance(used_percent, (int, float)):
+        return None
+    return round(max(0.0, min(100.0, 100.0 - float(used_percent))), 1)
+
+
+def usage_window_label(seconds) -> str:
+    """Label a provider window compactly: Week for seven days, Quota when absent."""
+    if not isinstance(seconds, (int, float)) or seconds <= 0:
+        return "Quota"
+    if int(seconds) == 604800:
+        return "Week"
+    if int(seconds) % 86400 == 0:
+        return f"{int(seconds // 86400)}d"
+    if int(seconds) % 3600 == 0:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 60)}m"
+
+
+def usage_reset_iso(value) -> str | None:
+    """Normalize a provider reset stamp (unix seconds or ISO text) to ISO UTC."""
+    if isinstance(value, (int, float)) and value > 0:
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def usage_countdown(resets_at: str | None) -> str:
+    """Compact countdown to a reset: 5d17h, 3h, due, or '' when unknown."""
+    if not resets_at:
+        return ""
+    try:
+        when = datetime.fromisoformat(resets_at)
+    except ValueError:
+        return ""
+    remaining = (when - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return "due"
+    days, hours = divmod(int(remaining // 3600), 24)
+    return f"{days}d{hours}h" if days else f"{hours}h"
+
+
+def usage_reset_text(resets_at: str | None) -> str:
+    """Render a reset stamp as a countdown plus the local time, for the table."""
+    countdown = usage_countdown(resets_at)
+    if not countdown or not resets_at:
+        return ""
+    when = datetime.fromisoformat(resets_at)
+    return f"resets {countdown} ({when.astimezone().strftime('%b %d %H:%M')})"
+
+
+def usage_age_text(seconds: float) -> str:
+    """Compact cache age: seconds under a minute, minutes, then hours."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def read_codex_usage(home: Path) -> dict | None:
+    """Read one Codex account's quota: its OAuth token in auth.json, then the
+    account usage endpoint. None means credentials or the read are unavailable."""
+    credentials = usage_read_json(home / "auth.json") or {}
+    tokens = credentials.get("tokens") if isinstance(credentials.get("tokens"), dict) else {}
+    token = str(tokens.get("access_token") or "").strip()
+    account = str(tokens.get("account_id") or "").strip()
+    if not token or not account:
+        return None
+    status, payload = usage_http_get_json(
+        CODEX_USAGE_ENDPOINT,
+        {
+            "Authorization": f"Bearer {token}",
+            "ChatGPT-Account-Id": account,
+            "User-Agent": USAGE_USER_AGENT,
+        },
+    )
+    if status != 200 or not payload:
+        return None
+    windows: list[dict] = []
+    rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
+    for window_id, key in (("primary", "primary_window"), ("secondary", "secondary_window")):
+        window = rate_limit.get(key)
+        if isinstance(window, dict):
+            windows.append(
+                {
+                    "id": window_id,
+                    "label": usage_window_label(window.get("limit_window_seconds")),
+                    "remainingPercent": usage_remaining_percent(window.get("used_percent")),
+                    "resetsAt": usage_reset_iso(window.get("reset_at")),
+                }
+            )
+    additional = payload.get("additional_rate_limits")
+    if isinstance(additional, list):
+        for index, limit in enumerate(additional):
+            if not isinstance(limit, dict):
+                continue
+            rate = limit.get("rate_limit") if isinstance(limit.get("rate_limit"), dict) else {}
+            name = str(limit.get("limit_name") or f"Additional {index + 1}").strip()
+            for window_id, key in (("primary", "primary_window"), ("secondary", "secondary_window")):
+                window = rate.get(key)
+                if isinstance(window, dict):
+                    windows.append(
+                        {
+                            "id": f"additional_{index + 1}.{window_id}",
+                            "label": f"{name} · {usage_window_label(window.get('limit_window_seconds'))}",
+                            "remainingPercent": usage_remaining_percent(window.get("used_percent")),
+                            "resetsAt": usage_reset_iso(window.get("reset_at")),
+                        }
+                    )
+    return {"plan": payload.get("plan_type"), "windows": windows}
+
+
+def claude_credentials() -> dict | None:
+    """Claude Code's OAuth credentials: the macOS Keychain entry where Claude
+    Code stores them, else the credentials file used on other platforms."""
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=USAGE_HTTP_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                payload = json.loads(result.stdout)
+            except ValueError:
+                return None
+            return payload if isinstance(payload, dict) else None
+    return usage_read_json(Path.home() / ".claude" / ".credentials.json")
+
+
+def claude_user_agent() -> str:
+    """The usage endpoint expects a Claude Code user agent; use the installed
+    CLI's version when it can be read."""
+    try:
+        result = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=USAGE_HTTP_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return USAGE_USER_AGENT
+    output = (result.stdout or "").strip()
+    version = output.split()[0] if output else ""
+    return f"claude-code/{version}" if version else USAGE_USER_AGENT
+
+
+def read_claude_usage() -> dict | None:
+    """Read the Claude Code account quota from its usage endpoint. Claude Code
+    keeps one shared login per user, so this is one account, not one per home."""
+    credentials = claude_credentials() or {}
+    oauth = credentials.get("claudeAiOauth") if isinstance(credentials.get("claudeAiOauth"), dict) else {}
+    token = str(oauth.get("accessToken") or "").strip()
+    if not token:
+        return None
+    status, payload = usage_http_get_json(
+        CLAUDE_USAGE_ENDPOINT,
+        {
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": claude_user_agent(),
+        },
+    )
+    if status != 200 or not payload:
+        return None
+    windows: list[dict] = []
+    for key, label in (
+        ("five_hour", "5h"),
+        ("seven_day", "Week"),
+        ("seven_day_opus", "Opus · Week"),
+        ("seven_day_sonnet", "Sonnet · Week"),
+        ("seven_day_oauth_apps", "OAuth apps · Week"),
+    ):
+        window = payload.get(key)
+        if isinstance(window, dict):
+            windows.append(
+                {
+                    "id": key,
+                    "label": label,
+                    "remainingPercent": usage_remaining_percent(window.get("utilization")),
+                    "resetsAt": usage_reset_iso(window.get("resets_at")),
+                }
+            )
+    return {"plan": oauth.get("subscriptionType"), "windows": windows}
+
+
+def kimi_runtime(home: Path) -> tuple[str, str, Path]:
+    """Resolve a Kimi Code account's OAuth host, API base URL and credential
+    file. The install's config.toml lists several service base URLs, so only
+    the account's coding endpoint counts; the environment may pin a region and
+    the mainland hosts apply otherwise."""
+    text = ""
+    config = home / "config.toml"
+    if config.exists():
+        try:
+            text = config.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+    configured = [value.rstrip("/") for value in re.findall(r'(?m)^\s*base_url\s*=\s*"([^"]+)"', text)]
+    account_base = next(
+        (value for value in configured if value in (KIMI_MAINLAND_BASE_URL, KIMI_GLOBAL_BASE_URL)), ""
+    )
+    base_url = (os.environ.get("KIMI_CODE_BASE_URL") or account_base).strip().rstrip("/")
+    oauth_setting = re.search(r'(?m)^\s*oauthHost\s*=\s*"([^"]+)"', text)
+    oauth_host = (
+        os.environ.get("KIMI_CODE_OAUTH_HOST")
+        or os.environ.get("KIMI_OAUTH_HOST")
+        or (oauth_setting.group(1) if oauth_setting else "")
+    ).strip().rstrip("/")
+    if not base_url:
+        base_url = KIMI_GLOBAL_BASE_URL if oauth_host == KIMI_GLOBAL_OAUTH_HOST else KIMI_MAINLAND_BASE_URL
+    if not oauth_host:
+        oauth_host = KIMI_GLOBAL_OAUTH_HOST if base_url == KIMI_GLOBAL_BASE_URL else KIMI_MAINLAND_OAUTH_HOST
+    if oauth_host == KIMI_MAINLAND_OAUTH_HOST and base_url == KIMI_MAINLAND_BASE_URL:
+        key = KIMI_DEFAULT_OAUTH_KEY
+    else:
+        payload = json.dumps({"oauthHost": oauth_host, "baseUrl": base_url}, separators=(",", ":"))
+        key = "oauth/kimi-code-env-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return oauth_host, base_url, home / "credentials" / f"{key.removeprefix('oauth/')}.json"
+
+
+def kimi_refresh(oauth_host: str, credentials_path: Path, credentials: dict) -> str:
+    """Refresh and persist one Kimi Code file token; '' when it cannot refresh."""
+    refresh_token = str(credentials.get("refresh_token") or "").strip()
+    if not refresh_token:
+        return ""
+    status, payload = usage_http_post_form(
+        f"{oauth_host}/api/oauth/token",
+        {
+            "client_id": KIMI_OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+    )
+    if status != 200 or not payload:
+        return ""
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        return ""
+    replacement = {
+        "access_token": token,
+        "refresh_token": str(payload.get("refresh_token") or refresh_token),
+        "expires_at": int(time.time()) + int(payload.get("expires_in") or 0),
+        "scope": str(payload.get("scope") or credentials.get("scope") or ""),
+        "token_type": str(payload.get("token_type") or credentials.get("token_type") or ""),
+        "expires_in": int(payload.get("expires_in") or 0),
+    }
+    try:
+        credentials_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = credentials_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(replacement), encoding="utf-8")
+        os.replace(tmp, credentials_path)
+    except OSError:
+        pass
+    return token
+
+
+def kimi_window_seconds(value, unit) -> float:
+    """Convert Kimi's window unit to seconds; unknown units read as zero."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return {
+        "TIME_UNIT_MINUTE": amount * 60,
+        "TIME_UNIT_HOUR": amount * 3600,
+        "TIME_UNIT_DAY": amount * 86400,
+    }.get(str(unit), 0.0)
+
+
+def kimi_quota_window(window_id: str, label: str, quota: dict) -> dict | None:
+    """One Kimi window from its limit/used/resetTime; None when unusable."""
+    try:
+        limit = float(quota.get("limit"))
+        used = float(quota.get("used"))
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    return {
+        "id": window_id,
+        "label": label,
+        "remainingPercent": usage_remaining_percent(used / limit * 100.0),
+        "resetsAt": usage_reset_iso(quota.get("resetTime")),
+    }
+
+
+def read_kimi_usage(home: Path) -> dict | None:
+    """Read one Kimi Code account's quota. Kimi rotates short-lived file
+    tokens, so an expired or rejected token is refreshed once (and persisted)
+    before the usage read is retried."""
+    oauth_host, base_url, credentials_path = kimi_runtime(home)
+    credentials = usage_read_json(credentials_path) or {}
+    token = str(credentials.get("access_token") or "").strip()
+    expires_at = credentials.get("expires_at")
+    if token and isinstance(expires_at, (int, float)) and expires_at and expires_at - 60 <= time.time():
+        token = ""
+    if not token:
+        token = kimi_refresh(oauth_host, credentials_path, credentials)
+    if not token:
+        return None
+
+    def fetch(access_token: str) -> tuple[int, dict | None]:
+        return usage_http_get_json(
+            f"{base_url}/usages",
+            {"Authorization": f"Bearer {access_token}", "User-Agent": USAGE_USER_AGENT},
+        )
+
+    status, payload = fetch(token)
+    if status == 401:
+        token = kimi_refresh(oauth_host, credentials_path, credentials)
+        if not token:
+            return None
+        status, payload = fetch(token)
+    if status != 200 or not payload:
+        return None
+    windows: list[dict] = []
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        window = kimi_quota_window("plan", "Quota", usage)
+        if window:
+            windows.append(window)
+    limits = payload.get("limits")
+    if isinstance(limits, list):
+        for index, limit in enumerate(limits):
+            if not isinstance(limit, dict):
+                continue
+            detail = limit.get("detail")
+            window_spec = limit.get("window") if isinstance(limit.get("window"), dict) else {}
+            if isinstance(detail, dict):
+                seconds = kimi_window_seconds(window_spec.get("duration"), window_spec.get("timeUnit"))
+                window = kimi_quota_window(f"rolling_{index + 1}", usage_window_label(seconds), detail)
+                if window:
+                    windows.append(window)
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    membership = user.get("membership") if isinstance(user.get("membership"), dict) else {}
+    return {"plan": membership.get("level"), "windows": windows}
+
+
+def read_provider_usage(target: dict) -> dict | None:
+    """Read one account's quota through its provider reader; None on failure."""
+    provider, home = target["provider"], target["home"]
+    if provider == "codex" and home is not None:
+        return read_codex_usage(home)
+    if provider == "claude":
+        return read_claude_usage()
+    if provider == "kimi" and home is not None:
+        return read_kimi_usage(home)
+    return None
+
+
+def usage_targets(conn: sqlite3.Connection) -> list[dict]:
+    """Every provider account the ledger knows, plus each provider's default
+    login. Claude Code keeps one shared login per user, so its named accounts
+    are not separately readable and the shared entry covers them."""
+    targets = [
+        {
+            "label": "Codex",
+            "provider": "codex",
+            "home": Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex"),
+        },
+        {"label": "Claude", "provider": "claude", "home": None},
+        {
+            "label": "Kimi",
+            "provider": "kimi",
+            "home": Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code"),
+        },
+    ]
+    display = {"codex": "Codex", "kimi": "Kimi"}
+    for row in conn.execute("SELECT name, provider, home FROM accounts ORDER BY name").fetchall():
+        provider = row["provider"]
+        if provider not in display or not row["home"]:
+            continue
+        targets.append(
+            {
+                "label": f"{display[provider]} · {row['name']}",
+                "provider": provider,
+                "home": Path(row["home"]).expanduser(),
+            }
+        )
+    return targets
+
+
+def load_usage_cache() -> dict:
+    """The usage cache entries, or an empty mapping when none is readable."""
+    payload = usage_read_json(usage_cache_path()) or {}
+    entries = payload.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def save_usage_cache(entries: dict) -> None:
+    """Persist the usage cache atomically; the cache is a convenience, so a
+    failed write is ignored rather than failing the command."""
+    path = usage_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"version": 1, "entries": entries}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
+    """Refresh stale provider entries, at most once per TTL window.
+
+    The lock makes several panes share one refresh. A failed read keeps the
+    previous entry, or records one unavailable entry for the window, so the
+    display degrades to stale instead of polling the provider."""
+    entries = load_usage_cache()
+    targets = usage_targets(conn)
+    now_ts = time.time()
+
+    def fresh(entry) -> bool:
+        return isinstance(entry, dict) and now_ts - float(entry.get("observedAt") or 0) <= USAGE_CACHE_TTL_S
+
+    stale = [target for target in targets if not fresh(entries.get(target["label"]))]
+    if not stale:
+        return entries
+    lock_path = usage_lock_path()
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return entries
+    with open(lock_path, "a+", encoding="utf-8") as lock_fd:
+        if not relay_lock(lock_fd):
+            return load_usage_cache()
+        entries = load_usage_cache()
+        for target in stale:
+            previous = entries.get(target["label"])
+            if fresh(previous):
+                continue
+            value = read_provider_usage(target)
+            if value is not None:
+                entries[target["label"]] = {**value, "provider": target["provider"], "observedAt": now_ts}
+            elif not isinstance(previous, dict):
+                entries[target["label"]] = {
+                    "provider": target["provider"],
+                    "observedAt": now_ts,
+                    "detail": "credentials or endpoint unavailable",
+                    "windows": [],
+                }
+        save_usage_cache(entries)
+    return entries
+
+
+def usage_primary_window(entry: dict) -> dict | None:
+    """The window the ticker line shows: the weekly or plan allowance."""
+    windows = [window for window in entry.get("windows", []) if isinstance(window, dict)]
+    for wanted in ("Week", "Quota"):
+        for window in windows:
+            if window.get("label") == wanted:
+                return window
+    return windows[0] if windows else None
+
+
+def render_usage_line(entries: dict) -> str:
+    """The compact ticker line: one segment per account, usage-style."""
+    segments = []
+    for label, entry in entries.items():
+        window = usage_primary_window(entry)
+        if window is None:
+            segments.append(f"{label}: unavailable")
+            continue
+        remaining = window.get("remainingPercent")
+        percent = f"{int(remaining)}%" if isinstance(remaining, (int, float)) else "-"
+        segment = f"{label}: {window.get('label') or 'Quota'} {percent}"
+        countdown = usage_countdown(window.get("resetsAt"))
+        if countdown:
+            segment += f" ({countdown})"
+        segments.append(segment)
+    return " - ".join(segments) if segments else "no usage accounts"
+
+
+def render_usage_table(entries: dict) -> str:
+    """The aligned per-account table with every window and the cache age."""
+    newest = max((float(entry.get("observedAt") or 0) for entry in entries.values()), default=0.0)
+    header = f"provider usage · {datetime.now().strftime('%H:%M')}"
+    if newest:
+        age = max(time.time() - newest, 0.0)
+        header += f" · cache{' stale' if age > USAGE_CACHE_TTL_S else ''} {usage_age_text(age)}"
+    else:
+        header += " · no data yet"
+    lines = [header]
+    label_width = max((len(label) for label in entries), default=0)
+    for label, entry in entries.items():
+        windows = [window for window in entry.get("windows", []) if isinstance(window, dict)]
+        if not windows:
+            lines.append(f"  {label:<{label_width}}  {entry.get('detail') or 'unavailable'}")
+            continue
+        window_width = max(len(str(window.get("label") or "")) for window in windows)
+        for index, window in enumerate(windows):
+            remaining = window.get("remainingPercent")
+            percent = f"{int(remaining)}% left" if isinstance(remaining, (int, float)) else "-"
+            name = label if index == 0 else ""
+            line = f"  {name:<{label_width}}  {str(window.get('label') or '-'):<{window_width}}  {percent:>8}"
+            lines.append(f"{line}  {usage_reset_text(window.get('resetsAt'))}".rstrip())
+    return "\n".join(lines)
+
+
+def usage_payload(entries: dict) -> dict:
+    """The machine-readable snapshot: every account, window and observation time."""
+    newest = max((float(entry.get("observedAt") or 0) for entry in entries.values()), default=0.0)
+    age = max(time.time() - newest, 0.0) if newest else None
+    return {
+        "observedAt": datetime.fromtimestamp(newest, timezone.utc).isoformat() if newest else None,
+        "ageSeconds": None if age is None else round(age, 1),
+        "stale": bool(age is not None and age > USAGE_CACHE_TTL_S),
+        "accounts": [
+            {
+                "label": label,
+                "provider": entry.get("provider"),
+                "plan": entry.get("plan"),
+                "detail": entry.get("detail"),
+                "windows": [
+                    {
+                        "id": window.get("id"),
+                        "label": window.get("label"),
+                        "remainingPercent": window.get("remainingPercent"),
+                        "resetsAt": window.get("resetsAt"),
+                    }
+                    for window in entry.get("windows", [])
+                    if isinstance(window, dict)
+                ],
+            }
+            for label, entry in entries.items()
+        ],
+    }
+
+
+def cmd_tools_usage(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Show provider quota for every account, read from the providers' own
+    endpoints into one local cache.
+
+    Bounded with respect to the providers: at most one read per account per TTL
+    window, shared by all callers through a lock, so nothing here can poll a
+    provider or trip its rate limit. The default mode is the ticker; --table
+    prints the aligned table once, --once prints one ticker line, and --json
+    prints the machine-readable snapshot."""
+
+    def snapshot() -> tuple[str, str, dict]:
+        entries = refresh_usage_cache(conn)
+        return render_usage_line(entries), render_usage_table(entries), usage_payload(entries)
+
+    if args.json:
+        _, _, payload = snapshot()
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return 0
+    if args.table:
+        _, table, _ = snapshot()
+        print(table)
+        return 0
+    if args.once:
+        line, _, _ = snapshot()
+        print(line)
+        return 0
+    while True:
+        line, _, _ = snapshot()
+        sys.stdout.write("\x1b[2J\x1b[H" + line + "\n")
+        sys.stdout.flush()
+        time.sleep(max(args.interval, 1.0))
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI parser: one subcommand per ledger operation, plus relay/view."""
     parser = argparse.ArgumentParser(prog="radio", description=__doc__)
@@ -2638,6 +3312,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("view", help="live roster + message stream TUI")
     p.add_argument("--frequency", metavar="NAME", help="advanced: view only this named frequency")
+
+    p = sub.add_parser("tools", help="local views over provider data")
+    tools = p.add_subparsers(dest="tools_command")
+    tp = tools.add_parser("usage", help="provider quota per account, from a local cache")
+    tp.add_argument("--table", action="store_true", help="print the aligned table once instead of the ticker")
+    tp.add_argument("--once", action="store_true", help="print one ticker line and exit")
+    tp.add_argument("--json", action="store_true", help="print one machine-readable snapshot and exit")
+    tp.add_argument("--interval", type=float, default=30.0, help="seconds between ticker redraws (default 30)")
+    p.set_defaults(func=cmd_tools_usage)
+
     return parser
 
 
@@ -2894,6 +3578,7 @@ def main() -> int:
             "log": cmd_log,
             "inbox": cmd_inbox,
             "show": cmd_show,
+            "tools": cmd_tools_usage,
         }[args.command]
         return handler(conn, args)
 

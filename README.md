@@ -131,6 +131,7 @@ radio pm coder 'ping' --from planner
 | `radio handles` | This project's roster: live, gone, or pull. Outside Herdr: every project, grouped |
 | `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
 | `radio account <add\|list\|remove\|move>` | Named provider accounts: a config home plus launch environment per login; `move` carries a session to another account |
+| `radio tools usage` | Provider quota per account (Codex, Claude, Kimi): a ticker by default, `--table` / `--once` / `--json` for one-shot reads |
 | `radio inbox` | Index of your messages: ids, senders, status. Nothing consumed |
 | `radio show <id>` | Read one exact body; records the delivery |
 | `radio log` | This project's message log |
@@ -165,6 +166,8 @@ The default dashboard makes its frequency visible: workspace `w4` is shown as `F
 **New projects come with a view.** When Herdr creates a workspace, a `workspace.created` hook opens a scoped Radio view pane in it, so every project starts with its own dashboard.
 
 **Bring an agent back.** `radio restore <handle>` re-launches the handle's recorded provider, account and session in its own pane (the briefing carries the workspace and role again); without a recorded session it starts fresh. It never creates layout: if the pane is gone, it says which workspace to open a pane in.
+
+**Provider usage without polling.** `radio tools usage` reads each provider's own quota endpoint in-process — Codex's `auth.json`, Claude Code's login, Kimi Code's file token — and keeps the result in one local cache. A read happens at most once per account per ten-minute window, shared by every pane through a lock, so a ticker or several dashboards can never poll a provider or trip its rate limit; a failed read keeps the last value and shows the cache's age instead.
 
 **Accounts.** Any number of logins per provider can share the bus. `radio account add work --provider codex --home ~/.codex-work` registers a config home — the default follows the provider's convention (`codex2` → `~/.codex-account-2`) — and `--env NAME=VALUE` (repeatable) adds launch-time environment for unusual setups. `radio join coder --account work` launches that login and records it on the handle, so `radio restore coder` brings the same login back without repeating the selector. The account is a property, never part of the name: the roster shows it as a separate `account:` field. To move a conversation to another login, `radio account move coder --to personal` copies the session files into the target home (codex, claude, kimi and pi) and switches the handle over; the old account keeps its data. `radio account list` shows each home, its extra environment and auth state; removing an account a handle still uses is refused.
 
