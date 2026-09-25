@@ -546,6 +546,25 @@ class RelayTickTest(RadioTestCase):
         self.assertEqual(row["attempts"], 0)
         self.assertTrue(any("agent blocked" in e for e in events))
 
+    def test_booting_agent_defers_then_falls_through_to_typing(self):
+        """A pane that has not reported its agent is booting, not reused: the
+        delivery holds through the grace window and then types into the shell
+        the pane actually is."""
+        self.conn.execute("UPDATE handles SET agent='codex' WHERE name='bob'")
+        self.conn.commit()
+        events = self.tick({"label": "bob"}, (True, None))
+        row = self.delivery_row(self.mid)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 0)
+        self.assertTrue(any("agent still booting" in e for e in events))
+        old = (
+            datetime.now(timezone.utc) - timedelta(seconds=radio.AGENT_BOOT_GRACE_S + 5)
+        ).isoformat()
+        self.conn.execute("UPDATE handles SET last_seen=? WHERE name='bob'", (old,))
+        self.conn.commit()
+        self.tick({"label": "bob"}, (True, None))
+        self.assertEqual(self.delivery_row(self.mid)["status"], "delivered")
+
 
 class RelayIdentityGuardTest(RadioTestCase):
     """The relay must never push one handle's mail into a pane that no longer
@@ -643,6 +662,54 @@ class DeliveryUnconfirmedTest(RadioTestCase):
         # 'pull' is not pending: a later tick must not push this delivery again.
         radio.relay_tick(self.conn)
         self.assertEqual(len(self.push_calls), 1)
+
+
+class PushToPaneTest(RadioTestCase):
+    """push_to_pane: the error contract the relay switches on, and the shell
+    escaping that keeps a typed message inert."""
+
+    def setUp(self):
+        """Stub herdr and the paste delay so each branch runs without a pane."""
+        super().setUp()
+        saved_herdr = radio.herdr
+        self.addCleanup(setattr, radio, "herdr", saved_herdr)
+        saved_sleep = radio.time.sleep
+        self.addCleanup(setattr, radio.time, "sleep", saved_sleep)
+        radio.time.sleep = lambda seconds: None
+        self.calls = []
+
+    def install(self, *, returncode=0, stderr="", raises=None):
+        """Answer every herdr call with one configured result or exception."""
+        def fake(*args, **kwargs):
+            """Record the call and answer with the configured result."""
+            self.calls.append(args)
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(list(args), returncode, stdout="", stderr=stderr)
+        radio.herdr = fake
+
+    def shell_calls(self):
+        """The send-text calls the shell branch made."""
+        return [call for call in self.calls if call[:2] == ("pane", "send-text")]
+
+    def test_prompt_timeout_is_unconfirmed(self):
+        """A wedged herdr must never turn into a resubmission."""
+        self.install(raises=subprocess.TimeoutExpired("herdr", 7))
+        self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "delivery_unconfirmed"))
+
+    def test_blocked_and_stalled_map_to_their_sentinels(self):
+        """herdr's stderr wording maps to the contract the relay switches on."""
+        self.install(returncode=1, stderr="agent is blocked by a dialog")
+        self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "agent_blocked"))
+        self.install(returncode=1, stderr="prompt stalled after 6s")
+        self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "delivery_unconfirmed"))
+
+    def test_agent_pane_gets_the_raw_text(self):
+        """A detected agent receives the message untouched."""
+        self.install()
+        radio.push_to_pane("w1:p1", "rm -rf / ; echo hi")
+        self.assertEqual(self.calls[0][3], "rm -rf / ; echo hi")
+        self.assertEqual(self.shell_calls(), [])
 
 
 class BacktickNormalizationTest(RadioTestCase):

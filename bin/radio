@@ -363,7 +363,11 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
         if entered.returncode != 0:
             return False, (entered.stderr or "enter key rejected").strip()
         return True, None
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
+        # The submission state is unknowable: herdr may have delivered the
+        # prompt before the timeout. Never let the caller resubmit.
+        return False, "delivery_unconfirmed"
+    except OSError as exc:
         return False, str(exc)
 
 
@@ -2238,7 +2242,9 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             continue
         if scope_workspace(handle) and (pane.get("workspace_id") or "") != scope_workspace(handle):
             continue
-        if handle["agent"] and pane.get("agent") != handle["agent"]:
+        # An undetected agent is booting, not changed: the push path's boot
+        # grace decides when to type instead.
+        if handle["agent"] and pane.get("agent") and pane.get("agent") != handle["agent"]:
             continue
         cur = conn.execute(
             "UPDATE deliveries SET status='pending', last_error=NULL, focus_hold_since=NULL "
@@ -2315,7 +2321,11 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             if cur.rowcount:
                 events.append(f"#{delivery_id} -> {target} ({pane_id}): workspace changed, left for pull")
             continue
-        if handle["agent"] and pane.get("agent") != handle["agent"]:
+        if handle["agent"] and pane.get("agent") and pane.get("agent") != handle["agent"]:
+            # A pane that reports no agent yet may be booting, or may run a
+            # provider herdr cannot detect: leave the decision to
+            # delivery_wait_reason, which defers through the boot window and
+            # then falls through to typing.
             cur = conn.execute(
                 "UPDATE deliveries SET status='pull', last_error='agent changed', "
                 "focus_hold_since=NULL "
@@ -2349,7 +2359,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
                     == pane_label(row["target"], row["target_ws"]).casefold()
                 and (not scope_workspace(current)
                      or live_pane.get("workspace_id") == scope_workspace(current))
-                and (not current["agent"] or live_pane.get("agent") == current["agent"])
+                and (not current["agent"] or not live_pane.get("agent")
+                     or live_pane.get("agent") == current["agent"])
             )
             if unchanged and any(is_frequency(row[key]) for key in ("target_ws", "from_ws", "to_ws")):
                 count = conn.execute(
