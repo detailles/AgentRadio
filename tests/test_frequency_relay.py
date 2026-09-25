@@ -17,12 +17,16 @@ except ImportError:  # unittest discover -s tests imports modules without a pack
 
 
 class FrequencyRelayRaceTest(FrequencyCase):
+    """The relay's final locked recheck against concurrent retunes and duplicate bindings."""
+
     def competing_connection(self):
+        """A second connection with no busy wait, so lock contention is visible."""
         connection = sqlite3.connect(self.root / "radio.db", timeout=0)
         self.addCleanup(connection.close)
         return connection
 
     def test_binding_retuned_before_final_lock_blocks_push_despite_stale_pane(self):
+        """A retune committed before the final lock blocks the push and leaves the mail for pull."""
         self.add_handle(scope="freq.old")
         mid = self.seed_message("freq.old", "must stay on the old frequency")
         self.conn.execute(
@@ -34,6 +38,7 @@ class FrequencyRelayRaceTest(FrequencyCase):
         retuned = []
 
         def lookup_with_concurrent_retune(pane_id):
+            """Retune the binding through a competing connection, then report the stale pane."""
             self.assertEqual(pane_id, "w1:p1")
             if not retuned:
                 self.assertFalse(self.conn.in_transaction)
@@ -67,12 +72,14 @@ class FrequencyRelayRaceTest(FrequencyCase):
         self.assertFalse(self.conn.in_transaction)
 
     def test_push_holds_write_lock_and_releases_it_before_later_retune(self):
+        """The push holds the write lock, and the same retune succeeds once it is released."""
         self.add_handle()
         mid = self.seed_message("freq.team", "deliver while binding is locked")
         competing = self.competing_connection()
         attempted = []
 
         def push_while_retune_attempts(pane_id, text):
+            """A retune attempt during the push must fail on the held lock."""
             self.assertTrue(self.conn.in_transaction)
             with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
                 competing.execute(
@@ -99,6 +106,7 @@ class FrequencyRelayRaceTest(FrequencyCase):
         self.assertEqual(self.row()["session_ref"], "manual")
 
     def test_duplicate_active_bindings_block_named_delivery_even_with_matching_label(self):
+        """Two bindings on one pane block a named push even with a matching label."""
         self.add_handle(scope="freq.team")
         self.add_handle(scope="freq.other")
         self.panes["w1:p1"]["label"] = "alice@team"
@@ -248,7 +256,10 @@ class FrequencyRelayFocusTest(FrequencyCase):
 
 
 class FrequencyRelayBoundaryTest(FrequencyCase):
+    """Raw ledger rows cannot push across a frequency boundary."""
+
     def assert_raw_delivery_blocked(self, source, target, *, message_target=None):
+        """Insert a raw cross-scope delivery and assert the relay leaves it for pull."""
         self.add_handle(scope=target)
         mid = radio.record_message(
             self.conn, "pm", "sender", "raw cross-scope body",
@@ -266,24 +277,31 @@ class FrequencyRelayBoundaryTest(FrequencyCase):
         self.assertFalse(self.conn.in_transaction)
 
     def test_named_source_cannot_push_into_default_workspace(self):
+        """A named source cannot push into a default workspace."""
         self.assert_raw_delivery_blocked("freq.team", "w1")
 
     def test_default_source_cannot_push_into_named_frequency(self):
+        """A default source cannot push into a named frequency."""
         self.assert_raw_delivery_blocked("w1", "freq.team")
 
     def test_named_source_cannot_push_into_legacy_global_scope(self):
+        """A named source cannot push into the legacy global scope."""
         self.assert_raw_delivery_blocked("freq.team", "")
 
     def test_legacy_global_source_cannot_push_into_named_frequency(self):
+        """The legacy global scope cannot push into a named frequency."""
         self.assert_raw_delivery_blocked("", "freq.team")
 
     def test_other_named_frequency_cannot_push_into_recipient_frequency(self):
+        """Another frequency cannot push into the recipient's frequency."""
         self.assert_raw_delivery_blocked("freq.other", "freq.team")
 
     def test_named_message_cannot_be_redirected_by_delivery_target(self):
+        """A delivery row cannot redirect a named message to another frequency."""
         self.assert_raw_delivery_blocked("freq.team", "freq.team", message_target="freq.other")
 
     def test_message_named_destination_cannot_be_disguised_by_default_delivery_row(self):
+        """A default delivery row cannot disguise a named message destination."""
         self.assert_raw_delivery_blocked("w1", "w1", message_target="freq.team")
 
 

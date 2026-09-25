@@ -434,6 +434,7 @@ class RadioView(App):
         self.last_message_id = max((r["id"] for r in rows), default=0)
 
     def render_message(self, row: sqlite3.Row) -> Text:
+        """Render one message for the stream, with the scope label only in overview mode."""
         return fmt_message(
             row, show_scope=all_scopes(self.scope, self.show_all), labels=self.labels,
         )

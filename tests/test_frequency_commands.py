@@ -12,12 +12,18 @@ from test_frequencies import FrequencyCase, join_args, radio
 
 
 class TerminalOutput(io.StringIO):
+    """A stdout stub that claims to be a tty, so an interactive join proceeds."""
+
     def isatty(self):
+        """Report a terminal so the join takes its interactive path."""
         return True
 
 
 class FrequencyCommandsTest(FrequencyCase):
+    """CLI boundaries: default handle changes, alias recovery, restore/view/part and the parser."""
+
     def test_default_handle_change_keeps_commands_usable_and_old_mail_for_pull(self):
+        """Renaming the handle keeps the pane usable and leaves the old handle's mail for pull."""
         self.pane()
         self.enter()
         self.capture(radio.cmd_join, join_args(handle="alice"))
@@ -44,6 +50,7 @@ class FrequencyCommandsTest(FrequencyCase):
         self.assertEqual(radio.current_scope(self.conn), "w1")
 
     def test_existing_default_aliases_recover_from_the_live_pane_identity(self):
+        """A stale alias is resolved from the live pane's label and session."""
         # Older releases retained the former handle after relabeling one pane.
         self.add_handle("alice", scope="w1", agent="codex", session="old-session")
         old_message = self.seed_message("w1", "old alias mail")
@@ -63,6 +70,7 @@ class FrequencyCommandsTest(FrequencyCase):
         self.assertEqual(self.herdr_calls, [])
 
     def test_default_alias_recovery_requires_a_matching_live_pane(self):
+        """Alias recovery needs a live pane whose label and workspace match."""
         self.add_handle("alice", scope="w1")
         self.add_handle("bob", scope="w1")
         self.enter()
@@ -73,6 +81,7 @@ class FrequencyCommandsTest(FrequencyCase):
                     radio.current_scope(self.conn)
 
     def test_default_alias_recovery_never_selects_among_named_bindings(self):
+        """A named binding forbids alias guessing, even when the label matches."""
         self.add_handle("alice", scope="freq.team")
         self.add_handle("bob", scope="w1")
         self.enter()
@@ -86,6 +95,7 @@ class FrequencyCommandsTest(FrequencyCase):
         self.assertEqual(self.herdr_calls, [])
 
     def test_legacy_unscoped_membership_can_still_be_adopted_by_its_workspace(self):
+        """A pre-scope row is adopted by its workspace without a disk search."""
         self.add_handle("alice", scope="", agent="codex", session="legacy-session")
         self.enter()
         self.capture(radio.cmd_join, join_args(provider="codex", resume=True))
@@ -97,6 +107,7 @@ class FrequencyCommandsTest(FrequencyCase):
         self.session_search.assert_not_called()
 
     def test_parser_requires_one_frequency_selection(self):
+        """--frequency and --workspace-frequency are mutually exclusive."""
         parser = radio.build_parser()
         args = parser.parse_args(["join", "alice", "--frequency", "team"])
         self.assertEqual(args.frequency, "team")
@@ -104,6 +115,7 @@ class FrequencyCommandsTest(FrequencyCase):
             parser.parse_args(["join", "alice", "--frequency", "team", "--workspace-frequency"])
 
     def test_status_distinguishes_default_and_advanced(self):
+        """radio frequency marks the default scope and named frequencies distinctly."""
         self.enter()
         output = self.capture(radio.cmd_frequency, argparse.Namespace())
         self.assertIn("(default)", output)
@@ -112,6 +124,7 @@ class FrequencyCommandsTest(FrequencyCase):
         self.assertIn("frequency: team (advanced)", output)
 
     def test_detached_named_agent_cannot_fall_back_to_workspace(self):
+        """A detached named agent cannot silently fall back to the workspace."""
         self.add_handle()
         self.enter()
         os.environ["RADIO_JOINED_SCOPE"] = "freq.team"
@@ -120,6 +133,7 @@ class FrequencyCommandsTest(FrequencyCase):
             radio.current_scope(self.conn)
 
     def test_old_conversation_cannot_silently_follow_a_new_binding(self):
+        """An old conversation scope cannot follow a new binding."""
         self.add_handle()
         self.enter()
         for previous in ("w1", "freq.other"):
@@ -129,6 +143,7 @@ class FrequencyCommandsTest(FrequencyCase):
                     radio.current_scope(self.conn)
 
     def test_view_uses_membership_and_clears_stale_environment(self):
+        """The view inherits the pane's frequency and clears a stale override."""
         self.add_handle()
         self.enter()
         os.environ["RADIO_VIEW_FREQUENCY"] = "stale"
@@ -140,6 +155,7 @@ class FrequencyCommandsTest(FrequencyCase):
             self.assertNotIn("RADIO_VIEW_FREQUENCY", launch.call_args.args[1])
 
     def test_restore_keeps_destination_frequency_and_recorded_session(self):
+        """restore types the join command with the frequency and the recorded session."""
         self.add_handle(agent="codex", session="saved-session")
         self.panes["w1:p1"]["agent"] = None
         self.enter()
@@ -150,6 +166,7 @@ class FrequencyCommandsTest(FrequencyCase):
         self.assertEqual(typed[3], "radio join alice --provider codex --resume --frequency team")
 
     def test_restore_recovery_instructions_keep_frequency(self):
+        """Restore recovery instructions keep the frequency."""
         self.add_handle("operator", pane_id="w1:p2")
         self.enter("w1:p2")
         self.add_handle(agent="codex", session="saved-session")
@@ -162,6 +179,7 @@ class FrequencyCommandsTest(FrequencyCase):
             radio.cmd_restore(self.conn, argparse.Namespace(handle="alice"))
 
     def test_opencode_same_handle_keeps_separate_frequency_briefings(self):
+        """Two frequencies of one handle get separate opencode configs and briefings."""
         configs = []
         for number, frequency in enumerate(("one", "two"), start=1):
             pane_id = f"w1:p{number}"
