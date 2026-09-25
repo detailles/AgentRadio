@@ -3031,15 +3031,25 @@ class UsageToolsTest(RadioTestCase):
         radio.refresh_usage_cache(self.conn)
         self.assertEqual(len(self.reads), first * 2)
 
-    def test_failed_read_keeps_the_previous_value(self):
-        """A provider failure keeps the cached value; a missing one is recorded once."""
+    def test_failed_read_keeps_the_previous_value_and_is_not_retried(self):
+        """A provider failure keeps the cached value, stamps the attempt, and
+        is asked again only in the next window — never on every call."""
         self.install()
         radio.refresh_usage_cache(self.conn)
         self.backdate_cache()
         kept = radio.load_usage_cache()["Codex"]
         self.install(fail=True)
+        before = len(self.reads)
         entries = radio.refresh_usage_cache(self.conn)
-        self.assertEqual(entries["Codex"], kept)
+        self.assertEqual(len(self.reads), before + len(radio.usage_targets(self.conn)))
+        self.assertEqual(
+            {key: value for key, value in entries["Codex"].items() if key != "attemptedAt"},
+            kept,
+        )
+        self.assertGreater(entries["Codex"]["attemptedAt"], 0)
+        # Inside the window the failure is cached: a second call reads nothing.
+        radio.refresh_usage_cache(self.conn)
+        self.assertEqual(len(self.reads), before + len(radio.usage_targets(self.conn)))
         path = radio.usage_cache_path()
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["entries"].pop("Kimi")
@@ -3075,6 +3085,62 @@ class UsageToolsTest(RadioTestCase):
             [account["label"] for account in payload["accounts"]], ["Codex", "Claude", "Kimi"]
         )
         self.assertEqual(payload["accounts"][0]["windows"][1]["remainingPercent"], 61.0)
+
+    def test_malformed_cache_entries_do_not_break_the_display(self):
+        """A truncated or hand-edited cache is an empty entry, not a crash."""
+        path = radio.usage_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "entries": {
+            "Codex": "not an object",
+            "Kimi": {"observedAt": "yesterday", "windows": [{"label": "Week"}]},
+        }}), encoding="utf-8")
+        self.assertEqual(list(radio.load_usage_cache()), ["Kimi"])
+        # A malformed timestamp and a non-list windows value render as empty.
+        entries = {"Kimi": {"observedAt": "yesterday", "windows": "junk"}}
+        self.assertIn("Kimi: unavailable", radio.render_usage_line(entries))
+        self.assertIn("no data yet", radio.render_usage_table(entries))
+        payload = radio.usage_payload(entries)
+        self.assertIsNone(payload["observedAt"])
+        self.assertEqual(payload["accounts"][0]["windows"], [])
+
+    def test_ticker_exits_cleanly_on_interrupt(self):
+        """Ctrl-C ends the ticker without a traceback."""
+        self.install()
+
+        def stop(seconds):
+            """End the ticker loop the way Ctrl-C does."""
+            raise KeyboardInterrupt
+
+        saved_sleep = radio.time.sleep
+        self.addCleanup(setattr, radio.time, "sleep", saved_sleep)
+        radio.time.sleep = stop
+        args = radio.build_parser().parse_args(["tools", "usage"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(radio.cmd_tools_usage(self.conn, args), 0)
+
+    def test_kimi_home_falls_back_like_the_cli(self):
+        """KIMI_CODE_HOME wins, KIMI_HOME is honored, ~/.kimi-code is the default."""
+        saved = {key: os.environ.pop(key, None) for key in ("KIMI_CODE_HOME", "KIMI_HOME")}
+        self.addCleanup(self._restore_kimi_env, saved)
+
+        def kimi_home():
+            """The Kimi target's resolved home."""
+            return [t for t in radio.usage_targets(self.conn) if t["label"] == "Kimi"][0]["home"]
+
+        self.assertEqual(kimi_home(), Path.home() / ".kimi-code")
+        os.environ["KIMI_HOME"] = "/tmp/kimi-home"
+        self.assertEqual(kimi_home(), Path("/tmp/kimi-home"))
+        os.environ["KIMI_CODE_HOME"] = "/tmp/kimi-code-home"
+        self.assertEqual(kimi_home(), Path("/tmp/kimi-code-home"))
+
+    @staticmethod
+    def _restore_kimi_env(saved):
+        """Put the ambient Kimi home env back."""
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_json_reports_cache_age_and_staleness(self):
         """The snapshot carries the observation time and a stale flag."""

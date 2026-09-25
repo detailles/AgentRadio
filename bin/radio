@@ -3080,7 +3080,11 @@ def usage_targets(conn: sqlite3.Connection) -> list[dict]:
         {
             "label": "Kimi",
             "provider": "kimi",
-            "home": Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code"),
+            "home": Path(
+                os.environ.get("KIMI_CODE_HOME")
+                or os.environ.get("KIMI_HOME")
+                or Path.home() / ".kimi-code"
+            ),
         },
     ]
     display = {"codex": "Codex", "kimi": "Kimi"}
@@ -3098,11 +3102,24 @@ def usage_targets(conn: sqlite3.Connection) -> list[dict]:
     return targets
 
 
+def usage_timestamp(value) -> float:
+    """A cache timestamp as a float; a malformed value reads as 0 (never
+    observed) so one bad entry can never break the display."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def load_usage_cache() -> dict:
-    """The usage cache entries, or an empty mapping when none is readable."""
+    """The usage cache entries, or an empty mapping when none is readable. An
+    entry that is not an object is dropped: the cache is written by this same
+    tool, and a truncated or hand-edited file must not break the display."""
     payload = usage_read_json(usage_cache_path()) or {}
     entries = payload.get("entries")
-    return entries if isinstance(entries, dict) else {}
+    if not isinstance(entries, dict):
+        return {}
+    return {label: entry for label, entry in entries.items() if isinstance(entry, dict)}
 
 
 def save_usage_cache(entries: dict) -> None:
@@ -3123,13 +3140,19 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
 
     The lock makes several panes share one refresh. A failed read keeps the
     previous entry, or records one unavailable entry for the window, so the
-    display degrades to stale instead of polling the provider."""
+    display degrades to stale instead of polling the provider. The attempt is
+    stamped too: a provider that is down or logged out must not be read again
+    on every call — that is a poll and can trip its rate limit."""
     entries = load_usage_cache()
     targets = usage_targets(conn)
     now_ts = time.time()
 
     def fresh(entry) -> bool:
-        return isinstance(entry, dict) and now_ts - float(entry.get("observedAt") or 0) <= USAGE_CACHE_TTL_S
+        """True when the entry was read or attempted inside the TTL window."""
+        return isinstance(entry, dict) and now_ts - max(
+            usage_timestamp(entry.get("observedAt")),
+            usage_timestamp(entry.get("attemptedAt")),
+        ) <= USAGE_CACHE_TTL_S
 
     stale = [target for target in targets if not fresh(entries.get(target["label"]))]
     if not stale:
@@ -3150,10 +3173,16 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
             value = read_provider_usage(target)
             if value is not None:
                 entries[target["label"]] = {**value, "provider": target["provider"], "observedAt": now_ts}
-            elif not isinstance(previous, dict):
+            elif isinstance(previous, dict) and previous.get("windows"):
+                # Keep the last data on display — it will read as stale — but
+                # stamp the attempt so the provider is asked again in the next
+                # window, not on every call.
+                entries[target["label"]] = {**previous, "attemptedAt": now_ts}
+            else:
                 entries[target["label"]] = {
                     "provider": target["provider"],
                     "observedAt": now_ts,
+                    "attemptedAt": now_ts,
                     "detail": "credentials or endpoint unavailable",
                     "windows": [],
                 }
@@ -3191,7 +3220,7 @@ def render_usage_line(entries: dict) -> str:
 
 def render_usage_table(entries: dict) -> str:
     """The aligned per-account table with every window and the cache age."""
-    newest = max((float(entry.get("observedAt") or 0) for entry in entries.values()), default=0.0)
+    newest = max((usage_timestamp(entry.get("observedAt")) for entry in entries.values()), default=0.0)
     header = f"provider usage · {datetime.now().strftime('%H:%M')}"
     if newest:
         age = max(time.time() - newest, 0.0)
@@ -3217,7 +3246,7 @@ def render_usage_table(entries: dict) -> str:
 
 def usage_payload(entries: dict) -> dict:
     """The machine-readable snapshot: every account, window and observation time."""
-    newest = max((float(entry.get("observedAt") or 0) for entry in entries.values()), default=0.0)
+    newest = max((usage_timestamp(entry.get("observedAt")) for entry in entries.values()), default=0.0)
     age = max(time.time() - newest, 0.0) if newest else None
     return {
         "observedAt": datetime.fromtimestamp(newest, timezone.utc).isoformat() if newest else None,
@@ -3252,8 +3281,8 @@ def cmd_tools_usage(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     Bounded with respect to the providers: at most one read per account per TTL
     window, shared by all callers through a lock, so nothing here can poll a
     provider or trip its rate limit. The default mode is the ticker; --table
-    prints the aligned table once, --once prints one ticker line, and --json
-    prints the machine-readable snapshot."""
+    prints the aligned table once, --once prints one ticker line, --json
+    prints the machine-readable snapshot. Ctrl-C ends the ticker cleanly."""
 
     def snapshot() -> tuple[str, str, dict]:
         entries = refresh_usage_cache(conn)
@@ -3271,11 +3300,16 @@ def cmd_tools_usage(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         line, _, _ = snapshot()
         print(line)
         return 0
-    while True:
-        line, _, _ = snapshot()
-        sys.stdout.write("\x1b[2J\x1b[H" + line + "\n")
-        sys.stdout.flush()
-        time.sleep(max(args.interval, 1.0))
+    try:
+        while True:
+            line, _, _ = snapshot()
+            sys.stdout.write("\x1b[2J\x1b[H" + line + "\n")
+            sys.stdout.flush()
+            time.sleep(max(args.interval, 1.0))
+    except KeyboardInterrupt:
+        # The ticker is a foreground display: Ctrl-C is the way out, not a
+        # traceback.
+        return 0
 
 
 # ---------------------------------------------------------------------------
