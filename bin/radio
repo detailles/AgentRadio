@@ -2572,7 +2572,8 @@ def script_compiles(script: str) -> bool:
 def cmd_relay(args: argparse.Namespace) -> int:
     """Run the delivery relay daemon: single instance via relay_lock, ticking
     relay_tick on the interval, re-execing itself when the script changes on
-    disk so a deploy never leaves stale code running."""
+    disk so a deploy never leaves stale code running. The lock file handle is
+    closed on every way out, so an in-process caller releases the lock too."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     # Leave the plugin directory: a daemon whose cwd sits inside the managed
     # plugin dir blocks Herdr's install/update on Windows (sharing violation),
@@ -2583,10 +2584,23 @@ def cmd_relay(args: argparse.Namespace) -> int:
         pass
     # 'a+', not 'w': Windows refuses to truncate a file whose bytes another
     # process holds locked, so the second relay must open without truncating.
-    lock_fd = open(LOCK_PATH, "a+")
-    if not relay_lock(lock_fd):
-        print("radio relay already running (lock held)", file=sys.stderr)
+    try:
+        lock_fd = open(LOCK_PATH, "a+")
+    except OSError as exc:
+        print(f"radio relay: cannot open the lock file: {exc}", file=sys.stderr)
         return 1
+    try:
+        if not relay_lock(lock_fd):
+            print("radio relay already running (lock held)", file=sys.stderr)
+            return 1
+        return relay_loop(args, lock_fd)
+    finally:
+        lock_fd.close()
+
+
+def relay_loop(args: argparse.Namespace, lock_fd) -> int:
+    """The daemon loop: tick, print the events that changed, and hand over to
+    a fresh process when the script changed on disk."""
     print(f"radio relay · db: {DB_PATH} · interval {args.interval}s")
     script = str(Path(__file__).resolve())
     started_mtime = Path(script).stat().st_mtime

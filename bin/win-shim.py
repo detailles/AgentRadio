@@ -26,16 +26,29 @@ RESOLVER_FILE = "radio-resolve.py"
 def shim_text() -> str:
     """The generated radio.cmd body. Stable across plugin updates: it resolves
     the plugin root at run time, so a moved or stale install can never leave a
-    dangling path behind."""
+    dangling path behind.
+
+    The interpreter probe is a real 3.10 gate — the CLI uses 3.10 syntax, so an
+    old `python` on PATH must not be picked — and it is written without
+    comparison operators or parentheses on purpose: cmd treats both as syntax
+    even inside quotes, which silently truncated the command line (found on
+    the Windows guest, 2026-09-25). `minor // 10` is 1 for 3.10..3.99 and 0
+    for 3.0..3.9, so it needs neither."""
     return f"""\
 {SHIM_MARKER} — stable across plugin updates; do not edit by hand.
 @echo off
 setlocal
 set "RADIO_PY="
-py -3 --version >nul 2>&1 && set "RADIO_PY=py -3"
-if not defined RADIO_PY (python --version >nul 2>&1 && set "RADIO_PY=python")
-if not defined RADIO_PY (python3 --version >nul 2>&1 && set "RADIO_PY=python3")
-if not defined RADIO_PY (echo radio needs Python 3.10+ on PATH 1>&2 & exit /b 1)
+set "RADIO_PYCHECK=import sys; assert sys.version_info.major == 3 and sys.version_info.minor // 10"
+py -3 -c "%RADIO_PYCHECK%" >nul 2>&1 && set "RADIO_PY=py -3"
+if defined RADIO_PY goto radio_python
+python -c "%RADIO_PYCHECK%" >nul 2>&1 && set "RADIO_PY=python"
+if defined RADIO_PY goto radio_python
+python3 -c "%RADIO_PYCHECK%" >nul 2>&1 && set "RADIO_PY=python3"
+if defined RADIO_PY goto radio_python
+echo radio needs Python 3.10+ on PATH 1>&2
+exit /b 1
+:radio_python
 set "ROOT="
 if exist "%~dp0{ROOT_FILE}" for /f "usebackq delims=" %%R in ("%~dp0{ROOT_FILE}") do set "ROOT=%%R"
 if not exist "%ROOT%\\bin\\radio" (
@@ -112,6 +125,21 @@ if __name__ == "__main__":
 ''' % {"marker": RESOLVER_MARKER, "root_file": ROOT_FILE}
 
 
+def write_atomic(path: Path, text: str, *, newline: str | None = None) -> None:
+    """Write text through a sibling temp file and replace it, so a reader — or
+    a shim being run at that moment — never sees a half-written file."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8", newline=newline)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def ensure_shim(root: Path, link_dir: Path | None = None) -> str:
     """Create or refresh the shim, the resolver, and the root cache in
     link_dir (default ~/.local/bin) so the CLI keeps working across plugin
@@ -128,11 +156,13 @@ def ensure_shim(root: Path, link_dir: Path | None = None) -> str:
         ):
             return f"{RESOLVER_FILE} left alone (not a radio resolver): {resolver}"
         link_dir.mkdir(parents=True, exist_ok=True)
-        if not shim.exists() or shim.read_text(encoding="utf-8") != shim_text():
-            shim.write_text(shim_text(), encoding="utf-8", newline="\r\n")
-        if not resolver.exists() or resolver.read_text(encoding="utf-8") != resolver_text():
-            resolver.write_text(resolver_text(), encoding="utf-8")
-        cache.write_text(str(root) + "\n", encoding="utf-8")
+        if not shim.exists() or shim.read_text(encoding="utf-8", errors="replace") != shim_text():
+            write_atomic(shim, shim_text(), newline="\r\n")
+        if not resolver.exists() or resolver.read_text(
+            encoding="utf-8", errors="replace"
+        ) != resolver_text():
+            write_atomic(resolver, resolver_text())
+        write_atomic(cache, str(root) + "\n")
     except OSError as exc:
         return f"radio shim not written: {exc}"
     return f"radio.cmd -> {root}\\bin\\radio"

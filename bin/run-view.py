@@ -36,11 +36,18 @@ def view_python(venv: Path | None = None) -> Path:
 def detach_cwd() -> None:
     """Leave the plugin directory before running the view. Herdr launches the
     pane with the managed plugin dir as cwd; a process that keeps that cwd
-    blocks `herdr plugin install` on Windows (sharing violation)."""
+    blocks `herdr plugin install` on Windows (sharing violation). The state
+    dir is created when it is missing — the view runs on a fresh install,
+    before anything else has made it — and the fallback keeps the plugin dir
+    out of our cwd even if it cannot be."""
     try:
+        state_dir().mkdir(parents=True, exist_ok=True)
         os.chdir(state_dir())
     except OSError:
-        pass
+        try:
+            os.chdir(Path.home())
+        except OSError:
+            pass
 
 
 def main() -> int:

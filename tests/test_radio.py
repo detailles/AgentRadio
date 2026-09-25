@@ -2520,6 +2520,31 @@ class WinShimTest(RadioTestCase):
         self.assertIn(self.win_shim.RESOLVER_FILE, text)
         self.assertNotIn("plugins\\radio-", text)  # no baked plugin path
 
+    def test_shim_gates_on_python_310(self):
+        """Every interpreter probe checks the version, not just that it runs,
+        and the check itself uses no cmd-syntax characters."""
+        text = self.win_shim.shim_text()
+        self.assertIn("version_info", text)
+        self.assertNotIn("--version", text)
+        self.assertEqual(text.count("RADIO_PYCHECK"), 4)  # one set + three probes
+        raw = text.split('set "RADIO_PYCHECK=')[1].split('"')[0]
+        # cmd reads ( ) < > as syntax even inside a quoted value.
+        self.assertFalse(set("()<>") & set(raw))
+        check = raw.removeprefix("import sys; ")
+        for major, minor, accepted in ((3, 9, False), (3, 10, True), (3, 12, True),
+                                       (3, 99, True), (2, 7, False), (4, 0, False)):
+            fake = types.SimpleNamespace(
+                version_info=types.SimpleNamespace(major=major, minor=minor)
+            )
+            with self.subTest(version=f"{major}.{minor}"):
+                if accepted:
+                    exec(check, {"sys": fake})
+                else:
+                    with self.assertRaises(AssertionError):
+                        exec(check, {"sys": fake})
+
+
+
     def test_resolver_text_queries_herdr(self):
         """The resolver asks herdr for the plugin root."""
         text = self.win_shim.resolver_text()
@@ -2543,6 +2568,24 @@ class WinShimTest(RadioTestCase):
         self.win_shim.ensure_shim(Path(r"C:\plugins\radio-b"), self.link_dir)
         self.assertEqual(shim.read_text(encoding="utf-8"), shim_before)
         self.assertEqual(cache.read_text(encoding="utf-8").strip(), r"C:\plugins\radio-b")
+
+    def test_a_failed_write_keeps_the_previous_shim(self):
+        """A failed write leaves the working shim in place and no temp file."""
+        self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
+        shim = self.link_dir / "radio.cmd"
+        before = shim.read_text(encoding="utf-8")
+        saved = self.win_shim.os.replace
+        self.addCleanup(setattr, self.win_shim.os, "replace", saved)
+
+        def locked(src, dst):
+            """Fail the replace the way a locked target file does."""
+            raise OSError("locked")
+
+        self.win_shim.os.replace = locked
+        msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-b"), self.link_dir)
+        self.assertIn("not written", msg)
+        self.assertEqual(shim.read_text(encoding="utf-8"), before)
+        self.assertEqual(list(self.link_dir.glob("*.tmp")), [])
 
     def test_foreign_radio_cmd_is_left_alone(self):
         """A radio.cmd without the marker is never overwritten."""
@@ -2644,17 +2687,20 @@ class ViewPythonTest(unittest.TestCase):
         os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
         self.assertEqual(self.run_view.state_dir(), Path("/tmp/radio-home-test"))
 
-    def test_detach_cwd_leaves_the_plugin_dir(self):
-        """detach_cwd moves into the state dir."""
-        saved_home = os.environ.get("RADIO_HOME")
-        self.addCleanup(self._restore_env, saved_home)
-        os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
-        calls = []
-        saved_chdir = self.run_view.os.chdir
-        self.addCleanup(setattr, self.run_view.os, "chdir", saved_chdir)
-        self.run_view.os.chdir = lambda path: calls.append(path)
-        self.run_view.detach_cwd()
-        self.assertEqual(calls, [Path("/tmp/radio-home-test")])
+    def test_detach_cwd_creates_the_state_dir_and_moves_into_it(self):
+        """detach_cwd makes the state dir when it is missing, then moves there."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "radio-home"
+            saved_home = os.environ.get("RADIO_HOME")
+            self.addCleanup(self._restore_env, saved_home)
+            os.environ["RADIO_HOME"] = str(home)
+            calls = []
+            saved_chdir = self.run_view.os.chdir
+            self.addCleanup(setattr, self.run_view.os, "chdir", saved_chdir)
+            self.run_view.os.chdir = lambda path: calls.append(path)
+            self.run_view.detach_cwd()
+            self.assertEqual(calls, [home])
+            self.assertTrue(home.is_dir())
 
     @staticmethod
     def _restore_env(saved):
