@@ -231,6 +231,8 @@ def herdr(*args: str, timeout: float = HERDR_READ_TIMEOUT) -> subprocess.Complet
         timeout=timeout,
         encoding="utf-8",
         errors="replace",
+        # A detached Windows relay must not open a console for each lookup.
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
 
 
