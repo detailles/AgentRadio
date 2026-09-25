@@ -1154,6 +1154,18 @@ class ScopedJoinTest(RadioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["workspace"], "w2")
 
+    def test_flagless_rejoin_keeps_the_recorded_provider(self):
+        """A plain rejoin (or a bot's --no-launch) must not erase the provider."""
+        self.add_handle("reviewer", ref="herdr:w2:p1", agent="claude",
+                        agent_session="sess1", workspace="w2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            radio.cmd_join(self.conn, join_args("reviewer", pane="w2:p1"))
+        row = self.conn.execute(
+            "SELECT * FROM handles WHERE workspace='w2' AND name='reviewer'"
+        ).fetchone()
+        self.assertEqual(row["agent"], "claude")
+        self.assertEqual(row["agent_session"], "sess1")
+
 
 class AccountTest(RadioTestCase):
     """Named provider accounts: several logins of one provider, recorded on the
@@ -1633,6 +1645,17 @@ class ScopedRosterTest(RadioTestCase):
         out = self.capture(radio.cmd_log, argparse.Namespace(limit=20))
         self.assertIn("own message", out)
         self.assertNotIn("other message", out)
+
+    def test_show_is_scoped_and_legacy_rows_stay_reachable(self):
+        """show refuses another workspace's message; pre-scope rows still read."""
+        self.add_handle("hede", workspace="w1")
+        foreign = self.pm("hede", "hede", "foreign body", from_ws="w1", to_ws="w1")
+        with self.assertRaises(SystemExit):
+            self.capture(radio.cmd_show, argparse.Namespace(message_id=foreign, by=None))
+        legacy = self.pm("alice", "alice", "legacy body", from_ws="", to_ws="")
+        self.assertIn("legacy body", self.capture(
+            radio.cmd_show, argparse.Namespace(message_id=legacy, by=None)
+        ))
 
 
 class AccountsMigrationTest(unittest.TestCase):

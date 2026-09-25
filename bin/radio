@@ -1417,7 +1417,11 @@ def cmd_join(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                                                       role=excluded.role,
                                                       account=excluded.account,
                                                       last_seen=excluded.last_seen""",
-        (workspace, physical_workspace, handle, ref, provider or None, agent_session, role, account_value, ts, ts),
+        # A flagless rejoin (or a bot's --no-launch) must not erase the
+        # recorded provider: only an explicit provider or account replaces it.
+        (workspace, physical_workspace, handle, ref,
+         provider or (existing["agent"] if existing else None),
+         agent_session, role, account_value, ts, ts),
     )
     conn.commit()
     session_note = f", {provider} session {agent_session[:8]}" if provider and agent_session else ""
@@ -2053,6 +2057,10 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             raise SystemExit(f"no message #{args.message_id} in this frequency")
         # Validate --by before printing; a rejected reader must not see the body.
         resolve_identity(conn, args.by, what="reader")
+    elif scope and scope not in (row["from_ws"], row["to_ws"]) and (row["from_ws"] or row["to_ws"]):
+        # Workspace-scoped like log/inbox: another project's message is not
+        # ours to read or acknowledge. Legacy unscoped rows stay reachable.
+        raise SystemExit(f"no message #{args.message_id} in this workspace")
     print(format_for_pane(row))
     try:
         viewer_ws, viewer = resolve_identity(conn, args.by, what="reader")
