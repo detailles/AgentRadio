@@ -52,7 +52,7 @@ MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
-VERSION = "0.6.0"  # keep in sync with herdr-plugin.toml
+VERSION = "0.6.1"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pane workspace.
 
 # Provider usage: each provider's own quota endpoint is read here, in Python,
