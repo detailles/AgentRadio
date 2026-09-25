@@ -33,7 +33,11 @@ spec.loader.exec_module(radio)
 
 
 class RadioTestCase(unittest.TestCase):
+    """Shared fixture: a hermetic temp ledger plus helpers that seed handles, messages and
+    deliveries."""
+
     def setUp(self):
+        """Point radio's module paths at a fresh temp ledger and strip ambient herdr/pane env."""
         self._saved = (radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH)
         # Hermetic identity: an ambient Herdr pane env (running the suite from
         # inside a pane) must not leak into current_session_ref/cmd_join.
@@ -46,6 +50,7 @@ class RadioTestCase(unittest.TestCase):
         self.conn = radio.connect()
 
     def tearDown(self):
+        """Close the ledger and restore the module paths and environment the test found."""
         self.conn.close()
         radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = self._saved
         for key, value in self._saved_env.items():
@@ -54,6 +59,7 @@ class RadioTestCase(unittest.TestCase):
 
     def add_handle(self, name, ref="manual", agent=None, agent_session=None,
                    last_seen=None, workspace="", role=None, account=None):
+        """Insert one handle row directly, defaulting the columns a test does not care about."""
         ts = last_seen or radio.now()
         self.conn.execute(
             "INSERT INTO handles(workspace, name, session_ref, agent, agent_session, role, account, created_at, last_seen) "
@@ -64,6 +70,7 @@ class RadioTestCase(unittest.TestCase):
 
     def pm(self, sender, to, text, ref=None, reply_required=False,
            from_ws="", to_ws=""):
+        """Record a PM and enqueue its delivery, as cmd_pm would; returns the message id."""
         mid = radio.record_message(self.conn, "pm", sender, text,
                                    to_handle=to, ref=ref, reply_required=reply_required,
                                    from_ws=from_ws, to_ws=to_ws)
@@ -72,14 +79,17 @@ class RadioTestCase(unittest.TestCase):
         return mid
 
     def message_row(self, mid):
+        """Fetch the messages row for an id."""
         return self.conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
 
     def delivery_row(self, mid):
+        """Fetch the single deliveries row for a message id."""
         return self.conn.execute(
             "SELECT * FROM deliveries WHERE message_id = ?", (mid,)
         ).fetchone()
 
     def backdate_attempt(self, mid, seconds):
+        """Age a delivery's last attempt past RETRY_AFTER_S so the next tick selects it."""
         old = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(
             timespec="milliseconds"
         )
@@ -89,13 +99,19 @@ class RadioTestCase(unittest.TestCase):
 
 
 class PaneIdOfTest(RadioTestCase):
+    """pane_id_of: a herdr session ref carries the pane id; manual refs have none."""
+
     def test_herdr_ref_vs_manual(self):
+        """herdr refs yield their pane id, manual refs yield None."""
         self.assertEqual(radio.pane_id_of("herdr:w1:p1"), "w1:p1")
         self.assertIsNone(radio.pane_id_of("manual"))
 
 
 class FormatForPaneTest(RadioTestCase):
+    """The pane envelope: header fields plus the reply and ref lines."""
+
     def test_envelope_variants(self):
+        """Plain, reply-required and ref messages each produce the expected envelope lines."""
         mid = self.pm("alice", "bob", "hello")
         out = radio.format_for_pane(self.message_row(mid))
         self.assertIn(f"id={mid}", out)
@@ -116,14 +132,21 @@ class FormatForPaneTest(RadioTestCase):
 
 
 class BriefingTextTest(RadioTestCase):
+    """The opening briefing an agent receives on join."""
+
     def test_handle_and_no_polling_rule(self):
+        """The briefing names the handle and carries the no-polling rule."""
         text = radio.briefing_text("scout")
         self.assertIn('You are on Radio as "scout"', text)
         self.assertIn("NEVER poll `radio inbox`", text)
 
 
 class LaunchArgvTest(RadioTestCase):
+    """launch_argv: per-provider session flags, the briefing injection, and unknown providers."""
+
     def test_provider_matrix(self):
+        """Each provider gets its argv shape: resume vs fresh, briefing, yolo and unknown-
+        provider exit."""
         argv = radio.launch_argv("claude", "h", None)
         self.assertIn("--append-system-prompt", argv)
         self.assertEqual(argv[-2:], ["--name", "h"])
@@ -168,7 +191,10 @@ class LaunchArgvTest(RadioTestCase):
 
 
 class EnqueueDeliveryTest(RadioTestCase):
+    """enqueue_delivery: a pane-bound handle gets a push, everything else a pull."""
+
     def test_push_vs_pull_binding(self):
+        """Pane-bound handles become pending pushes; manual refs become pull."""
         self.add_handle("onpane", ref="herdr:w1:p1")
         mid = self.pm("alice", "onpane", "hi")
         self.assertEqual(self.delivery_row(mid)["status"], "pending")
@@ -179,21 +205,27 @@ class EnqueueDeliveryTest(RadioTestCase):
 
 
 class CmdPmTest(RadioTestCase):
+    """cmd_pm: target resolution, the printed confirmation, and the ref/reply hints."""
+
     def pm_args(self, to, text, reply_required=False):
+        """Build the argparse namespace cmd_pm expects."""
         return argparse.Namespace(sender="alice", to=to, text=[text],
                                   ref=None, reply_required=reply_required)
 
     def run_pm(self, args):
+        """Run cmd_pm with stdout captured and return the printed text."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             radio.cmd_pm(self.conn, args)
         return buf.getvalue()
 
     def test_unknown_target_exits(self):
+        """An unknown target exits with a message."""
         with self.assertRaises(SystemExit):
             radio.cmd_pm(self.conn, self.pm_args("ghost", "hi"))
 
     def test_happy_path_records_and_prints(self):
+        """A valid PM records a pending delivery and prints its id and target."""
         self.add_handle("bob", ref="herdr:w1:p1")
         out = self.run_pm(self.pm_args("bob", "hi"))
         self.assertIn("pm #1 -> bob", out)
@@ -202,18 +234,24 @@ class CmdPmTest(RadioTestCase):
         self.assertEqual(row["target"], "bob")
 
     def test_long_message_nudges_ref(self):
+        """A very long message suggests --ref instead of inline text."""
         self.add_handle("bob")
         out = self.run_pm(self.pm_args("bob", "x" * 1300))
         self.assertIn("--ref <path>", out)
 
     def test_reply_required_prints_no_poll_note(self):
+        """reply-required prints the do-not-poll note."""
         self.add_handle("bob")
         out = self.run_pm(self.pm_args("bob", "ping", reply_required=True))
         self.assertIn("do NOT poll `radio inbox`", out)
 
 
 class PullPathTest(RadioTestCase):
+    """The pull path: reading a message marks it delivered only for its recipient."""
+
     def test_show_marks_only_recipient_delivered(self):
+        """A third party's show leaves the delivery alone; the recipient's show marks it
+        delivered."""
         self.add_handle("bob", ref="manual")
         mid = self.pm("alice", "bob", "pull me")
         self.assertEqual(self.delivery_row(mid)["status"], "pull")
@@ -231,7 +269,10 @@ class PullPathTest(RadioTestCase):
 
 
 class CmdPartTest(RadioTestCase):
+    """cmd_part: leaving fails every outstanding delivery for the handle."""
+
     def test_part_fails_outstanding_deliveries(self):
+        """Both pull and pending deliveries become failed when the handle parts."""
         self.add_handle("bob", ref="manual")
         self.add_handle("onpane", ref="herdr:w1:p1")
         mid_pull = self.pm("alice", "bob", "a")
@@ -248,6 +289,7 @@ class ComposerDraftTest(RadioTestCase):
     prompt marker we know; unknown providers report None (push)."""
 
     def setUp(self):
+        """Stub herdr so composer_has_draft reads a visible-text fixture."""
         super().setUp()
         self._herdr = radio.herdr
         self.addCleanup(setattr, radio, "herdr", self._herdr)
@@ -259,6 +301,7 @@ class ComposerDraftTest(RadioTestCase):
         )
 
     def test_codex_placeholder_is_empty_and_text_is_a_draft(self):
+        """The codex placeholder counts as empty; typed text counts as a draft."""
         self.visible = "»⠁Ask Codex to do anything⡀\n  gpt-6\n"
         self.assertFalse(radio.composer_has_draft("codex", "w1:p1"))
         radio._composer_cache.clear()
@@ -267,6 +310,8 @@ class ComposerDraftTest(RadioTestCase):
 
     def test_codex_prompt_glyph_variants_are_recognized(self):
         # The Windows VM capture renders the prompt as Γ; macOS as ».
+        """The Gamma and single-angle renderings match the codex marker set like the double
+        angle."""
         self.visible = "Γ yarim taslak\n"
         self.assertTrue(radio.composer_has_draft("codex", "w1:p1"))
         radio._composer_cache.clear()
@@ -274,6 +319,7 @@ class ComposerDraftTest(RadioTestCase):
         self.assertFalse(radio.composer_has_draft("codex", "w1:p1"))
 
     def test_claude_marker_only_is_empty(self):
+        """An empty claude marker line is empty; text after it is a draft."""
         self.visible = "❯\n─────\n"
         self.assertFalse(radio.composer_has_draft("claude", "w1:p1"))
         radio._composer_cache.clear()
@@ -281,6 +327,7 @@ class ComposerDraftTest(RadioTestCase):
         self.assertTrue(radio.composer_has_draft("claude", "w1:p1"))
 
     def test_unknown_provider_or_failure_is_none(self):
+        """Unknown providers and failed reads report None, which the caller treats as push."""
         self.visible = "❯ hello\n"
         self.assertIsNone(radio.composer_has_draft("kimi", "w1:p1"))
         radio.herdr = lambda *args, **kwargs: subprocess.CompletedProcess(
@@ -290,9 +337,11 @@ class ComposerDraftTest(RadioTestCase):
         self.assertIsNone(radio.composer_has_draft("claude", "w1:p2"))
 
     def test_cache_avoids_a_read_per_tick(self):
+        """Two calls inside the cache window cause one herdr read."""
         calls = []
 
         def counting(*args, **kwargs):
+            """Record each stub read so the test can count them."""
             calls.append(args)
             return subprocess.CompletedProcess(list(args), 0, stdout="❯\n", stderr="")
 
@@ -307,6 +356,7 @@ class FocusHoldTest(RadioTestCase):
     so a pane left focused does not starve."""
 
     def setUp(self):
+        """Bind bob to a focused pane and stub the pane fetch/push/draft calls."""
         super().setUp()
         self.add_handle("bob", ref="herdr:w1:p1", agent="codex", agent_session="s1")
         self.mid = self.pm("alice", "bob", "hi")
@@ -321,14 +371,17 @@ class FocusHoldTest(RadioTestCase):
         }
 
     def _restore(self):
+        """Put the stubbed relay functions back."""
         radio.fetch_pane = self._fetch
         radio.push_to_pane = self._push
         radio.composer_has_draft = self._draft
 
     def delivery(self):
+        """The delivery row under test."""
         return self.delivery_row(self.mid)
 
     def backdate_hold(self):
+        """Age focus_hold_since past FOCUS_HOLD_S so the composer check applies."""
         old = (
             datetime.now(timezone.utc) - timedelta(seconds=radio.FOCUS_HOLD_S + 5)
         ).isoformat(timespec="milliseconds")
@@ -338,6 +391,7 @@ class FocusHoldTest(RadioTestCase):
         self.conn.commit()
 
     def test_focused_pane_starts_a_hold_without_pushing(self):
+        """A focused pane starts the hold: nothing is pushed and focus_hold_since is stamped."""
         radio.composer_has_draft = lambda provider, pane_id: False
         events = radio.relay_tick(self.conn)
         row = self.delivery()
@@ -347,6 +401,7 @@ class FocusHoldTest(RadioTestCase):
         self.assertTrue(any("pane focused" in event for event in events))
 
     def test_after_the_window_an_empty_composer_lets_the_push_through(self):
+        """After the window an empty composer delivers and clears the hold."""
         radio.composer_has_draft = lambda provider, pane_id: False
         radio.relay_tick(self.conn)
         self.backdate_hold()
@@ -356,6 +411,7 @@ class FocusHoldTest(RadioTestCase):
         self.assertIsNone(self.delivery()["focus_hold_since"])
 
     def test_after_the_window_a_draft_keeps_the_hold(self):
+        """A detected draft keeps the delivery pending and reports user is typing."""
         radio.composer_has_draft = lambda provider, pane_id: True
         radio.relay_tick(self.conn)
         self.backdate_hold()
@@ -366,12 +422,17 @@ class FocusHoldTest(RadioTestCase):
 
 
 class DeliveryWaitReasonTest(RadioTestCase):
+    """delivery_wait_reason: the blocked/working/booting defers plus the focus hold."""
+
     def handle_row(self, name):
+        """Fetch the handles row for a name."""
         return self.conn.execute(
             "SELECT * FROM handles WHERE name = ?", (name,)
         ).fetchone()
 
     def test_reason_matrix(self):
+        """Blocked and working defer; a booting agent defers within the grace window; others
+        push."""
         self.add_handle("shell", ref="herdr:w1:p1", agent=None)
         self.add_handle("boot", ref="herdr:w1:p2", agent="claude", last_seen=radio.now())
 
@@ -387,6 +448,8 @@ class DeliveryWaitReasonTest(RadioTestCase):
         self.assertEqual(radio.delivery_wait_reason({}, boot), "agent still booting")
 
     def test_focus_holds_then_the_composer_decides(self):
+        """Focused panes hold; after the window the composer verdict decides, and unfocused
+        panes push."""
         saved_draft = radio.composer_has_draft
         self.addCleanup(setattr, radio, "composer_has_draft", saved_draft)
         self.add_handle("agent", ref="herdr:w1:p9", agent="codex")
@@ -417,7 +480,10 @@ class DeliveryWaitReasonTest(RadioTestCase):
 
 
 class RelayTickTest(RadioTestCase):
+    """relay_tick outcomes: delivered, no-pane pull, retry backoff and agent-blocked defers."""
+
     def setUp(self):
+        """Seed bob on a pane with one pending PM."""
         super().setUp()
         self.add_handle("bob", ref="herdr:w1:p1")
         self.mid = self.pm("alice", "bob", "hi")
@@ -426,15 +492,18 @@ class RelayTickTest(RadioTestCase):
         self.addCleanup(self._restore)
 
     def _restore(self):
+        """Put the stubbed pane functions back."""
         radio.fetch_pane = self._fetch
         radio.push_to_pane = self._push
 
     def tick(self, pane, push_result):
+        """Run one relay tick with the given pane and push result."""
         radio.fetch_pane = lambda pane_id: pane
         radio.push_to_pane = lambda pane_id, text: push_result
         return radio.relay_tick(self.conn)
 
     def test_push_ok_marks_delivered(self):
+        """A successful push marks the delivery delivered and reports it."""
         events = self.tick({"label": "bob"}, (True, None))
         row = self.delivery_row(self.mid)
         self.assertEqual(row["status"], "delivered")
@@ -442,12 +511,14 @@ class RelayTickTest(RadioTestCase):
         self.assertTrue(any("delivered" in e for e in events))
 
     def test_no_pane_falls_back_to_pull(self):
+        """A vanished pane leaves the mail for pull with 'no live pane'."""
         self.tick(None, (True, None))
         row = self.delivery_row(self.mid)
         self.assertEqual(row["status"], "pull")
         self.assertEqual(row["last_error"], "no live pane")
 
     def test_generic_failure_counts_attempts_then_fails(self):
+        """Failures count up to MAX_DELIVERY_ATTEMPTS and then go terminal."""
         pane = {"label": "bob"}
         self.tick(pane, (False, "agent_not_accepting"))
         row = self.delivery_row(self.mid)
@@ -466,6 +537,7 @@ class RelayTickTest(RadioTestCase):
         self.assertEqual(row["status"], "failed")
 
     def test_agent_blocked_defers_without_attempt(self):
+        """A blocked agent defers without consuming an attempt."""
         events = self.tick({"label": "bob"}, (False, "agent_blocked"))
         row = self.delivery_row(self.mid)
         self.assertEqual(row["status"], "pending")
@@ -478,6 +550,7 @@ class RelayIdentityGuardTest(RadioTestCase):
     belongs to it — a live pane id proves nothing (panes get reused)."""
 
     def setUp(self):
+        """Capture push calls and stub the pane functions."""
         super().setUp()
         self._fetch = radio.fetch_pane
         self._push = radio.push_to_pane
@@ -485,13 +558,16 @@ class RelayIdentityGuardTest(RadioTestCase):
         self.push_calls = []
 
     def _restore(self):
+        """Put the stubbed pane functions back."""
         radio.fetch_pane = self._fetch
         radio.push_to_pane = self._push
 
     def tick(self, pane):
+        """Run one relay tick against the given pane."""
         radio.fetch_pane = lambda pane_id: pane
 
         def push(pane_id, text):
+            """Push stub that records the pane id and reports success."""
             self.push_calls.append(pane_id)
             return True, None
 
@@ -499,6 +575,7 @@ class RelayIdentityGuardTest(RadioTestCase):
         return radio.relay_tick(self.conn)
 
     def test_label_mismatch_leaves_for_pull_without_push(self):
+        """A reused pane whose label changed is left for pull, never pushed."""
         self.add_handle("bob", ref="herdr:w1:p1")
         mid = self.pm("alice", "bob", "hi")
         self.tick({"label": "mallory"})
@@ -508,6 +585,7 @@ class RelayIdentityGuardTest(RadioTestCase):
         self.assertEqual(self.push_calls, [])
 
     def test_agent_mismatch_leaves_for_pull_without_push(self):
+        """A pane now running a different agent is left for pull."""
         self.add_handle("bob", ref="herdr:w1:p1", agent="claude", agent_session="sess1")
         mid = self.pm("alice", "bob", "hi")
         self.tick({"label": "bob", "agent": "codex"})
@@ -517,6 +595,7 @@ class RelayIdentityGuardTest(RadioTestCase):
         self.assertEqual(self.push_calls, [])
 
     def test_matching_pane_gets_the_push(self):
+        """A pane whose label and agent match still receives the push."""
         self.add_handle("bob", ref="herdr:w1:p1", agent="claude", agent_session="sess1")
         mid = self.pm("alice", "bob", "hi")
         self.tick({"label": "bob", "agent": "claude"})
@@ -525,7 +604,11 @@ class RelayIdentityGuardTest(RadioTestCase):
 
 
 class DeliveryUnconfirmedTest(RadioTestCase):
+    """delivery_unconfirmed: the pane took the text but did not acknowledge, so it is left
+    for pull and never retried."""
+
     def setUp(self):
+        """Seed bob on a pane with one pending PM and capture pushes."""
         super().setUp()
         self.add_handle("bob", ref="herdr:w1:p1")
         self.mid = self.pm("alice", "bob", "hi")
@@ -535,13 +618,16 @@ class DeliveryUnconfirmedTest(RadioTestCase):
         self.push_calls = []
 
     def _restore(self):
+        """Put the stubbed pane functions back."""
         radio.fetch_pane = self._fetch
         radio.push_to_pane = self._push
 
     def test_unconfirmed_goes_to_pull_and_is_never_retried(self):
+        """An unconfirmed push becomes pull with no attempts and is not retried on a later tick."""
         radio.fetch_pane = lambda pane_id: {"label": "bob"}
 
         def push(pane_id, text):
+            """Push stub that records the call and reports an unconfirmed delivery."""
             self.push_calls.append(pane_id)
             return False, "delivery_unconfirmed"
 
@@ -558,14 +644,20 @@ class DeliveryUnconfirmedTest(RadioTestCase):
 
 
 class BacktickNormalizationTest(RadioTestCase):
+    """Typed text is normalized before it is stored."""
+
     def test_backticks_become_quotes(self):
         # A backtick typed into a shell pane is command substitution.
+        """Backticks become single quotes so a shell pane never runs command substitution."""
         mid = self.pm("alice", "bob", "run `ls -la` now")
         self.assertEqual(self.message_row(mid)["text"], "run 'ls -la' now")
 
 
 class NormalizeHandleTest(RadioTestCase):
+    """normalize_handle: the @ prefix is accepted, invalid names exit."""
+
     def test_strip_at_and_validate(self):
+        """@foo and foo normalize; spaces and brackets are rejected."""
         self.assertEqual(radio.normalize_handle("@foo"), "foo")
         self.assertEqual(radio.normalize_handle("foo"), "foo")
         with self.assertRaises(SystemExit):
@@ -574,6 +666,7 @@ class NormalizeHandleTest(RadioTestCase):
             radio.normalize_handle("we]rd")
 
     def test_pm_to_at_handle_resolves(self):
+        """pm to @bob resolves to the registered bob."""
         self.add_handle("bob")
         args = argparse.Namespace(sender="alice", to="@bob", text=["hi"],
                                   ref=None, reply_required=False)
@@ -584,25 +677,31 @@ class NormalizeHandleTest(RadioTestCase):
 
 
 def join_args(handle, pane=None, role=None, account=None):
+    """Build the argparse namespace cmd_join expects, with no_launch on."""
     return argparse.Namespace(handle=handle, pane=pane, provider=None,
                               new=False, resume=False, model=None, role=role,
                               account=account, no_launch=True)
 
 
 class ResolveHandleTest(RadioTestCase):
+    """resolve_handle: case-insensitive lookup that preserves the registered spelling."""
+
     def test_resolver_semantics(self):
+        """Exact and case-insensitive hits resolve; a miss returns None."""
         self.add_handle("bob")
         self.assertEqual(radio.resolve_handle(self.conn, "bob")["name"], "bob")
         self.assertEqual(radio.resolve_handle(self.conn, "BOB")["name"], "bob")
         self.assertIsNone(radio.resolve_handle(self.conn, "ghost"))
 
     def test_ambiguous_case_variants_exit(self):
+        """Two case variants make an ambiguous lookup exit."""
         self.add_handle("Foo")
         self.add_handle("foo")
         with self.assertRaises(SystemExit):
             radio.resolve_handle(self.conn, "FOO")
 
     def test_pm_case_insensitive_uses_registered_spelling(self):
+        """pm resolves BOB to the stored 'bob'."""
         self.add_handle("bob")
         args = argparse.Namespace(sender="alice", to="BOB", text=["hi"],
                                   ref=None, reply_required=False)
@@ -612,6 +711,7 @@ class ResolveHandleTest(RadioTestCase):
         self.assertEqual(row["to_handle"], "bob")
 
     def test_part_wrong_case_removes_the_right_row(self):
+        """part BOB removes the bob row."""
         self.add_handle("bob")
         with contextlib.redirect_stdout(io.StringIO()):
             radio.cmd_part(self.conn, argparse.Namespace(handle="BOB"))
@@ -619,6 +719,7 @@ class ResolveHandleTest(RadioTestCase):
         self.assertIsNone(row)
 
     def test_join_case_variant_upserts_existing(self):
+        """Joining BOB does not fork a second row for bob."""
         self.add_handle("bob", ref="manual")
         with contextlib.redirect_stdout(io.StringIO()):
             radio.cmd_join(self.conn, join_args("BOB"))
@@ -633,18 +734,21 @@ class RepairTest(RadioTestCase):
     way out of a corrupt ledger or one written by a newer radio."""
 
     def run_repair(self, reset=False, yes=False):
+        """Run cmd_repair with stdout captured."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = radio.cmd_repair(argparse.Namespace(reset=reset, yes=yes))
         return rc, buf.getvalue()
 
     def test_health_report_on_a_fresh_ledger(self):
+        """A fresh ledger reports healthy and the current schema."""
         rc, out = self.run_repair()
         self.assertEqual(rc, 0)
         self.assertIn("verdict:   healthy", out)
         self.assertIn(f"schema:    {radio.SCHEMA_VERSION}", out)
 
     def test_newer_schema_is_reported_and_connect_refuses(self):
+        """A newer schema is reported with the reset hint and connect refuses."""
         self.conn.execute("PRAGMA user_version = 99")
         self.conn.commit()
         rc, out = self.run_repair()
@@ -656,6 +760,7 @@ class RepairTest(RadioTestCase):
         self.assertIn("newer radio", str(ctx.exception))
 
     def test_reset_requires_yes_when_not_interactive(self):
+        """A non-interactive reset without --yes exits."""
         saved = sys.stdin
         sys.stdin = io.StringIO("")
         self.addCleanup(setattr, sys, "stdin", saved)
@@ -663,6 +768,7 @@ class RepairTest(RadioTestCase):
             self.run_repair(reset=True)
 
     def test_reset_recovers_from_a_newer_schema(self):
+        """reset --yes recreates the ledger at the current schema."""
         self.conn.execute("PRAGMA user_version = 99")
         self.conn.commit()
         rc, out = self.run_repair(reset=True, yes=True)
@@ -674,6 +780,7 @@ class RepairTest(RadioTestCase):
         )
 
     def test_reset_keeps_a_backup_and_creates_an_empty_ledger(self):
+        """reset backs the old ledger up and leaves an empty one."""
         self.add_handle("bob")
         self.pm("alice", "bob", "hi")
         rc, out = self.run_repair(reset=True, yes=True)
@@ -706,31 +813,37 @@ class WorkspaceScopeTest(RadioTestCase):
     }
 
     def stub_workspaces(self, data=None):
+        """Stub herdr_json with the workspace label fixture."""
         saved = radio.herdr_json
         self.addCleanup(setattr, radio, "herdr_json", saved)
         radio.herdr_json = lambda *args: (data if data is not None else self.WS_LABELS)
 
     def test_same_name_in_two_workspaces(self):
+        """The same name resolves to its own workspace's row."""
         self.add_handle("reviewer", workspace="w1")
         self.add_handle("reviewer", workspace="w2")
         row = radio.resolve_handle(self.conn, "reviewer", "w2")
         self.assertEqual((row["workspace"], row["name"]), ("w2", "reviewer"))
 
     def test_other_workspace_handle_is_unreachable(self):
+        """A handle in another workspace does not resolve."""
         self.add_handle("hede", workspace="w1")
         self.assertIsNone(radio.resolve_handle(self.conn, "hede", "w2"))
 
     def test_unscoped_handles_stay_reachable(self):
+        """Unscoped legacy rows resolve from any workspace."""
         self.add_handle("bot")
         self.add_handle("reviewer", workspace="w2")
         self.assertEqual(radio.resolve_handle(self.conn, "bot", "w2")["workspace"], "")
 
     def test_internal_qualified_form(self):
+        """The w1:name form resolves across scopes for scripts."""
         self.add_handle("reviewer", workspace="w1")
         row = radio.resolve_handle(self.conn, "w1:reviewer", "")
         self.assertEqual(row["workspace"], "w1")
 
     def test_outside_scope_ambiguity_names_candidates(self):
+        """Outside a workspace an ambiguous name lists both qualified candidates."""
         self.add_handle("reviewer", workspace="w1")
         self.add_handle("reviewer", workspace="w2")
         with self.assertRaises(SystemExit) as ctx:
@@ -739,6 +852,7 @@ class WorkspaceScopeTest(RadioTestCase):
         self.assertIn("w2:reviewer", str(ctx.exception))
 
     def test_miss_message_names_the_workspace(self):
+        """A scoped miss names the workspace and points at the other one."""
         self.stub_workspaces()
         self.add_handle("hede", workspace="w1")
         message = radio.no_handle_message(self.conn, "hede", "w2")
@@ -747,6 +861,7 @@ class WorkspaceScopeTest(RadioTestCase):
         self.assertIn("BoilerRoom", message)
 
     def test_workspace_spec_accepts_id_and_label(self):
+        """An explicit workspace accepts either the id or the label."""
         self.stub_workspaces()
         self.assertEqual(radio.resolve_workspace_spec("Servers", self.conn), "w2")
         self.assertEqual(radio.resolve_workspace_spec("w1", self.conn), "w1")
@@ -758,6 +873,7 @@ class ScopedPmTest(RadioTestCase):
     """cmd_pm routes inside the sender's workspace and refuses to cross."""
 
     def setUp(self):
+        """Pretend the command runs in w2 with RADIO_HANDLE=alice."""
         super().setUp()
         saved = radio.current_workspace
         self.addCleanup(setattr, radio, "current_workspace", saved)
@@ -770,10 +886,12 @@ class ScopedPmTest(RadioTestCase):
 
     @staticmethod
     def pm_args(to):
+        """Build a cmd_pm namespace with no explicit sender (it resolves from the environment)."""
         return argparse.Namespace(sender=None, to=to, text=["hi"], ref=None,
                                   reply_required=False)
 
     def test_pm_resolves_in_own_workspace(self):
+        """Both sides resolve inside the sender's workspace."""
         self.add_handle("alice", workspace="w2")
         self.add_handle("reviewer", workspace="w1")
         self.add_handle("reviewer", workspace="w2")
@@ -784,6 +902,7 @@ class ScopedPmTest(RadioTestCase):
         self.assertEqual((row["to_ws"], row["to_handle"]), ("w2", "reviewer"))
 
     def test_pm_refuses_other_workspace(self):
+        """A handle that exists only elsewhere is reported as missing, naming this workspace."""
         self.add_handle("alice", workspace="w2")
         self.add_handle("hede", workspace="w1")
         with self.assertRaises(SystemExit) as ctx:
@@ -793,6 +912,7 @@ class ScopedPmTest(RadioTestCase):
         self.assertIn("w2", message)
 
     def test_pm_warns_when_the_sender_is_not_joined(self):
+        """An unjoined sender still sends, with a warning."""
         self.add_handle("bob", workspace="w2")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -809,6 +929,7 @@ class ScopedPmTest(RadioTestCase):
 
     def test_pm_accepts_internal_qualified_form(self):
         # Scripts outside herdr address a scoped handle as w1:name.
+        """A script can address w1:bob and the delivery records w1."""
         self.add_handle("bob", workspace="w1")
         os.environ.pop("RADIO_HANDLE")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -826,6 +947,7 @@ class ScopedDeliveryTest(RadioTestCase):
     that lives in a different workspace."""
 
     def _stub_panes(self, pane):
+        """Stub the pane fetch/push calls and capture pushes."""
         for name in ("fetch_pane", "push_to_pane"):
             saved = getattr(radio, name)
             self.addCleanup(setattr, radio, name, saved)
@@ -834,12 +956,14 @@ class ScopedDeliveryTest(RadioTestCase):
         radio.push_to_pane = lambda pane_id, text: (self.pushed.append(pane_id), (True, None))[1]
 
     def test_delivery_records_target_workspace(self):
+        """The delivery carries the target workspace."""
         self.add_handle("bob", ref="herdr:w2:p1", workspace="w2")
         mid = self.pm("alice", "bob", "hi", to_ws="w2")
         self.assertEqual(self.delivery_row(mid)["target_ws"], "w2")
         self.assertEqual(self.delivery_row(mid)["status"], "pending")
 
     def test_relay_pushes_inside_the_workspace(self):
+        """A pane in the right workspace receives the push."""
         self.add_handle("bob", ref="herdr:w2:p1", workspace="w2")
         mid = self.pm("alice", "bob", "hi", to_ws="w2")
         self._stub_panes({"label": "bob", "workspace_id": "w2"})
@@ -848,6 +972,7 @@ class ScopedDeliveryTest(RadioTestCase):
         self.assertEqual(self.delivery_row(mid)["status"], "delivered")
 
     def test_relay_refuses_foreign_workspace(self):
+        """A pane that moved to another workspace is left for pull."""
         self.add_handle("bob", ref="herdr:w9:p1", workspace="w2")
         mid = self.pm("alice", "bob", "hi", to_ws="w2")
         self._stub_panes({"label": "bob", "workspace_id": "w9"})
@@ -863,6 +988,7 @@ class RoleTest(RadioTestCase):
     other handle operation, and carried by the briefing."""
 
     def setUp(self):
+        """Pretend the command runs in w2."""
         super().setUp()
         saved = radio.current_workspace
         self.addCleanup(setattr, radio, "current_workspace", saved)
@@ -872,6 +998,7 @@ class RoleTest(RadioTestCase):
         radio.herdr_json = lambda *args: {}
 
     def run_role(self, handle, text=(), clear=False):
+        """Run cmd_role with stdout captured."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             radio.cmd_role(
@@ -881,6 +1008,7 @@ class RoleTest(RadioTestCase):
         return buf.getvalue()
 
     def test_set_show_clear(self):
+        """Setting, showing and clearing a role round-trips through the ledger."""
         self.add_handle("reviewer", workspace="w2")
         self.run_role("reviewer", ["test", "evidence", "gate"])
         row = self.conn.execute(
@@ -895,11 +1023,13 @@ class RoleTest(RadioTestCase):
         self.assertIsNone(row["role"])
 
     def test_role_is_scoped(self):
+        """A handle in another workspace cannot be given a role."""
         self.add_handle("reviewer", workspace="w1")
         with self.assertRaises(SystemExit):
             self.run_role("reviewer", ["nope"])
 
     def test_briefing_carries_workspace_and_role(self):
+        """The briefing names the workspace label and the role."""
         radio.herdr_json = lambda *args: {
             "result": {"workspaces": [{"workspace_id": "w2", "label": "Servers"}]}
         }
@@ -914,6 +1044,7 @@ class ScopedJoinTest(RadioTestCase):
     rows instead of forking a duplicate identity."""
 
     def setUp(self):
+        """Stub herdr and the pane lookup with two same-name panes in different workspaces."""
         super().setUp()
         saved_herdr = radio.herdr
         self.addCleanup(setattr, radio, "herdr", saved_herdr)
@@ -929,6 +1060,7 @@ class ScopedJoinTest(RadioTestCase):
         radio.fetch_pane = lambda pane_id: self.panes.get(pane_id)
 
     def test_join_records_workspace_and_role(self):
+        """join records the pane's workspace and keeps --role."""
         with contextlib.redirect_stdout(io.StringIO()):
             radio.cmd_join(self.conn, join_args("reviewer", pane="w2:p1",
                                                 role="test evidence gate"))
@@ -937,6 +1069,7 @@ class ScopedJoinTest(RadioTestCase):
         self.assertEqual(row["role"], "test evidence gate")
 
     def test_same_name_joins_in_two_workspaces(self):
+        """The same name can join once per workspace."""
         for pane_id in ("w2:p1", "w1:p1"):
             with contextlib.redirect_stdout(io.StringIO()):
                 radio.cmd_join(self.conn, join_args("reviewer", pane=pane_id))
@@ -944,6 +1077,7 @@ class ScopedJoinTest(RadioTestCase):
         self.assertEqual([r["workspace"] for r in rows], ["w1", "w2"])
 
     def test_pre_scope_row_is_adopted(self):
+        """A pre-scope row is adopted into the workspace instead of duplicated."""
         self.add_handle("reviewer", ref="herdr:w2:p1")  # pre-scope: workspace ''
         with contextlib.redirect_stdout(io.StringIO()):
             radio.cmd_join(self.conn, join_args("reviewer", pane="w2:p1"))
@@ -957,6 +1091,7 @@ class AccountTest(RadioTestCase):
     handle so restore brings the same login back."""
 
     def setUp(self):
+        """Stub herdr and the pane lookup for a w2 coder pane."""
         super().setUp()
         saved_herdr = radio.herdr
         self.addCleanup(setattr, radio, "herdr", saved_herdr)
@@ -969,6 +1104,7 @@ class AccountTest(RadioTestCase):
         radio.fetch_pane = lambda pane_id: self.panes.get(pane_id)
 
     def run_account(self, *argv):
+        """Parse and run an account subcommand with stdout captured."""
         buf = io.StringIO()
         args = radio.build_parser().parse_args(["account", *argv])
         with contextlib.redirect_stdout(buf):
@@ -976,6 +1112,7 @@ class AccountTest(RadioTestCase):
         return rc, buf.getvalue()
 
     def test_default_homes_follow_the_provider_convention(self):
+        """Default homes follow the provider convention, numbered for extra accounts."""
         self.assertEqual(radio.default_account_home("codex", "codex"), Path.home() / ".codex")
         self.assertEqual(
             radio.default_account_home("codex", "codex2"), Path.home() / ".codex-account-2"
@@ -985,6 +1122,7 @@ class AccountTest(RadioTestCase):
         )
 
     def test_account_env_combines_home_and_overrides(self):
+        """The provider's home variable plus overrides, with overrides winning."""
         self.assertEqual(
             radio.account_env({"provider": "codex", "home": r"C:\x", "env": "{}"}),
             {"CODEX_HOME": r"C:\x"},
@@ -1015,6 +1153,7 @@ class AccountTest(RadioTestCase):
         )
 
     def test_add_list_remove(self):
+        """add records and creates the home, list shows it, remove deletes it."""
         tmp_home = str(radio.STATE_DIR / "codex2-home")
         rc, out = self.run_account("add", "codex2", "--provider", "codex", "--home", tmp_home)
         self.assertEqual(rc, 0)
@@ -1031,6 +1170,7 @@ class AccountTest(RadioTestCase):
         self.assertIsNone(self.conn.execute("SELECT * FROM accounts").fetchone())
 
     def test_env_overrides_are_recorded_and_listed(self):
+        """K=V overrides are stored, listed, and malformed ones rejected."""
         tmp_home = str(radio.STATE_DIR / "proxy-home")
         rc, out = self.run_account(
             "add", "proxy", "--provider", "codex", "--home", tmp_home,
@@ -1045,6 +1185,7 @@ class AccountTest(RadioTestCase):
             self.run_account("add", "bad", "--provider", "codex", "--env", "NOVALUE")
 
     def test_duplicate_and_in_use_guards(self):
+        """Duplicate names and removing an in-use account exit."""
         self.run_account(
             "add", "codex2", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex2-home")
         )
@@ -1058,6 +1199,7 @@ class AccountTest(RadioTestCase):
         self.assertIn("in use by: coder", str(ctx.exception))
 
     def test_roster_shows_the_account_separately(self):
+        """The roster shows agent and account separately, never fused."""
         self.add_handle("coder", ref="manual", workspace="w2", agent="codex", account="work")
         row = self.conn.execute("SELECT * FROM handles WHERE name='coder'").fetchone()
         line = radio.handle_line(row)
@@ -1066,6 +1208,8 @@ class AccountTest(RadioTestCase):
         self.assertNotIn("codex/work", line)
 
     def test_move_copies_the_session_and_switches_the_account(self):
+        """move copies the session file and index into the target home and switches the
+        handle; the source stays."""
         source_home = radio.STATE_DIR / "codex-home"
         target_home = radio.STATE_DIR / "codex-work"
         session_file = source_home / "sessions" / "2026" / "09" / "rollout-x-sess-1.jsonl"
@@ -1091,6 +1235,7 @@ class AccountTest(RadioTestCase):
         self.assertTrue(session_file.exists())
 
     def test_move_refuses_unknown_account_and_missing_sessions(self):
+        """An unknown target exits; a session missing from the source home exits."""
         self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="codex",
                         agent_session="sess-1")
         args = radio.build_parser().parse_args(["account", "move", "coder", "--to", "ghost"])
@@ -1105,6 +1250,7 @@ class AccountTest(RadioTestCase):
         self.assertIn("not found", str(ctx.exception))
 
     def test_move_without_a_session_just_switches(self):
+        """A handle with no session just changes its account."""
         self.run_account(
             "add", "work", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex-work")
         )
@@ -1117,6 +1263,7 @@ class AccountTest(RadioTestCase):
         self.assertIn("account changed only", buf.getvalue())
 
     def test_join_with_a_new_provider_drops_the_recorded_session(self):
+        """Switching provider clears the recorded session and says it will not resume."""
         self.add_handle("coder", ref="herdr:w2:p1", workspace="w2", agent="claude",
                         agent_session="claude-1")
         args = join_args("coder", pane="w2:p1")
@@ -1130,6 +1277,7 @@ class AccountTest(RadioTestCase):
         self.assertIn("not resumed under codex", buf.getvalue())
 
     def test_join_with_a_new_account_drops_the_recorded_session(self):
+        """Switching account clears the session and points at account move."""
         self.run_account(
             "add", "work", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex-work")
         )
@@ -1144,6 +1292,7 @@ class AccountTest(RadioTestCase):
         self.assertIn("radio account move coder --to work", buf.getvalue())
 
     def test_move_copies_claude_kimi_and_pi_layouts(self):
+        """claude, kimi and pi session layouts are copied too."""
         cases = [
             ("claude", "projects/-x/abc.jsonl"),
             ("kimi", "sessions/wd_1/session_abc/state.json"),
@@ -1168,6 +1317,7 @@ class AccountTest(RadioTestCase):
             self.assertTrue((target / relative).exists(), f"{provider}: {relative}")
 
     def test_kimi_probes_prefer_kimi_code_home(self):
+        """auth_status for kimi checks KIMI_CODE_HOME before KIMI_HOME."""
         tmp = radio.STATE_DIR / "kimi-home"
         tmp.mkdir(parents=True, exist_ok=True)
         (tmp / "config.toml").write_text("")
@@ -1179,6 +1329,7 @@ class AccountTest(RadioTestCase):
 
     @staticmethod
     def _restore_env(saved):
+        """Put the environment variables the test changed back."""
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -1186,6 +1337,7 @@ class AccountTest(RadioTestCase):
                 os.environ[key] = value
 
     def test_join_with_account_records_it(self):
+        """join --account records provider and account on the handle."""
         self.run_account(
             "add", "codex2", "--provider", "codex", "--home", str(radio.STATE_DIR / "codex2-home")
         )
@@ -1195,6 +1347,7 @@ class AccountTest(RadioTestCase):
         self.assertEqual((row["agent"], row["account"]), ("codex", "codex2"))
 
     def test_join_rejects_unknown_account_and_provider_conflict(self):
+        """An unknown account, or one whose provider conflicts, exits."""
         with self.assertRaises(SystemExit):
             radio.cmd_join(self.conn, join_args("coder", pane="w2:p1", account="ghost"))
         self.run_account(
@@ -1211,6 +1364,7 @@ class RestoreTest(RadioTestCase):
     the join/resume command into it; never creates layout."""
 
     def setUp(self):
+        """Stub herdr and the pane lookup; seed coder with a recorded session."""
         super().setUp()
         self._herdr = radio.herdr
         self._fetch = radio.fetch_pane
@@ -1219,6 +1373,7 @@ class RestoreTest(RadioTestCase):
         self.calls = []
 
         def fake_herdr(*args, **kwargs):
+            """herdr stub that records each argv and returns success."""
             self.calls.append(args)
             return subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
 
@@ -1229,12 +1384,14 @@ class RestoreTest(RadioTestCase):
                         agent="codex", agent_session="sess-1")
 
     def restore(self, handle="coder"):
+        """Run cmd_restore with stdout captured."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = radio.cmd_restore(self.conn, argparse.Namespace(handle=handle))
         return rc, buf.getvalue()
 
     def send_text_calls(self):
+        """The pane send-text calls herdr received."""
         return [call for call in self.calls if call[:2] == ("pane", "send-text")]
 
     def add_account_with_session(self, session_id="sess-1"):
@@ -1254,6 +1411,7 @@ class RestoreTest(RadioTestCase):
         return home
 
     def test_types_the_resume_command_into_the_pane(self):
+        """Restore types the join --resume command into the pane and presses enter."""
         self.add_account_with_session()
         self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
         rc, out = self.restore()
@@ -1266,6 +1424,7 @@ class RestoreTest(RadioTestCase):
         self.assertIn("restoring coder", out)
 
     def test_restore_starts_fresh_when_the_session_is_missing(self):
+        """A session absent from the account home starts fresh."""
         self.conn.execute(
             "INSERT INTO accounts(name, provider, home, created_at) "
             "VALUES ('personal', 'codex', ?, 't')",
@@ -1280,6 +1439,7 @@ class RestoreTest(RadioTestCase):
         self.assertNotIn("--resume", self.send_text_calls()[0][3])
 
     def test_restore_refuses_when_the_pane_is_busy(self):
+        """A busy pane is refused rather than interrupted."""
         self.panes["w2:p1"] = {
             "label": "coder", "workspace_id": "w2", "agent_status": "blocked"
         }
@@ -1288,6 +1448,7 @@ class RestoreTest(RadioTestCase):
         self.assertIn("busy", str(ctx.exception))
 
     def test_starts_fresh_without_a_recorded_session(self):
+        """No recorded session starts fresh with a note."""
         self.conn.execute("UPDATE handles SET agent_session=NULL WHERE name='coder'")
         self.conn.commit()
         self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2"}
@@ -1297,6 +1458,7 @@ class RestoreTest(RadioTestCase):
         self.assertIn("no recorded session", out)
 
     def test_already_running_is_a_noop(self):
+        """A pane already running the right agent is left alone."""
         self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2", "agent": "codex"}
         rc, out = self.restore()
         self.assertEqual(rc, 0)
@@ -1304,21 +1466,25 @@ class RestoreTest(RadioTestCase):
         self.assertEqual(self.send_text_calls(), [])
 
     def test_missing_pane_reports_what_to_do(self):
+        """A missing pane tells the user to run radio join."""
         with self.assertRaises(SystemExit) as ctx:
             self.restore()
         self.assertIn("radio join coder", str(ctx.exception))
 
     def test_foreign_agent_blocks(self):
+        """A pane running a different agent is refused."""
         self.panes["w2:p1"] = {"label": "coder", "workspace_id": "w2", "agent": "claude"}
         with self.assertRaises(SystemExit):
             self.restore()
 
     def test_handle_without_provider(self):
+        """A handle with no provider cannot be restored."""
         self.add_handle("plain", ref="herdr:w2:p2", workspace="w2")
         with self.assertRaises(SystemExit):
             self.restore("plain")
 
     def test_restore_reports_the_recorded_account(self):
+        """The restore output names the account it will use."""
         self.conn.execute("UPDATE handles SET account='codex2' WHERE name='coder'")
         self.conn.execute(
             "INSERT INTO accounts(name, provider, home, created_at) "
@@ -1331,6 +1497,7 @@ class RestoreTest(RadioTestCase):
         self.assertIn("account: codex2", out)
 
     def test_restore_reports_a_removed_account(self):
+        """A handle pointing at a deleted account exits with an explanation."""
         self.conn.execute("UPDATE handles SET account='codex2' WHERE name='coder'")
         self.conn.commit()
         with self.assertRaises(SystemExit) as ctx:
@@ -1352,6 +1519,7 @@ class ScopedRosterTest(RadioTestCase):
     }
 
     def setUp(self):
+        """Pretend the command runs in w2 and stub the workspace labels."""
         super().setUp()
         saved_ws = radio.current_workspace
         self.addCleanup(setattr, radio, "current_workspace", saved_ws)
@@ -1364,12 +1532,14 @@ class ScopedRosterTest(RadioTestCase):
         radio.herdr_json = lambda *args: self.LABELS
 
     def capture(self, fn, *args):
+        """Run a command with stdout captured."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             fn(self.conn, *args)
         return buf.getvalue()
 
     def test_roster_shows_only_own_workspace(self):
+        """The roster lists this workspace's handles and its label only."""
         self.add_handle("alice", workspace="w2")
         self.add_handle("hede", workspace="w1")
         out = self.capture(radio.cmd_handles, argparse.Namespace(workspace=None))
@@ -1378,6 +1548,7 @@ class ScopedRosterTest(RadioTestCase):
         self.assertIn("Servers", out)
 
     def test_roster_filter_by_label(self):
+        """An explicit label narrows the roster to that workspace."""
         self.add_handle("alice", workspace="w2")
         self.add_handle("hede", workspace="w1")
         out = self.capture(radio.cmd_handles, argparse.Namespace(workspace="BoilerRoom"))
@@ -1385,6 +1556,7 @@ class ScopedRosterTest(RadioTestCase):
         self.assertNotIn("alice", out)
 
     def test_log_is_scoped(self):
+        """The log shows only messages that belong to this workspace."""
         self.add_handle("alice", workspace="w2")
         self.add_handle("hede", workspace="w1")
         self.pm("alice", "alice", "own message", from_ws="w2", to_ws="w2")
@@ -1399,6 +1571,7 @@ class AccountsMigrationTest(unittest.TestCase):
     migration renames it to `home` and adds the env column."""
 
     def test_old_accounts_shape_converges(self):
+        """A dir-shaped accounts table is renamed to home with an empty env."""
         tmp = Path(tempfile.mkdtemp(prefix="radio-accounts-"))
         db = tmp / "radio.db"
         legacy = sqlite3.connect(db)
@@ -1429,6 +1602,7 @@ class AccountsMigrationTest(unittest.TestCase):
 
     @staticmethod
     def _restore(saved):
+        """Put radio's module paths back."""
         radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = saved
 
 
@@ -1438,6 +1612,7 @@ class ScopeMigrationTest(unittest.TestCase):
     joined again in another workspace."""
 
     def setUp(self):
+        """Build a pre-scope ledger with one handle, message and delivery."""
         self.tmp = Path(tempfile.mkdtemp(prefix="radio-legacy-"))
         legacy = sqlite3.connect(self.tmp / "radio.db")
         legacy.executescript(
@@ -1485,9 +1660,11 @@ class ScopeMigrationTest(unittest.TestCase):
 
     @staticmethod
     def _restore(saved):
+        """Put radio's module paths back."""
         radio.STATE_DIR, radio.DB_PATH, radio.LOCK_PATH = saved
 
     def test_migration_preserves_rows_and_adds_scope(self):
+        """Rows survive as unscoped, the scope columns exist, and the same name can join again."""
         conn = radio.connect()
         self.addCleanup(conn.close)
         row = conn.execute("SELECT * FROM handles").fetchone()
@@ -1507,17 +1684,23 @@ class ScopeMigrationTest(unittest.TestCase):
 
 
 class CatchUpCompactionTest(RadioTestCase):
+    """cmd_join's catch-up: on a pane rejoin only the newest reply-required PM per sender
+    stays push-worthy; the rest are left for pull."""
+
     def setUp(self):
+        """Capture the pane functions the join path uses."""
         super().setUp()
         self._fetch = radio.fetch_pane
         self._pane_exists = radio.pane_exists
         self.addCleanup(self._restore)
 
     def _restore(self):
+        """Put the stubbed pane functions back."""
         radio.fetch_pane = self._fetch
         radio.pane_exists = self._pane_exists
 
     def seed_backlog(self):
+        """Seed a mixed backlog of plain and reply-required PMs plus one failed delivery."""
         self.add_handle("bob", ref="herdr:w1:p1")
         m1 = self.pm("alice", "bob", "plain 1")
         m2 = self.pm("alice", "bob", "rr old", reply_required=True)
@@ -1531,12 +1714,15 @@ class CatchUpCompactionTest(RadioTestCase):
         return m1, m2, m3, m4, m5, m6
 
     def statuses(self):
+        """Map message id -> (status, last_error) for every delivery."""
         return {
             r["message_id"]: (r["status"], r["last_error"])
             for r in self.conn.execute("SELECT * FROM deliveries").fetchall()
         }
 
     def test_pane_rejoin_compacts_backlog(self):
+        """A pane rejoin keeps the newest reply-required mail pending and moves the rest,
+        including failed rows, to pull."""
         m1, m2, m3, m4, m5, m6 = self.seed_backlog()
         radio.fetch_pane = lambda pane_id: {"label": "bob"}
         buf = io.StringIO()
@@ -1553,6 +1739,7 @@ class CatchUpCompactionTest(RadioTestCase):
         self.assertIn("catch-up: 2 push (reply-required), 4 left for pull", buf.getvalue())
 
     def test_manual_join_compacts_nothing(self):
+        """A manual join (no pane) leaves the backlog untouched."""
         m1, m2, m3, m4, m5, m6 = self.seed_backlog()
         radio.pane_exists = lambda pane_id: False  # old pane gone: ref stays manual
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1564,7 +1751,10 @@ class CatchUpCompactionTest(RadioTestCase):
 
 
 class RepromotionTest(RadioTestCase):
+    """The relay re-promotes a delivery only when its pull reason was transient (no live pane)."""
+
     def setUp(self):
+        """Seed bob on a pane and capture pushes."""
         super().setUp()
         self.add_handle("bob", ref="herdr:w1:p1")
         self._fetch = radio.fetch_pane
@@ -1573,10 +1763,12 @@ class RepromotionTest(RadioTestCase):
         self.push_calls = []
 
     def _restore(self):
+        """Put the stubbed pane functions back."""
         radio.fetch_pane = self._fetch
         radio.push_to_pane = self._push
 
     def stranded(self, last_error):
+        """Create a pull delivery with the given last_error."""
         mid = self.pm("alice", "bob", "hi")
         self.conn.execute("UPDATE deliveries SET status='pull', last_error=? "
                           "WHERE message_id=?", (last_error, mid))
@@ -1584,9 +1776,11 @@ class RepromotionTest(RadioTestCase):
         return mid
 
     def tick(self):
+        """Run one relay tick against a live bob pane."""
         radio.fetch_pane = lambda pane_id: {"label": "bob"}
 
         def push(pane_id, text):
+            """Push stub that records the pane id and reports success."""
             self.push_calls.append(pane_id)
             return True, None
 
@@ -1594,12 +1788,14 @@ class RepromotionTest(RadioTestCase):
         return radio.relay_tick(self.conn)
 
     def test_no_live_pane_is_repromoted_and_pushed(self):
+        """A delivery stranded on 'no live pane' is pushed when the pane is back."""
         mid = self.stranded("no live pane")
         self.tick()
         self.assertEqual(self.push_calls, ["w1:p1"])
         self.assertEqual(self.delivery_row(mid)["status"], "delivered")
 
     def test_deliberate_pull_stays_pull(self):
+        """Catch-up and unconfirmed pulls are never re-promoted."""
         m1 = self.stranded("catch-up: read via radio inbox")
         m2 = self.stranded("delivery unconfirmed — left for pull, not retried")
         self.tick()
@@ -1609,7 +1805,11 @@ class RepromotionTest(RadioTestCase):
 
 
 class RetryBackoffTest(RadioTestCase):
+    """Retry selection: fresh mail first, errored mail after RETRY_AFTER_S, and no stamp on
+    a defer."""
+
     def setUp(self):
+        """Seed bob on a pane and capture pushes."""
         super().setUp()
         self.add_handle("bob", ref="herdr:w1:p1")
         self._fetch = radio.fetch_pane
@@ -1618,13 +1818,16 @@ class RetryBackoffTest(RadioTestCase):
         self.push_calls = []
 
     def _restore(self):
+        """Put the stubbed pane functions back."""
         radio.fetch_pane = self._fetch
         radio.push_to_pane = self._push
 
     def tick(self, push_result=(True, None)):
+        """Run one relay tick with the given push result."""
         radio.fetch_pane = lambda pane_id: {"label": "bob"}
 
         def push(pane_id, text):
+            """Push stub that records the envelope and returns the configured result."""
             self.push_calls.append(text)
             return push_result
 
@@ -1632,6 +1835,7 @@ class RetryBackoffTest(RadioTestCase):
         return radio.relay_tick(self.conn)
 
     def test_errored_delivery_backs_off_then_retries(self):
+        """An errored delivery is not retried inside the window and is retried after it."""
         mid = self.pm("alice", "bob", "hi")
         self.tick((False, "wedged"))
         row = self.delivery_row(mid)
@@ -1647,6 +1851,7 @@ class RetryBackoffTest(RadioTestCase):
         self.assertEqual(len(self.push_calls), 2)
 
     def test_fresh_delivery_is_always_selected(self):
+        """A fresh delivery is selected immediately and stamped on success."""
         mid = self.pm("alice", "bob", "hi")
         self.tick()
         row = self.delivery_row(mid)
@@ -1655,6 +1860,7 @@ class RetryBackoffTest(RadioTestCase):
         self.assertEqual(len(self.push_calls), 1)
 
     def test_fresh_first_ordering(self):
+        """New mail is pushed before a due retry."""
         m1 = self.pm("alice", "bob", "old, errored once")
         self.tick((False, "wedged"))
         self.backdate_attempt(m1, radio.RETRY_AFTER_S + 10)  # due for retry
@@ -1666,6 +1872,7 @@ class RetryBackoffTest(RadioTestCase):
         self.assertIn(f"id={m1}", self.push_calls[1])
 
     def test_agent_blocked_defer_stamps_nothing(self):
+        """An agent-blocked defer consumes no attempt and no timestamp."""
         mid = self.pm("alice", "bob", "hi")
         self.tick((False, "agent_blocked"))
         row = self.delivery_row(mid)
@@ -1675,7 +1882,10 @@ class RetryBackoffTest(RadioTestCase):
 
 
 class CompareAndSwapTest(RadioTestCase):
+    """The relay's status update is a compare-and-swap, so a concurrent ack wins."""
+
     def test_ack_during_push_is_not_overwritten(self):
+        """An ack landing between the relay's select and update is not clobbered."""
         self.add_handle("bob", ref="herdr:w1:p1")
         mid = self.pm("alice", "bob", "hi")
         delivery_id = self.delivery_row(mid)["id"]
@@ -1687,6 +1897,7 @@ class CompareAndSwapTest(RadioTestCase):
 
         def push(pane_id, text):
             # A cmd_show-style ack lands between the relay's SELECT and UPDATE.
+            """Push stub that lands a cmd_show-style ack before returning success."""
             self.conn.execute(
                 "UPDATE deliveries SET status='delivered', delivered_at='ack-ts' "
                 "WHERE id = ? AND status IN ('pending', 'pull', 'failed')",
@@ -1704,7 +1915,10 @@ class CompareAndSwapTest(RadioTestCase):
 
 
 class ChangedEventsTest(RadioTestCase):
+    """changed_events suppresses repeated delivery lines but always prints other events."""
+
     def test_fingerprinting(self):
+        """Repeated delivery text prints once; changed text and non-delivery events always print."""
         seen = {}
         waiting = "#3 -> bob (w1:p1) waiting: agent blocked"
         self.assertEqual(radio.changed_events([waiting], seen), [waiting])
@@ -1718,25 +1932,33 @@ class ChangedEventsTest(RadioTestCase):
 
 
 class TimeoutSplitTest(RadioTestCase):
+    """Read-only herdr calls use the short timeout; real sends use the longer one."""
+
     def setUp(self):
+        """Capture the subprocess module and the timeouts passed."""
         super().setUp()
         self._subprocess = radio.subprocess
         self.addCleanup(self._restore)
         self.timeouts = []
 
     def _restore(self):
+        """Put the real subprocess module back."""
         radio.subprocess = self._subprocess
 
     def install_stub(self, returncode=0, stdout="{}"):
+        """Install a subprocess stub that records each call's timeout."""
         import subprocess as real_subprocess
         timeouts = self.timeouts
 
         class Stub:
+            """subprocess stand-in that records each call's timeout."""
+
             TimeoutExpired = real_subprocess.TimeoutExpired
             CompletedProcess = real_subprocess.CompletedProcess
 
             @staticmethod
             def run(cmd, **kwargs):
+                """Record the timeout and return a completed process."""
                 timeouts.append(kwargs.get("timeout"))
                 return real_subprocess.CompletedProcess(
                     cmd, returncode, stdout=stdout, stderr=""
@@ -1745,12 +1967,14 @@ class TimeoutSplitTest(RadioTestCase):
         radio.subprocess = Stub
 
     def test_read_path_uses_read_timeout(self):
+        """fetch_pane passes HERDR_READ_TIMEOUT."""
         self.install_stub(stdout='{"result": {"pane": {"label": "x"}}}')
         pane = radio.fetch_pane("w1:p1")
         self.assertEqual(pane, {"label": "x"})
         self.assertEqual(self.timeouts, [radio.HERDR_READ_TIMEOUT])
 
     def test_send_path_uses_send_timeout(self):
+        """push_to_pane passes HERDR_SEND_TIMEOUT."""
         self.install_stub(returncode=0)
         ok, error = radio.push_to_pane("w1:p1", "hi")
         self.assertEqual((ok, error), (True, None))
@@ -1762,6 +1986,7 @@ class Utf8StreamsTest(RadioTestCase):
     its output (·, ⚠, —) can never crash a command."""
 
     def test_reconfigures_real_streams_and_ignores_replaced_ones(self):
+        """A cp1252 stream is reconfigured to UTF-8; a replaced StringIO is left alone."""
         buf = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
         saved = sys.stdout
         self.addCleanup(setattr, sys, "stdout", saved)
@@ -1777,6 +2002,7 @@ class RelayCwdTest(RadioTestCase):
     managed plugin dir blocks Herdr's install/update on Windows."""
 
     def test_relay_chdirs_to_the_state_dir(self):
+        """The relay chdirs to the state dir before its first tick."""
         calls = []
         saved_chdir = radio.os.chdir
         saved_tick = radio.relay_tick
@@ -1785,6 +2011,7 @@ class RelayCwdTest(RadioTestCase):
         radio.os.chdir = lambda path: calls.append(path)
 
         def stop(_conn):
+            """Tick stub that ends the relay loop with KeyboardInterrupt."""
             raise KeyboardInterrupt
 
         radio.relay_tick = stop
@@ -1800,10 +2027,12 @@ class RelayUpdateTest(RadioTestCase):
     detached successor instead of a fragile re-exec."""
 
     def test_script_changed_is_false_when_unreadable(self):
+        """An unreadable script reports no change; a real one reports a change."""
         self.assertFalse(radio.script_changed("/nonexistent/radio", 1.0))
         self.assertTrue(radio.script_changed(str(REPO / "bin" / "radio"), 1.0))
 
     def test_partial_writes_are_not_handed_over(self):
+        """A script with a syntax error is rejected before handover."""
         self.assertFalse(radio.script_compiles("/nonexistent/radio"))
         broken = radio.STATE_DIR / "broken-radio"
         broken.write_text("def broken(:\n", encoding="utf-8")
@@ -1811,6 +2040,7 @@ class RelayUpdateTest(RadioTestCase):
         self.assertTrue(radio.script_compiles(str(REPO / "bin" / "radio")))
 
     def test_mid_write_keeps_the_old_code_running(self):
+        """A broken on-disk script keeps the loop running with no successor spawned."""
         saved = (
             radio.script_changed,
             radio.script_compiles,
@@ -1826,6 +2056,7 @@ class RelayUpdateTest(RadioTestCase):
         calls = []
 
         def tick(_conn):
+            """Tick stub that keeps the loop alive for two ticks, then stops it."""
             calls.append(1)
             if len(calls) >= 2:
                 raise KeyboardInterrupt
@@ -1841,6 +2072,7 @@ class RelayUpdateTest(RadioTestCase):
 
     @staticmethod
     def _restore_parts(saved):
+        """Put the five stubbed parts back."""
         (
             radio.script_changed,
             radio.script_compiles,
@@ -1850,13 +2082,17 @@ class RelayUpdateTest(RadioTestCase):
         ) = saved
 
     def test_on_disk_change_hands_over_to_a_successor(self):
+        """A valid change spawns the detached successor with the lock released."""
         saved = (radio.script_changed, radio.subprocess.Popen, radio.relay_tick, radio.time.sleep)
         self.addCleanup(self._restore, saved)
         radio.script_changed = lambda script, mtime: True
         spawned = []
 
         class FakePopen:
+            """Popen stand-in that records the spawned successor."""
+
             def __init__(self, argv, **kwargs):
+                """Record the argv and kwargs of the spawn."""
                 spawned.append((argv, kwargs))
 
         radio.subprocess.Popen = FakePopen
@@ -1880,16 +2116,21 @@ class RelayUpdateTest(RadioTestCase):
 
     @staticmethod
     def _restore(saved):
+        """Put the stubbed parts back."""
         radio.script_changed, radio.subprocess.Popen, radio.relay_tick, radio.time.sleep = saved
 
 
 class CrashSafeRelayTest(RadioTestCase):
+    """A tick error is logged and the daemon keeps running."""
+
     def test_tick_error_is_logged_and_the_daemon_survives(self):
+        """An injected RuntimeError is logged; the loop continues until the KeyboardInterrupt."""
         orig_tick = radio.relay_tick
         self.addCleanup(setattr, radio, "relay_tick", orig_tick)
         calls = []
 
         def flaky_tick(conn):
+            """Tick stub that raises once, then stops the loop."""
             calls.append(1)
             if len(calls) == 1:
                 raise RuntimeError("boom")
@@ -1923,6 +2164,7 @@ class ChoosePlainTest(unittest.TestCase):
     falls back to numbered options read from stdin."""
 
     def run_pick(self, keys, default=0):
+        """Run choose_plain with stdin fed from a string."""
         buf = io.StringIO()
         saved = sys.stdin
         sys.stdin = io.StringIO(keys)
@@ -1934,23 +2176,29 @@ class ChoosePlainTest(unittest.TestCase):
         return idx, buf.getvalue()
 
     def test_number_selects(self):
+        """A number selects that option."""
         self.assertEqual(self.run_pick("2\n")[0], 1)
 
     def test_enter_takes_the_default(self):
+        """Enter returns the default index."""
         self.assertEqual(self.run_pick("\n", default=2)[0], 2)
 
     def test_q_cancels(self):
+        """q returns None."""
         self.assertEqual(self.run_pick("q\n")[0], None)
 
     def test_closed_stdin_cancels(self):
+        """EOF returns None."""
         self.assertEqual(self.run_pick("")[0], None)
 
     def test_invalid_line_reprompts(self):
+        """An invalid line re-prompts and the next valid one wins."""
         idx, out = self.run_pick("nope\n3\n")
         self.assertEqual(idx, 2)
         self.assertIn("invalid choice", out)
 
     def test_choose_dispatches_when_termios_is_missing(self):
+        """choose falls back to the plain picker when termios is unavailable."""
         saved = radio.termios
         self.addCleanup(setattr, radio, "termios", saved)
         radio.termios = None
@@ -1966,15 +2214,18 @@ class RelayLockTest(RadioTestCase):
     with a fake module (the suite itself runs on POSIX)."""
 
     def _force_windows_lock(self, fake):
+        """Swap in a fake msvcrt so the Windows branch runs on POSIX."""
         saved = radio.fcntl, radio.msvcrt
         self.addCleanup(self._restore, saved)
         radio.fcntl, radio.msvcrt = None, fake
 
     @staticmethod
     def _restore(saved):
+        """Put the real modules back."""
         radio.fcntl, radio.msvcrt = saved
 
     def test_posix_second_lock_is_refused(self):
+        """The second lock attempt on the same file is refused."""
         lock = radio.STATE_DIR / "relay.lock"
         first, second = open(lock, "a+"), open(lock, "a+")
         self.addCleanup(first.close)
@@ -1983,13 +2234,17 @@ class RelayLockTest(RadioTestCase):
         self.assertFalse(radio.relay_lock(second))
 
     def test_windows_fallback_locks_one_byte(self):
+        """The Windows fallback locks one byte and keeps the region non-empty."""
         calls = []
 
         class FakeMsvcrt:
+            """msvcrt stand-in whose locking succeeds and records the call."""
+
             LK_NBLCK = 2
 
             @staticmethod
             def locking(fd, mode, size):
+                """Record the mode and size of the byte-range lock."""
                 calls.append((mode, size))
 
         self._force_windows_lock(FakeMsvcrt)
@@ -2000,11 +2255,15 @@ class RelayLockTest(RadioTestCase):
             self.assertEqual(fd.read(1), "1")  # region kept non-empty
 
     def test_windows_fallback_reports_contention(self):
+        """An OSError from msvcrt reports the lock as held."""
         class BusyMsvcrt:
+            """msvcrt stand-in whose lock is already held."""
+
             LK_NBLCK = 2
 
             @staticmethod
             def locking(fd, mode, size):
+                """Report the held lock as an OSError."""
                 raise OSError("lock held")
 
         self._force_windows_lock(BusyMsvcrt)
@@ -2017,15 +2276,18 @@ class AgentLaunchArgvTest(unittest.TestCase):
     .cmd/.bat shims cannot be CreateProcess'd and get wrapped in cmd /c."""
 
     def setUp(self):
+        """Capture shutil.which and os.name."""
         self._which = radio.shutil.which
         self._name = radio.os.name
         self.addCleanup(self._restore)
 
     def _restore(self):
+        """Put shutil.which and os.name back."""
         radio.shutil.which = self._which
         radio.os.name = self._name
 
     def test_posix_resolves_the_binary(self):
+        """On POSIX the resolved binary path replaces the command name."""
         radio.shutil.which = lambda cmd: f"/usr/local/bin/{cmd}"
         self.assertEqual(
             radio.agent_launch_argv(["claude", "--name", "x"]),
@@ -2033,6 +2295,7 @@ class AgentLaunchArgvTest(unittest.TestCase):
         )
 
     def test_windows_cmd_shim_is_wrapped(self):
+        """A .cmd shim is wrapped in cmd.exe /c."""
         radio.os.name = "nt"
         radio.shutil.which = lambda cmd: r"C:\npm\claude.cmd"
         self.assertEqual(
@@ -2041,6 +2304,7 @@ class AgentLaunchArgvTest(unittest.TestCase):
         )
 
     def test_windows_exe_is_not_wrapped(self):
+        """A real .exe is launched directly."""
         radio.os.name = "nt"
         radio.shutil.which = lambda cmd: r"C:\tools\codex.exe"
         self.assertEqual(radio.agent_launch_argv(["codex"]), [r"C:\tools\codex.exe"])
@@ -2051,20 +2315,24 @@ class ExecOrWaitTest(unittest.TestCase):
     the CRT's exec emulation returns the shell prompt while the target runs."""
 
     def setUp(self):
+        """Capture os.name, subprocess.run and os.execvpe."""
         self._name = radio.os.name
         self._run = radio.subprocess.run
         self._execvpe = radio.os.execvpe
         self.addCleanup(self._restore)
 
     def _restore(self):
+        """Put the captured attributes back."""
         radio.os.name = self._name
         radio.subprocess.run = self._run
         radio.os.execvpe = self._execvpe
 
     def test_posix_execs_in_place(self):
+        """On POSIX the target replaces the process via execvpe."""
         seen = {}
 
         def fake_execvpe(path, argv, env):
+            """execvpe stand-in that records the argv and aborts the exec."""
             seen["argv"] = argv
             raise RuntimeError("exec")
 
@@ -2074,11 +2342,13 @@ class ExecOrWaitTest(unittest.TestCase):
         self.assertEqual(seen["argv"], ["claude", "--name", "x"])
 
     def test_windows_waits_and_returns_the_exit_code(self):
+        """On Windows the child runs and its exit code is returned."""
         radio.os.name = "nt"
         radio.subprocess.run = lambda command, env=None: subprocess.CompletedProcess(command, 3)
         self.assertEqual(radio.exec_or_wait(["cmd.exe", "/c", "claude.cmd"], {}), 3)
 
     def test_windows_command_line_plain_binary(self):
+        """A plain binary path joins without quoting."""
         self.assertEqual(
             radio.windows_command_line([r"C:\tools\codex.exe", "--resume", "sid"]),
             r"C:\tools\codex.exe --resume sid",
@@ -2086,6 +2356,7 @@ class ExecOrWaitTest(unittest.TestCase):
 
     def test_windows_command_line_quotes_space_paths(self):
         # cmd /c strips a lone outer pair; the extra pair keeps the path whole.
+        """A path with spaces gets the extra quote pair cmd /c needs."""
         self.assertEqual(
             radio.windows_command_line(
                 ["cmd.exe", "/c", r"C:\Program Files\npm\claude.cmd", "--name", "x"]
@@ -2101,11 +2372,13 @@ class WinShimTest(RadioTestCase):
     foreign radio.cmd or radio-resolve.py is never clobbered); PATH hint."""
 
     def setUp(self):
+        """Load the shim module and point it at a temp link dir."""
         super().setUp()
         self.win_shim = load_bin_script("radio_win_shim", "win-shim.py")
         self.link_dir = radio.STATE_DIR / "link-bin"
 
     def test_shim_text_is_stable_and_bakes_no_root(self):
+        """The launcher text is marker-guarded and carries no plugin path."""
         text = self.win_shim.shim_text()
         self.assertTrue(text.startswith(self.win_shim.SHIM_MARKER))
         self.assertIn(self.win_shim.ROOT_FILE, text)
@@ -2113,12 +2386,15 @@ class WinShimTest(RadioTestCase):
         self.assertNotIn("plugins\\radio-", text)  # no baked plugin path
 
     def test_resolver_text_queries_herdr(self):
+        """The resolver asks herdr for the plugin root."""
         text = self.win_shim.resolver_text()
         self.assertIn(self.win_shim.RESOLVER_MARKER, text)
         self.assertIn("plugin_root", text)
         self.assertIn('"radio"', text)
 
     def test_ensure_shim_writes_launcher_resolver_and_cache(self):
+        """ensure_shim writes the launcher, resolver and root cache; a new root only
+        refreshes the cache."""
         msg = self.win_shim.ensure_shim(Path(r"C:\plugins\radio-a"), self.link_dir)
         self.assertIn("radio.cmd ->", msg)
         shim = self.link_dir / "radio.cmd"
@@ -2134,6 +2410,7 @@ class WinShimTest(RadioTestCase):
         self.assertEqual(cache.read_text(encoding="utf-8").strip(), r"C:\plugins\radio-b")
 
     def test_foreign_radio_cmd_is_left_alone(self):
+        """A radio.cmd without the marker is never overwritten."""
         self.link_dir.mkdir(parents=True, exist_ok=True)
         shim = self.link_dir / "radio.cmd"
         shim.write_text("@echo off\necho someone else's radio\n", encoding="utf-8")
@@ -2142,6 +2419,7 @@ class WinShimTest(RadioTestCase):
         self.assertIn("someone else's radio", shim.read_text(encoding="utf-8"))
 
     def test_append_path_entry_appends_and_dedupes(self):
+        """The PATH entry is appended once and trimmed of empty segments."""
         target = r"C:\Users\x\.local\bin"
         self.assertEqual(self.win_shim.append_path_entry("", target), target)
         self.assertEqual(
@@ -2155,9 +2433,11 @@ class WinShimTest(RadioTestCase):
         )
 
     def test_ensure_user_path_noop_off_windows(self):
+        """ensure_user_path does nothing off Windows."""
         self.assertIsNone(self.win_shim.ensure_user_path(self.link_dir))
 
     def test_foreign_resolver_is_left_alone(self):
+        """A resolver without the marker is never overwritten."""
         self.link_dir.mkdir(parents=True, exist_ok=True)
         resolver = self.link_dir / self.win_shim.RESOLVER_FILE
         resolver.write_text("print('someone else')\n", encoding="utf-8")
@@ -2166,6 +2446,7 @@ class WinShimTest(RadioTestCase):
         self.assertIn("someone else", resolver.read_text(encoding="utf-8"))
 
     def test_path_hint_only_when_missing(self):
+        """The PATH hint appears only when the dir is not on PATH."""
         saved = os.environ.get("PATH")
         self.addCleanup(self._restore_path, saved)
         os.environ["PATH"] = str(self.link_dir)
@@ -2176,6 +2457,7 @@ class WinShimTest(RadioTestCase):
 
     @staticmethod
     def _restore_path(saved):
+        """Put PATH back."""
         if saved is None:
             os.environ.pop("PATH", None)
         else:
@@ -2187,9 +2469,11 @@ class ViewPythonTest(unittest.TestCase):
     layout), fall back to the launcher's own interpreter."""
 
     def setUp(self):
+        """Load run-view.py as a module."""
         self.run_view = load_bin_script("radio_run_view", "run-view.py")
 
     def test_prefers_posix_venv(self):
+        """The POSIX venv interpreter is preferred when present."""
         with tempfile.TemporaryDirectory() as tmp:
             venv = Path(tmp) / "venv"
             venv_python = venv / "bin" / "python"
@@ -2198,6 +2482,7 @@ class ViewPythonTest(unittest.TestCase):
             self.assertEqual(self.run_view.view_python(venv), venv_python)
 
     def test_prefers_windows_venv(self):
+        """The Scripts/python.exe layout is preferred on Windows."""
         with tempfile.TemporaryDirectory() as tmp:
             venv = Path(tmp) / "venv"
             venv_python = venv / "Scripts" / "python.exe"
@@ -2211,18 +2496,21 @@ class ViewPythonTest(unittest.TestCase):
             self.assertEqual(self.run_view.view_python(venv), venv_python)
 
     def test_falls_back_when_venv_is_missing(self):
+        """A missing venv falls back to the launcher's interpreter."""
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
                 self.run_view.view_python(Path(tmp) / "venv"), Path(sys.executable)
             )
 
     def test_state_dir_honours_radio_home(self):
+        """RADIO_HOME overrides the state dir."""
         saved = os.environ.get("RADIO_HOME")
         self.addCleanup(self._restore_env, saved)
         os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
         self.assertEqual(self.run_view.state_dir(), Path("/tmp/radio-home-test"))
 
     def test_detach_cwd_leaves_the_plugin_dir(self):
+        """detach_cwd moves into the state dir."""
         saved_home = os.environ.get("RADIO_HOME")
         self.addCleanup(self._restore_env, saved_home)
         os.environ["RADIO_HOME"] = "/tmp/radio-home-test"
@@ -2235,6 +2523,7 @@ class ViewPythonTest(unittest.TestCase):
 
     @staticmethod
     def _restore_env(saved):
+        """Put RADIO_HOME back."""
         if saved is None:
             os.environ.pop("RADIO_HOME", None)
         else:
@@ -2246,6 +2535,7 @@ class WorkspaceCreatedHookTest(unittest.TestCase):
     opens the platform-correct Radio view pane without stealing focus."""
 
     def setUp(self):
+        """Load the hook and clear the event env it reads."""
         self.hook = load_bin_script("radio_workspace_hook", "workspace-created.py")
         for key in ("HERDR_PLUGIN_EVENT_JSON", "HERDR_WORKSPACE_ID", "HERDR_BIN_PATH"):
             saved = os.environ.pop(key, None)
@@ -2253,6 +2543,7 @@ class WorkspaceCreatedHookTest(unittest.TestCase):
                 self.addCleanup(os.environ.__setitem__, key, saved)
 
     def test_event_workspace_variants(self):
+        """The known payload shapes yield the workspace id; bad input yields an empty string."""
         self.assertEqual(self.hook.event_workspace('{"workspace":{"workspace_id":"w7"}}'), "w7")
         self.assertEqual(self.hook.event_workspace('{"workspace_id":"wA","x":1}'), "wA")
         self.assertEqual(self.hook.event_workspace('{"items":[{"workspace_id":"w9"}]}'), "w9")
@@ -2261,6 +2552,7 @@ class WorkspaceCreatedHookTest(unittest.TestCase):
 
     def test_targeted_keys_win_over_other_workspace_ids(self):
         # A decoy list of workspaces must not steal the event's workspace.
+        """The event's own workspace wins over a decoy workspace list."""
         payload = '{"workspace": {"workspace_id": "w7"}, "workspaces": [{"workspace_id": "w1"}]}'
         self.assertEqual(self.hook.event_workspace(payload), "w7")
         self.assertEqual(
@@ -2268,13 +2560,17 @@ class WorkspaceCreatedHookTest(unittest.TestCase):
         )
 
     def test_main_opens_the_view_in_the_new_workspace(self):
+        """The hook opens the view pane for the event workspace with --no-focus."""
         calls = []
 
         class FakeSubprocess:
+            """subprocess stand-in that records the hook's command."""
+
             TimeoutExpired = subprocess.TimeoutExpired
 
             @staticmethod
             def run(argv, **kwargs):
+                """Record the argv the hook would run."""
                 calls.append(argv)
 
         saved = self.hook.subprocess
@@ -2292,6 +2588,7 @@ class WorkspaceCreatedHookTest(unittest.TestCase):
         self.assertIn("--no-focus", argv)
 
     def test_main_noops_without_a_workspace(self):
+        """No payload means no action."""
         self.hook.main()  # no payload, no env: returns quietly
 
 
@@ -2299,6 +2596,7 @@ class WindowsScriptsTest(unittest.TestCase):
     """The Windows hook bodies must import and no-op cleanly off Windows."""
 
     def test_noops_off_windows(self):
+        """setup-win and autostart-win import and return 0 off Windows."""
         for filename in ("setup-win.py", "autostart-win.py"):
             module = load_bin_script(Path(filename).stem.replace("-", "_"), filename)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -2325,11 +2623,13 @@ class SidebarPolicyTest(unittest.TestCase):
 
     def test_auto_threshold(self):
         # Below the threshold the fixed sidebar would starve the stream.
+        """The sidebar hides below NARROW_COLS and shows at or above it."""
         self.assertFalse(radio_view.sidebar_visible(radio_view.NARROW_COLS - 1, None))
         self.assertTrue(radio_view.sidebar_visible(radio_view.NARROW_COLS, None))
         self.assertTrue(radio_view.sidebar_visible(200, None))
 
     def test_forced_overrides_width(self):
+        """An explicit toggle wins over the width."""
         self.assertTrue(radio_view.sidebar_visible(40, True))
         self.assertFalse(radio_view.sidebar_visible(200, False))
 
@@ -2339,6 +2639,7 @@ class CompactRosterTest(RadioTestCase):
     """Compact header roster: live handles inline, the rest as +N."""
 
     def test_live_inline_dead_counted(self):
+        """Live handles are listed inline and the rest counted."""
         self.add_handle("kimi", ref="herdr:1-1")
         self.add_handle("codex", ref="manual")  # no pane binding -> pull dot
         handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
@@ -2347,6 +2648,7 @@ class CompactRosterTest(RadioTestCase):
         self.assertEqual(roster.plain, "●kimi +1")
 
     def test_all_dead_is_only_the_count(self):
+        """With no live handles only the count shows."""
         self.add_handle("kimi", ref="manual")
         self.add_handle("codex", ref="herdr:9-9")  # pane gone -> ✗
         handles = self.conn.execute("SELECT * FROM handles ORDER BY name").fetchall()
@@ -2361,6 +2663,7 @@ class ViewScopeTest(RadioTestCase):
     messages without leaking another workspace's traffic."""
 
     def test_scope_from_herdr_env(self):
+        """The scope comes from HERDR_WORKSPACE_ID only inside herdr."""
         os.environ["HERDR_ENV"] = "1"
         os.environ["HERDR_WORKSPACE_ID"] = "w2"
         self.addCleanup(os.environ.pop, "HERDR_ENV", None)
@@ -2370,6 +2673,7 @@ class ViewScopeTest(RadioTestCase):
         self.assertEqual(radio_view.workspace_scope(), "")
 
     def test_handles_query_scopes(self):
+        """Scoped and all-workspace handle queries differ as expected."""
         sql, params = radio_view.handles_query("w2", False)
         self.assertIn("WHERE workspace = ?", sql)
         self.assertEqual(params, ("w2",))
@@ -2378,6 +2682,7 @@ class ViewScopeTest(RadioTestCase):
         self.assertEqual(params, ())
 
     def test_messages_query_scopes(self):
+        """Scoped messages filter on both ends; outside herdr there is no filter."""
         sql, params = radio_view.messages_query("w2", False, 5)
         self.assertIn("from_ws = ? OR to_ws = ?", sql)
         self.assertEqual(params, (5, "w2", "w2"))
@@ -2396,6 +2701,7 @@ class WorkspaceDeliveryTest(RadioTestCase):
     in pane get/send-text/send-keys (verified live against herdr)."""
 
     def test_relay_pushes_to_non_default_workspace(self):
+        """A pane id prefixed with another workspace travels unchanged and gets pushed."""
         self.add_handle("bob", ref="herdr:w2:p1")
         mid = self.pm("alice", "bob", "hi")
         orig_fetch, orig_push = radio.fetch_pane, radio.push_to_pane
@@ -2423,22 +2729,26 @@ class WorkspacePaneStatesTest(RadioTestCase):
 
     @staticmethod
     def _panes(*pane_ids):
+        """Build a pane-list JSON payload for the given ids."""
         return json.dumps(
             {"result": {"panes": [{"pane_id": p, "label": "x"} for p in pane_ids]}}
         )
 
     def setUp(self):
+        """Capture the view module's herdr function and the calls."""
         super().setUp()
         self._herdr = radio_view.herdr
         self.addCleanup(self._restore)
         self.calls = []
 
     def _restore(self):
+        """Put the view module's herdr back."""
         radio_view.herdr = self._herdr
 
     def install(self, routes):
         """Script radio_view.herdr: argv tuple -> (stdout, rc), or None (binary gone)."""
         def fake(*args):
+            """herdr stand-in that answers from the scripted route table."""
             self.calls.append(args)
             route = routes.get(tuple(args), ("{}", 1))
             if route is None:
@@ -2449,6 +2759,7 @@ class WorkspacePaneStatesTest(RadioTestCase):
         radio_view.herdr = fake
 
     def test_merges_all_workspaces(self):
+        """Pane states merge across every workspace, not just the default."""
         self.install({
             ("workspace", "list"): (self.WS_TWO, 0),
             ("pane", "list", "--workspace", "w1"): (self._panes("w1:p1"), 0),
@@ -2460,6 +2771,7 @@ class WorkspacePaneStatesTest(RadioTestCase):
         self.assertNotIn(("pane", "list"), self.calls)
 
     def test_workspace_list_failure_falls_back_to_default_scan(self):
+        """A failed, bad or missing workspace list falls back to the default pane scan."""
         routes = {
             ("workspace", "list"): ("", 1),  # herdr error
             ("pane", "list"): (self._panes("w1:p1"), 0),
@@ -2476,6 +2788,7 @@ class WorkspacePaneStatesTest(RadioTestCase):
         self.assertEqual(set(radio_view.pane_states()), {"w1:p1"})
 
     def test_workspace_vanishing_mid_scan_is_skipped(self):
+        """A workspace that errors mid-scan is skipped."""
         self.install({
             ("workspace", "list"): (self.WS_TWO, 0),
             ("pane", "list", "--workspace", "w1"): (self._panes("w1:p1"), 0),
@@ -2485,6 +2798,7 @@ class WorkspacePaneStatesTest(RadioTestCase):
         self.assertEqual(set(states), {"w1:p1"})
 
     def test_dot_for_handle_in_non_default_workspace(self):
+        """A handle in another workspace gets its live dot."""
         self.add_handle("bob", ref="herdr:w2:p3")
         row = self.conn.execute("SELECT * FROM handles WHERE name='bob'").fetchone()
         states = {"w2:p3": {"label": "bob", "agent_status": "idle"}}
@@ -2495,6 +2809,7 @@ class WorkspacePaneStatesTest(RadioTestCase):
         # Two workspaces may hold a pane with the same label: dot_for looks
         # the pane up by its workspace-prefixed id; the label is only the
         # identity check, never the lookup key.
+        """The pane is looked up by its prefixed id, not by label."""
         self.add_handle("bob", ref="herdr:w2:p1", agent="claude")
         row = self.conn.execute("SELECT * FROM handles WHERE name='bob'").fetchone()
         states = {

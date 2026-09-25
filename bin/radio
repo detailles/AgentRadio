@@ -672,6 +672,8 @@ def choose(question: str, options: list[str], default: int = 0) -> int | None:
     drawn = 0
 
     def render() -> None:
+        """Redraw the question and options in place: the cursor moves back over
+        the previous block and clears below it, so the menu never scrolls."""
         nonlocal drawn
         if drawn:
             sys.stdout.write(f"\x1b[{drawn}A\x1b[J")  # up over the old block, clear it
@@ -1698,6 +1700,8 @@ def cmd_handles(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     herdr every handle grouped by workspace. An explicit workspace id or label
     narrows it to that project."""
     def scoped(workspace: str) -> int:
+        """Print one workspace's roster, or its empty-state line; the caller
+        picks which workspace that is."""
         rows = conn.execute(
             "SELECT * FROM handles WHERE workspace = ? ORDER BY name", (workspace,)
         ).fetchall()
@@ -1815,10 +1819,13 @@ def cmd_show(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 
 def format_for_pane(message: sqlite3.Row) -> str:
-    # Legacy Arkai radio envelope: the reply semantics live in the structured
-    # header, not in inline command hints — agents learn the commands from the
-    # opening briefing. Multi-line is fine: agent panes get an atomic verified
-    # submission, and the shell path flattens newlines before typing.
+    """Render one message as the [RADIO_MESSAGE] envelope typed into a pane.
+
+    The structured header carries the reply semantics, not inline command
+    hints — agents learn the commands from the opening briefing. Multi-line is
+    fine: agent panes get an atomic verified submission, and the shell path
+    flattens newlines before typing. A cross-workspace sender is qualified
+    (w1:name) because that is the only address the recipient can reply to."""
     mid = message["id"]
     reply = "required" if message["reply_required"] else "not-required"
     reply_line = "\nReply required: answer this over radio." if message["reply_required"] else ""

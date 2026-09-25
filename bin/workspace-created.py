@@ -33,6 +33,8 @@ def event_workspace(payload: str) -> str:
     found = ""
 
     def walk(node) -> None:
+        """Depth-first search for the first workspace_id in a payload whose
+        exact shape is not guaranteed; sets the outer `found` and stops."""
         nonlocal found
         if found:
             return

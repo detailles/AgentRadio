@@ -19,6 +19,8 @@ def radio(*args: str) -> None:
 
 
 def main() -> int:
+    """Join the given handle, then answer every [RADIO_MESSAGE] envelope that
+    arrives on stdin — a minimal shell-pane agent loop to demo radio."""
     if len(sys.argv) != 2:
         print("usage: bot.py <handle>", file=sys.stderr)
         return 2
