@@ -2886,11 +2886,13 @@ def read_claude_usage() -> dict | None:
     return {"plan": oauth.get("subscriptionType"), "windows": windows}
 
 
-def kimi_runtime(home: Path) -> tuple[str, str, Path]:
+def kimi_runtime(home: Path) -> tuple[str, str, Path] | None:
     """Resolve a Kimi Code account's OAuth host, API base URL and credential
     file. The install's config.toml lists several service base URLs, so only
     the account's coding endpoint counts; the environment may pin a region and
-    the mainland hosts apply otherwise."""
+    the mainland hosts apply otherwise. None when the resolved region is not
+    one of the two known Kimi hosts — the refresh token is posted to the OAuth
+    host, so an unknown value is refused rather than trusted."""
     text = ""
     config = home / "config.toml"
     if config.exists():
@@ -2913,6 +2915,11 @@ def kimi_runtime(home: Path) -> tuple[str, str, Path]:
         base_url = KIMI_GLOBAL_BASE_URL if oauth_host == KIMI_GLOBAL_OAUTH_HOST else KIMI_MAINLAND_BASE_URL
     if not oauth_host:
         oauth_host = KIMI_GLOBAL_OAUTH_HOST if base_url == KIMI_GLOBAL_BASE_URL else KIMI_MAINLAND_OAUTH_HOST
+    if (oauth_host, base_url) not in (
+        (KIMI_MAINLAND_OAUTH_HOST, KIMI_MAINLAND_BASE_URL),
+        (KIMI_GLOBAL_OAUTH_HOST, KIMI_GLOBAL_BASE_URL),
+    ):
+        return None
     if oauth_host == KIMI_MAINLAND_OAUTH_HOST and base_url == KIMI_MAINLAND_BASE_URL:
         key = KIMI_DEFAULT_OAUTH_KEY
     else:
@@ -2951,9 +2958,14 @@ def kimi_refresh(oauth_host: str, credentials_path: Path, credentials: dict) -> 
         credentials_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = credentials_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(replacement), encoding="utf-8")
+        # Access and refresh tokens are private: the Kimi CLI writes 0600 and
+        # a refresh must not loosen that.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, credentials_path)
-    except OSError:
-        pass
+    except OSError as exc:
+        # The in-memory token still serves this read, but the file stays
+        # stale — the next refresh fails, so say so now.
+        print(f"warning: could not persist refreshed Kimi credentials: {exc}", file=sys.stderr)
     return token
 
 
@@ -2991,7 +3003,10 @@ def read_kimi_usage(home: Path) -> dict | None:
     """Read one Kimi Code account's quota. Kimi rotates short-lived file
     tokens, so an expired or rejected token is refreshed once (and persisted)
     before the usage read is retried."""
-    oauth_host, base_url, credentials_path = kimi_runtime(home)
+    runtime = kimi_runtime(home)
+    if runtime is None:
+        return None
+    oauth_host, base_url, credentials_path = runtime
     credentials = usage_read_json(credentials_path) or {}
     token = str(credentials.get("access_token") or "").strip()
     expires_at = credentials.get("expires_at")

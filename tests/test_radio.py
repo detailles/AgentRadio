@@ -3092,6 +3092,66 @@ class UsageToolsTest(RadioTestCase):
         self.assertEqual(args.func, radio.cmd_tools_usage)
 
 
+class KimiUsageTest(RadioTestCase):
+    """The Kimi reader: only the known regions are trusted, and a refreshed
+    token file stays private."""
+
+    def setUp(self):
+        """Strip ambient Kimi region env so the fixture is hermetic."""
+        super().setUp()
+        self._kimi_env = {key: os.environ.pop(key, None) for key in
+                          ("KIMI_CODE_BASE_URL", "KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST")}
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        """Put the ambient Kimi env back."""
+        for key, value in self._kimi_env.items():
+            if value is not None:
+                os.environ[key] = value
+
+    def temp_home(self):
+        """A temp Kimi home that cleans itself up."""
+        tmp = tempfile.TemporaryDirectory(prefix="radio-kimi-")
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def test_unknown_region_is_refused(self):
+        """A config pointing the refresh at another host is refused, not trusted."""
+        home = self.temp_home()
+        (home / "config.toml").write_text('oauthHost = "https://evil.example"\n', encoding="utf-8")
+        self.assertIsNone(radio.kimi_runtime(home))
+
+    def test_known_regions_resolve(self):
+        """Both shipped regions resolve; only the mainland uses the default key."""
+        mainland = radio.kimi_runtime(self.temp_home())
+        self.assertEqual(mainland[:2], (radio.KIMI_MAINLAND_OAUTH_HOST, radio.KIMI_MAINLAND_BASE_URL))
+        self.assertEqual(mainland[2].name, "kimi-code.json")
+        global_home = self.temp_home()
+        (global_home / "config.toml").write_text(
+            f'oauthHost = "{radio.KIMI_GLOBAL_OAUTH_HOST}"\n', encoding="utf-8"
+        )
+        overseas = radio.kimi_runtime(global_home)
+        self.assertEqual(overseas[:2], (radio.KIMI_GLOBAL_OAUTH_HOST, radio.KIMI_GLOBAL_BASE_URL))
+        self.assertNotEqual(overseas[2].name, "kimi-code.json")
+
+    def test_refreshed_credentials_are_written_private(self):
+        """A refresh keeps the token file unreadable to group and others."""
+        path = self.temp_home() / "credentials" / "kimi-code.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"refresh_token": "old"}), encoding="utf-8")
+        os.chmod(path, 0o644)
+        saved = radio.usage_http_post_form
+        self.addCleanup(setattr, radio, "usage_http_post_form", saved)
+        radio.usage_http_post_form = lambda url, form: (
+            200, {"access_token": "new", "refresh_token": "next", "expires_in": 3600}
+        )
+        token = radio.kimi_refresh(radio.KIMI_MAINLAND_OAUTH_HOST, path, {"refresh_token": "old"})
+        self.assertEqual(token, "new")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["refresh_token"], "next")
+        if os.name != "nt":  # POSIX mode bits; Windows has no group/other bit
+            self.assertEqual(path.stat().st_mode & 0o077, 0)
+
+
 class ToolsCalmTest(RadioTestCase):
     """radio tools calm: a self-contained terminal animation, no ledger or deps."""
 
