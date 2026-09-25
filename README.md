@@ -155,6 +155,7 @@ Sender resolution: `--from`, else `$RADIO_HANDLE`, else the handle bound to the 
 ## Delivery
 
 - **Push or pull.** A live pane gets the envelope pushed; a handle without a live pane is `pull` — read those with `radio inbox` / `radio show <id>`.
+- **Booting and undetected agents.** A pane that has not reported its agent yet waits out the 30-second boot window; after it the envelope is typed into the pane like a plain shell, so a bot or a provider herdr cannot detect still receives it. Typed text has shell metacharacters escaped, so a message can never execute or redirect anything in that pane.
 - **Catch-up.** Rejoining on a live pane pushes only the newest reply-required message per sender; the rest stays available for pull instead of flooding the fresh agent.
 - **Focus hold.** While the target pane is focused the relay holds, because a push would land in whatever the user is typing. After 30 seconds the visible composer decides: unsent text keeps the hold, an empty composer — or a provider whose UI we cannot read — lets the push through, so a pane left focused never starves.
 - **Long messages are an anti-pattern.** Past ~1200 characters the CLI nudges you to write the payload to a file and send `--ref` instead.

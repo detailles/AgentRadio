@@ -324,6 +324,22 @@ def pane_exists(pane_id: str) -> bool:
         return False
 
 
+SHELL_METACHARACTERS = "\\;|&<>()$`!\"'"
+
+
+def shell_safe_text(text: str) -> str:
+    """Escape what would let a plain shell execute or redirect typed text.
+
+    The escape character differs by platform — backslash on POSIX shells,
+    backtick in PowerShell — so the same message stays inert on both. cmd.exe
+    quoting cannot be satisfied by one shared escape: Windows panes default to
+    PowerShell and cmd panes are preview."""
+    escape = "`" if os.name == "nt" else "\\"
+    return "".join(
+        f"{escape}{char}" if char in SHELL_METACHARACTERS else char for char in text
+    )
+
+
 def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
     """Deliver one line into a pane. Agent panes get a verified submission
     (--wait: herdr confirms the agent actually started working, so a 'success'
@@ -352,9 +368,11 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
             # risk) and must not blind-type (composer stranding).
             return False, "delivery_unconfirmed"
         # Not an agent pane: type into the shell. Flatten newlines — an
-        # embedded newline submits the line early and drops the rest.
+        # embedded newline submits the line early and drops the rest — and
+        # escape shell metacharacters, so a message can never execute or
+        # redirect anything in the pane it lands in.
         flat = " ".join(text.splitlines())
-        typed = herdr("pane", "send-text", pane_id, flat, timeout=HERDR_SEND_TIMEOUT)
+        typed = herdr("pane", "send-text", pane_id, shell_safe_text(flat), timeout=HERDR_SEND_TIMEOUT)
         if typed.returncode != 0:
             err = (prompt_err or typed.stderr or typed.stdout).strip()
             return False, err or "pane rejected delivery"

@@ -711,6 +711,24 @@ class PushToPaneTest(RadioTestCase):
         self.assertEqual(self.calls[0][3], "rm -rf / ; echo hi")
         self.assertEqual(self.shell_calls(), [])
 
+    def test_shell_pane_gets_escaped_flattened_text(self):
+        """A plain shell receives one inert line: no execution, no redirection."""
+        self.install(returncode=1, stderr="not an agent pane")
+        radio.push_to_pane("w1:p1", "a; b $(x)\nnext > ~/out")
+        text = self.shell_calls()[0][3]
+        self.assertNotIn("\n", text)
+        self.assertIn("a\\;", text)
+        self.assertIn("\\$", text)
+        self.assertIn("\\>", text)
+
+    def test_shell_safe_text_uses_the_platform_escape(self):
+        """POSIX escapes with a backslash; Windows uses PowerShell's backtick."""
+        self.assertEqual(radio.shell_safe_text("a;b `c`"), "a\\;b \\`c\\`")
+        saved = radio.os.name
+        self.addCleanup(setattr, radio.os, "name", saved)
+        radio.os.name = "nt"
+        self.assertEqual(radio.shell_safe_text("a;b"), "a`;b")
+
 
 class BacktickNormalizationTest(RadioTestCase):
     """Typed text is normalized before it is stored."""
