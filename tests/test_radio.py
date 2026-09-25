@@ -243,6 +243,120 @@ class CmdPartTest(RadioTestCase):
         self.assertEqual(self.delivery_row(mid_pending)["status"], "failed")
 
 
+class ComposerDraftTest(RadioTestCase):
+    """composer_has_draft reads the visible composer line for providers whose
+    prompt marker we know; unknown providers report None (push)."""
+
+    def setUp(self):
+        super().setUp()
+        self._herdr = radio.herdr
+        self.addCleanup(setattr, radio, "herdr", self._herdr)
+        radio._composer_cache.clear()
+        self.addCleanup(radio._composer_cache.clear)
+        self.visible = ""
+        radio.herdr = lambda *args, **kwargs: subprocess.CompletedProcess(
+            list(args), 0, stdout=self.visible, stderr=""
+        )
+
+    def test_codex_placeholder_is_empty_and_text_is_a_draft(self):
+        self.visible = "»⠁Ask Codex to do anything⡀\n  gpt-6\n"
+        self.assertFalse(radio.composer_has_draft("codex", "w1:p1"))
+        radio._composer_cache.clear()
+        self.visible = "»⠁yarım taslak⡀\n"
+        self.assertTrue(radio.composer_has_draft("codex", "w1:p1"))
+
+    def test_claude_marker_only_is_empty(self):
+        self.visible = "❯\n─────\n"
+        self.assertFalse(radio.composer_has_draft("claude", "w1:p1"))
+        radio._composer_cache.clear()
+        self.visible = "❯ hello\n"
+        self.assertTrue(radio.composer_has_draft("claude", "w1:p1"))
+
+    def test_unknown_provider_or_failure_is_none(self):
+        self.visible = "❯ hello\n"
+        self.assertIsNone(radio.composer_has_draft("kimi", "w1:p1"))
+        radio.herdr = lambda *args, **kwargs: subprocess.CompletedProcess(
+            list(args), 1, stdout="", stderr="x"
+        )
+        radio._composer_cache.clear()
+        self.assertIsNone(radio.composer_has_draft("claude", "w1:p2"))
+
+    def test_cache_avoids_a_read_per_tick(self):
+        calls = []
+
+        def counting(*args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(list(args), 0, stdout="❯\n", stderr="")
+
+        radio.herdr = counting
+        radio.composer_has_draft("claude", "w1:p1")
+        radio.composer_has_draft("claude", "w1:p1")
+        self.assertEqual(len(calls), 1)
+
+
+class FocusHoldTest(RadioTestCase):
+    """A focused pane holds the push; after FOCUS_HOLD_S the composer decides,
+    so a pane left focused does not starve."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_handle("bob", ref="herdr:w1:p1", agent="codex", agent_session="s1")
+        self.mid = self.pm("alice", "bob", "hi")
+        self._fetch = radio.fetch_pane
+        self._push = radio.push_to_pane
+        self._draft = radio.composer_has_draft
+        self.addCleanup(self._restore)
+        self.pushes = []
+        radio.push_to_pane = lambda pane_id, text: (self.pushes.append(pane_id), (True, None))[1]
+        radio.fetch_pane = lambda pane_id: {
+            "label": "bob", "agent": "codex", "agent_status": "idle", "focused": True
+        }
+
+    def _restore(self):
+        radio.fetch_pane = self._fetch
+        radio.push_to_pane = self._push
+        radio.composer_has_draft = self._draft
+
+    def delivery(self):
+        return self.delivery_row(self.mid)
+
+    def backdate_hold(self):
+        old = (
+            datetime.now(timezone.utc) - timedelta(seconds=radio.FOCUS_HOLD_S + 5)
+        ).isoformat(timespec="milliseconds")
+        self.conn.execute(
+            "UPDATE deliveries SET focus_hold_since=? WHERE message_id=?", (old, self.mid)
+        )
+        self.conn.commit()
+
+    def test_focused_pane_starts_a_hold_without_pushing(self):
+        radio.composer_has_draft = lambda provider, pane_id: False
+        events = radio.relay_tick(self.conn)
+        row = self.delivery()
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(self.pushes, [])
+        self.assertIsNotNone(row["focus_hold_since"])
+        self.assertTrue(any("pane focused" in event for event in events))
+
+    def test_after_the_window_an_empty_composer_lets_the_push_through(self):
+        radio.composer_has_draft = lambda provider, pane_id: False
+        radio.relay_tick(self.conn)
+        self.backdate_hold()
+        radio.relay_tick(self.conn)
+        self.assertEqual(self.pushes, ["w1:p1"])
+        self.assertEqual(self.delivery()["status"], "delivered")
+        self.assertIsNone(self.delivery()["focus_hold_since"])
+
+    def test_after_the_window_a_draft_keeps_the_hold(self):
+        radio.composer_has_draft = lambda provider, pane_id: True
+        radio.relay_tick(self.conn)
+        self.backdate_hold()
+        events = radio.relay_tick(self.conn)
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.delivery()["status"], "pending")
+        self.assertTrue(any("user is typing" in event for event in events))
+
+
 class DeliveryWaitReasonTest(RadioTestCase):
     def handle_row(self, name):
         return self.conn.execute(
@@ -263,6 +377,35 @@ class DeliveryWaitReasonTest(RadioTestCase):
         self.assertIsNone(radio.delivery_wait_reason({"agent": "claude"}, shell))
         self.assertIsNone(radio.delivery_wait_reason({}, shell))
         self.assertEqual(radio.delivery_wait_reason({}, boot), "agent still booting")
+
+    def test_focus_holds_then_the_composer_decides(self):
+        saved_draft = radio.composer_has_draft
+        self.addCleanup(setattr, radio, "composer_has_draft", saved_draft)
+        self.add_handle("agent", ref="herdr:w1:p9", agent="codex")
+        row = self.handle_row("agent")
+        focused = {"agent_status": "idle", "agent": "codex", "focused": True}
+        self.assertEqual(
+            radio.delivery_wait_reason(focused, row, "w1:p9"),
+            "pane focused — user is there",
+        )
+        self.assertEqual(
+            radio.delivery_wait_reason(focused, row, "w1:p9", radio.now()),
+            "pane focused — user is there",
+        )
+        old = (
+            datetime.now(timezone.utc) - timedelta(seconds=radio.FOCUS_HOLD_S + 1)
+        ).isoformat(timespec="milliseconds")
+        radio.composer_has_draft = lambda provider, pane_id: False
+        self.assertIsNone(radio.delivery_wait_reason(focused, row, "w1:p9", old))
+        radio.composer_has_draft = lambda provider, pane_id: True
+        self.assertEqual(
+            radio.delivery_wait_reason(focused, row, "w1:p9", old),
+            "pane focused — user is typing",
+        )
+        # Unfocused panes behave exactly as before.
+        self.assertIsNone(
+            radio.delivery_wait_reason({"agent_status": "idle", "agent": "codex"}, row, "w1:p9")
+        )
 
 
 class RelayTickTest(RadioTestCase):

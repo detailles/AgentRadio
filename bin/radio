@@ -40,6 +40,8 @@ HERDR_READ_TIMEOUT = 2
 HERDR_SEND_TIMEOUT = 7
 MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
+FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
+COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
 VERSION = "0.4.0"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 1  # PRAGMA user_version this build writes; a newer ledger needs a newer radio
 
@@ -102,6 +104,7 @@ CREATE TABLE IF NOT EXISTS deliveries(
   status TEXT NOT NULL DEFAULT 'pending',  -- pending|delivered|pull|failed
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
+  focus_hold_since TEXT,         -- when the relay began deferring for pane focus
   created_at TEXT NOT NULL,
   delivered_at TEXT
 );
@@ -181,6 +184,7 @@ def connect() -> sqlite3.Connection:
     for column, ddl in (
         ("last_attempt_at", "ALTER TABLE deliveries ADD COLUMN last_attempt_at TEXT"),
         ("target_ws", "ALTER TABLE deliveries ADD COLUMN target_ws TEXT NOT NULL DEFAULT ''"),
+        ("focus_hold_since", "ALTER TABLE deliveries ADD COLUMN focus_hold_since TEXT"),
     ):
         if column not in del_cols:
             conn.execute(ddl)
@@ -1830,16 +1834,71 @@ def format_for_pane(message: sqlite3.Row) -> str:
 
 AGENT_BOOT_GRACE_S = 30.0
 
+COMPOSER_PROMPTS = {"codex": "»", "claude": "❯"}
+COMPOSER_PLACEHOLDERS = {"codex": ("Ask Codex to do anything",)}
+_COMPOSER_DECORATION = " \t⠀⠁⠂⠄⠆⠈⠐⠒⠔⠠⠢⠤⠦⡀⡄⡠⢀⣀"
+_composer_cache: dict[str, tuple[float, bool | None]] = {}
 
-def delivery_wait_reason(pane: dict, handle: sqlite3.Row) -> str | None:
+
+def composer_has_draft(provider: str, pane_id: str) -> bool | None:
+    """Whether the pane's visible composer holds unsent text: True/False for
+    providers whose prompt line we know, None when we cannot tell (the caller
+    then pushes). Results are cached per pane for COMPOSER_CHECK_INTERVAL_S so
+    a held delivery does not spawn a read on every relay tick."""
+    marker = COMPOSER_PROMPTS.get(provider)
+    if not marker or not pane_id:
+        return None
+    cached = _composer_cache.get(pane_id)
+    if cached and time.monotonic() - cached[0] < COMPOSER_CHECK_INTERVAL_S:
+        return cached[1]
+    verdict: bool | None = None
+    try:
+        result = herdr("pane", "read", pane_id, "--source", "visible", "--format", "text")
+        if result.returncode == 0:
+            lines = [line for line in result.stdout.splitlines() if marker in line]
+            if lines:
+                after = lines[-1].split(marker, 1)[1]
+                if any(
+                    placeholder in after
+                    for placeholder in COMPOSER_PLACEHOLDERS.get(provider, ())
+                ):
+                    verdict = False
+                else:
+                    verdict = bool(after.strip(_COMPOSER_DECORATION))
+    except (OSError, subprocess.TimeoutExpired):
+        verdict = None
+    _composer_cache[pane_id] = (time.monotonic(), verdict)
+    return verdict
+
+
+def held_seconds(since: str) -> float:
+    """Seconds since a focus hold began; a malformed timestamp reads as 0."""
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(since)).total_seconds()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def delivery_wait_reason(pane: dict, handle: sqlite3.Row, pane_id: str = "",
+                         held_since: str | None = None) -> str | None:
     """Hold a delivery while the target agent cannot accept input yet: a modal
     dialog is up (blocked), a turn is running (working — codex silently drops
     prompts submitted mid-turn), or the agent process is still booting (herdr
     has not detected it within the join grace window). Typing into any of
-    these strands text in the composer or a dialog."""
+    these strands text in the composer or a dialog.
+
+    A focused pane is held too: the user is at that pane and a push would land
+    in whatever they are typing. After FOCUS_HOLD_S the visible composer
+    decides — unsent text keeps the hold, an empty composer lets the push
+    through (a pane left focused must not starve)."""
     status = pane.get("agent_status") or "unknown"
     if status in ("blocked", "working"):
         return f"agent {status}"
+    if pane.get("focused"):
+        if held_since is None or held_seconds(held_since) < FOCUS_HOLD_S:
+            return "pane focused — user is there"
+        if composer_has_draft(pane.get("agent") or "", pane_id):
+            return "pane focused — user is typing"
     if pane.get("agent"):
         return None  # detected agent: herdr agent prompt submits atomically
     if not handle["agent"]:
@@ -1908,7 +1967,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         if handle["agent"] and pane.get("agent") != handle["agent"]:
             continue
         cur = conn.execute(
-            "UPDATE deliveries SET status='pending', last_error=NULL "
+            "UPDATE deliveries SET status='pending', last_error=NULL, focus_hold_since=NULL "
             "WHERE id = ? AND status = 'pull'",
             (d["id"],),
         )
@@ -1926,7 +1985,7 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         timespec="milliseconds"
     )
     rows = conn.execute(
-        """SELECT d.id AS delivery_id, d.target_ws, d.target, d.attempts, m.*
+        """SELECT d.id AS delivery_id, d.target_ws, d.target, d.attempts, d.focus_hold_since, m.*
            FROM deliveries d JOIN messages m ON m.id = d.message_id
            WHERE d.status = 'pending'
              AND (d.attempts = 0 OR d.last_attempt_at IS NULL OR d.last_attempt_at <= ?)
@@ -1949,7 +2008,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         pane = fetch_pane(pane_id) if pane_id else None
         if not pane_id or pane is None:
             cur = conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='no live pane' "
+                "UPDATE deliveries SET status='pull', last_error='no live pane', "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
@@ -1961,7 +2021,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
         # someone else; leave it for pull instead (mirrors handle_status).
         if (pane.get("label") or "").casefold() != row["target"].casefold():
             cur = conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='pane reused' "
+                "UPDATE deliveries SET status='pull', last_error='pane reused', "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
@@ -1972,7 +2033,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             # A moved pane gets a fresh workspace-qualified id, so this only
             # fires when the row's workspace was recorded wrong.
             cur = conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='workspace changed' "
+                "UPDATE deliveries SET status='pull', last_error='workspace changed', "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
@@ -1981,15 +2043,22 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             continue
         if handle["agent"] and pane.get("agent") != handle["agent"]:
             cur = conn.execute(
-                "UPDATE deliveries SET status='pull', last_error='agent changed' "
+                "UPDATE deliveries SET status='pull', last_error='agent changed', "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (delivery_id,),
             )
             if cur.rowcount:
                 events.append(f"#{delivery_id} -> {target} ({pane_id}): agent changed, left for pull")
             continue
-        wait = delivery_wait_reason(pane, handle)
+        wait = delivery_wait_reason(pane, handle, pane_id, row["focus_hold_since"])
         if wait:
+            if wait.startswith("pane focused") and not row["focus_hold_since"]:
+                # Start the hold clock; once it elapses the composer decides.
+                conn.execute(
+                    "UPDATE deliveries SET focus_hold_since=? WHERE id=? AND status='pending'",
+                    (now(), delivery_id),
+                )
             events.append(f"#{delivery_id} -> {target} ({pane_id}) waiting: {wait}")
             continue
         ok, error = push_to_pane(pane_id, format_for_pane(row))
@@ -2003,7 +2072,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             # retrying risks a duplicate. Terminal for push: pull only.
             cur = conn.execute(
                 "UPDATE deliveries SET status='pull', last_attempt_at=?, "
-                "last_error='delivery unconfirmed — left for pull, not retried' "
+                "last_error='delivery unconfirmed — left for pull, not retried', "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (attempted_at, delivery_id),
             )
@@ -2012,7 +2082,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             continue
         if ok:
             cur = conn.execute(
-                "UPDATE deliveries SET status='delivered', delivered_at=?, last_attempt_at=? "
+                "UPDATE deliveries SET status='delivered', delivered_at=?, last_attempt_at=?, "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (attempted_at, attempted_at, delivery_id),
             )
@@ -2022,7 +2093,8 @@ def relay_tick(conn: sqlite3.Connection) -> list[str]:
             attempts = int(row["attempts"]) + 1
             status = "failed" if attempts >= MAX_DELIVERY_ATTEMPTS else "pending"
             cur = conn.execute(
-                "UPDATE deliveries SET status=?, attempts=?, last_error=?, last_attempt_at=? "
+                "UPDATE deliveries SET status=?, attempts=?, last_error=?, last_attempt_at=?, "
+                "focus_hold_since=NULL "
                 "WHERE id = ? AND status = 'pending'",
                 (status, attempts, error, attempted_at, delivery_id),
             )
