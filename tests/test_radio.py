@@ -722,6 +722,9 @@ class PushToPaneTest(RadioTestCase):
 
     def test_shell_pane_gets_escaped_flattened_text(self):
         """A plain shell receives one inert line: no execution, no redirection."""
+        saved = radio.os.name
+        self.addCleanup(setattr, radio.os, "name", saved)
+        radio.os.name = "posix"  # the escaping asserted here is the POSIX one
         self.install(returncode=1, stderr="not an agent pane")
         radio.push_to_pane("w1:p1", "a; b $(x)\nnext > ~/out")
         text = self.shell_calls()[0][3]
@@ -732,9 +735,10 @@ class PushToPaneTest(RadioTestCase):
 
     def test_shell_safe_text_uses_the_platform_escape(self):
         """POSIX escapes with a backslash; Windows uses PowerShell's backtick."""
-        self.assertEqual(radio.shell_safe_text("a;b `c`"), "a\\;b \\`c\\`")
         saved = radio.os.name
         self.addCleanup(setattr, radio.os, "name", saved)
+        radio.os.name = "posix"
+        self.assertEqual(radio.shell_safe_text("a;b `c`"), "a\\;b \\`c\\`")
         radio.os.name = "nt"
         self.assertEqual(radio.shell_safe_text("a;b"), "a`;b")
 
