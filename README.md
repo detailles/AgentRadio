@@ -24,7 +24,7 @@
   <img src="docs/demo.gif" alt="Demo: three agents on claude, codex and gemini join by name, hand off work by file reference, and hold a back-and-forth over radio while the view logs every message">
 </p>
 
-One SQLite ledger, one stdlib-only Python CLI, one relay daemon. No servers, no dependencies, no sign-up.
+One SQLite ledger, one stdlib-only Python CLI, one relay daemon. No servers, no sign-up.
 PM-only and token-sensitive by design: no rooms, no broadcast, no chatter — a message costs exactly one delivered envelope.
 
 ## Highlights
@@ -155,7 +155,7 @@ Sender resolution: `--from`, else `$RADIO_HANDLE`, else the handle bound to the 
 ## Delivery
 
 - **Push or pull.** A live pane gets the envelope pushed; a handle without a live pane is `pull` — read those with `radio inbox` / `radio show <id>`.
-- **Booting and undetected agents.** A pane that has not reported its agent yet waits out the 30-second boot window; after it the envelope is typed into the pane like a plain shell, so a bot or a provider herdr cannot detect still receives it. Typed text has shell metacharacters escaped, so a message can never execute or redirect anything in that pane.
+- **Booting and undetected agents.** A pane that has not reported its agent yet waits out the 30-second boot window; after it the envelope is typed into the pane like a plain shell, so a bot or a provider herdr cannot detect still receives it. Typed text has shell metacharacters escaped (POSIX shells and PowerShell), so a message cannot execute or redirect anything in that pane.
 - **Catch-up.** Rejoining on a live pane pushes only the newest reply-required message per sender; the rest stays available for pull instead of flooding the fresh agent.
 - **Focus hold.** While the target pane is focused the relay holds, because a push would land in whatever the user is typing. After 30 seconds the visible composer decides: unsent text keeps the hold, an empty composer — or a provider whose UI we cannot read — lets the push through, so a pane left focused never starves.
 - **Long messages are an anti-pattern.** Past ~1200 characters the CLI nudges you to write the payload to a file and send `--ref` instead.
@@ -172,7 +172,7 @@ Any number of logins per provider can share the bus.
 
 ## Provider usage and calm
 
-- **`radio tools usage`** — quota per account (Codex, Claude, Kimi) as a ticker; `--table`, `--once` and `--json` for one-shot reads. It reads each provider's own quota endpoint in-process and caches the result, and every pane shares one cache and one lock, so a ticker or several dashboards cannot poll a provider or trip its rate limit. A healthy account is read at most once per ten-minute window.
+- **`radio tools usage`** — quota per account (Codex, Claude, Kimi) as a ticker; `--table`, `--once` and `--json` for one-shot reads, `--interval <seconds>` for the ticker pace (default 30). It reads each provider's own quota endpoint in-process and caches the result, and every pane shares one cache and one lock, so a ticker or several dashboards cannot poll a provider or trip its rate limit. An account is read at most once per ten-minute window, failed reads included — a provider that is down or logged out is not polled either.
 - **`radio tools calm`** — a quiet terminal animation: slow colour currents, twinkling stars and drifting motes; `q` quits.
 
 ## Named frequencies
@@ -241,7 +241,7 @@ AgentRadio is deliberately small: every mechanism earns its place by per-token c
 
 ## Known issues
 
-- **Herdr agent detection vs. bundled CLIs.** Providers that ship as one bundled binary (gemini, qwen) are not yet recognized by Herdr's pane detection: such a handle can show as `gone` while its pane is alive, and its messages wait for pull. Radio still works; the status column is the casualty. Herdr-side gap.
+- **Herdr agent detection vs. bundled CLIs.** Providers that ship as one bundled binary (gemini, qwen) are not yet recognized by Herdr's pane detection: such a handle can show as `gone` while its pane is alive, and the relay cannot use the verified agent prompt — after the boot window it types the envelope into the pane instead, like any undetected provider. Radio still works; the status column and the submission check are the casualties. Herdr-side gap.
 - **Windows (preview).** Herdr's plugin surface is preview on Windows: Radio's CLI, relay and view work there, but the gemini/kimi briefing hooks are POSIX-only, and a radio-launched agent that ships as a `.cmd` shim starts through `cmd /c`.
 - **Windows updates on 0.3.0 and older.** The relay kept its working directory inside the managed plugin dir, so `herdr plugin install` failed with a file-in-use error while the relay was running. 0.4.0 moves the relay out; until you update, stop the relay once (`Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*bin\radio*relay*" } | Stop-Process -Force`) and reinstall.
 
