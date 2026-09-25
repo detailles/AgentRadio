@@ -1803,6 +1803,52 @@ class RelayUpdateTest(RadioTestCase):
         self.assertFalse(radio.script_changed("/nonexistent/radio", 1.0))
         self.assertTrue(radio.script_changed(str(REPO / "bin" / "radio"), 1.0))
 
+    def test_partial_writes_are_not_handed_over(self):
+        self.assertFalse(radio.script_compiles("/nonexistent/radio"))
+        broken = radio.STATE_DIR / "broken-radio"
+        broken.write_text("def broken(:\n", encoding="utf-8")
+        self.assertFalse(radio.script_compiles(str(broken)))
+        self.assertTrue(radio.script_compiles(str(REPO / "bin" / "radio")))
+
+    def test_mid_write_keeps_the_old_code_running(self):
+        saved = (
+            radio.script_changed,
+            radio.script_compiles,
+            radio.relay_tick,
+            radio.time.sleep,
+            radio.subprocess.Popen,
+        )
+        self.addCleanup(self._restore_parts, saved)
+        radio.script_changed = lambda script, mtime: True
+        radio.script_compiles = lambda script: False
+        spawned = []
+        radio.subprocess.Popen = lambda *args, **kwargs: spawned.append(args)
+        calls = []
+
+        def tick(_conn):
+            calls.append(1)
+            if len(calls) >= 2:
+                raise KeyboardInterrupt
+            return []
+
+        radio.relay_tick = tick
+        radio.time.sleep = lambda _seconds: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                radio.cmd_relay(argparse.Namespace(interval=0.01))
+        self.assertEqual(spawned, [])
+        self.assertEqual(len(calls), 2)
+
+    @staticmethod
+    def _restore_parts(saved):
+        (
+            radio.script_changed,
+            radio.script_compiles,
+            radio.relay_tick,
+            radio.time.sleep,
+            radio.subprocess.Popen,
+        ) = saved
+
     def test_on_disk_change_hands_over_to_a_successor(self):
         saved = (radio.script_changed, radio.subprocess.Popen, radio.relay_tick, radio.time.sleep)
         self.addCleanup(self._restore, saved)

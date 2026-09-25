@@ -2203,6 +2203,21 @@ def restart_relay(interval: float, script: str, lock_fd) -> None:
         log.close()
 
 
+def script_compiles(script: str) -> bool:
+    """True when the script parses. The handover must not hand the daemon to a
+    half-written file (a manual copy or an interrupted update): that process
+    would die on import and delivery would wait for the next server start."""
+    try:
+        source = Path(script).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    try:
+        compile(source, script, "exec")
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     """Run the delivery relay daemon: single instance via relay_lock, ticking
     relay_tick on the interval, re-execing itself when the script changes on
@@ -2240,6 +2255,10 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 print(f"[{now()}] {event}", flush=True)
         time.sleep(args.interval)
         if script_changed(script, started_mtime):
+            if not script_compiles(script):
+                # Mid-write (manual copy, interrupted update): keep serving the
+                # old code and look again on the next tick.
+                continue
             # A deploy swapped the binary: hand over to a fresh daemon so the
             # relay never runs stale code.
             print("radio changed on disk; restarting relay", flush=True)
