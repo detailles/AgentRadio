@@ -122,6 +122,7 @@ radio pm coder 'ping' --from planner
 | `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
 | `radio account <add\|list\|remove\|move>` | Named provider accounts: a config home plus launch environment per login; `move` carries a session to another account |
 | `radio tools usage` | Provider quota per account (Codex, Claude, Kimi): a ticker by default, `--table` / `--once` / `--json` for one-shot reads |
+| `radio tools context` | One-shot per-agent context snapshot (Codex): default table, `--json` for other dashboards; same workspace/frequency scope as `handles` |
 | `radio tools calm` | A quiet terminal animation — slow colour currents and twinkling stars; `q` quits |
 | `radio inbox` | Index of your messages: ids, senders, status. Nothing consumed |
 | `radio show <id>` | Read one exact body; records the delivery |
@@ -176,6 +177,33 @@ To sign in to the two example Codex homes, run `CODEX_HOME="$HOME/.codex-work" c
 
 - **`radio tools usage`** — quota for local logins with credentials (Codex, Claude, Kimi) as a ticker; `--table`, `--once` and `--json` for one-shot reads, `--interval <seconds>` for the ticker pace (default 30). Missing providers and unlogged accounts are omitted. It reads each provider's own quota endpoint in-process and caches the result, and every pane shares one cache and one lock, so a ticker or several dashboards cannot poll a provider or trip its rate limit. An account is read at most once per ten-minute window, failed reads included. When [codex-reset.com](https://codex-reset.com/) announces a global Codex reset window, a separate community forecast line appears below the account quotas; it is cached for an hour and disappears when the window expires. It is a forecast, not an account quota reset time.
 - **`radio tools calm`** — a quiet terminal animation: slow colour currents, twinkling stars and drifting motes; `q` quits. It uses curses on macOS/Linux and the Windows console on PowerShell.
+
+### Agent context
+
+`radio tools context` prints one table of registered agents and their most recent
+context measurements. `--table` is explicit table mode; `--json` exposes the same
+snapshot to dashboards. `--workspace <id-or-label>` and the implicit caller scope
+follow `radio handles`, including named-frequency isolation. Outside Herdr the
+default overview includes ordinary workspaces, not other named frequencies.
+
+The first reader supports Codex rollouts under the handle's configured account
+home (`CODEX_HOME` overrides included). It verifies both the live pane/session
+binding and the session ID inside the rollout. Missing data or unsupported
+providers produce null measurements and an error reason, never zero usage.
+
+Context means approximate **used context**, computed from the last response's
+`last_token_usage.total_tokens / model_context_window`; it is neither cumulative
+session token consumption nor the shared account quota shown by `tools usage`.
+JSON includes raw counts, model/effort, observation time, sample age and a `stale`
+flag (five minutes). Compaction or a model change clears the previous measurement
+until a new sample arrives. Codex's on-disk format can change; this is not a native
+live context meter.
+
+This opt-in command reads local metadata and uses only Herdr pane lookups. It does
+not contact providers, read credentials, deliver messages, start a watcher, modify
+the ledger, or change roles, pane labels or UI layout. The ledger must already use
+the current schema; the command never migrates it. Role taxonomies, icons, colours
+and team-specific layouts belong to the consuming UI, not to the context reader.
 
 ## Named frequencies
 
