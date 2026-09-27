@@ -53,7 +53,7 @@ MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
-VERSION = "0.7.0"  # keep in sync with herdr-plugin.toml
+VERSION = "0.7.1"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pane workspace.
 
 # Provider usage: each provider's own quota endpoint is read here, in Python,
@@ -2691,6 +2691,8 @@ def read_codex_context(path: Path, expected_session_id: str) -> dict:
         return _empty_codex_context("invalid_session_id")
     values = _empty_codex_context()
     verified = False
+    fork_parent_id = None
+    allow_parent_meta = False
     try:
         path = Path(path)
         with path.open("rb") as stream:
@@ -2716,6 +2718,8 @@ def read_codex_context(path: Path, expected_session_id: str) -> dict:
                     continue
                 if not line.endswith(b"\n"):
                     break
+                parent_meta_here = allow_parent_meta
+                allow_parent_meta = False
                 try:
                     event = json.loads(line)
                 except (UnicodeError, ValueError, RecursionError):
@@ -2726,9 +2730,18 @@ def read_codex_context(path: Path, expected_session_id: str) -> dict:
                     continue
                 kind, payload = event.get("type"), event.get("payload")
                 if kind == "session_meta":
-                    if not isinstance(payload, dict) or payload.get("id") != expected_session_id:
+                    if not isinstance(payload, dict):
                         return _empty_codex_context("session_mismatch")
+                    if parent_meta_here and payload.get("id") == fork_parent_id:
+                        continue
+                    if payload.get("id") != expected_session_id:
+                        return _empty_codex_context("session_mismatch")
+                    first_identity = not verified
                     verified = True
+                    if first_identity:
+                        parent = payload.get("forked_from_id")
+                        fork_parent_id = parent if isinstance(parent, str) and parent else None
+                        allow_parent_meta = fork_parent_id is not None
                     continue
                 if not verified:
                     continue
@@ -3048,13 +3061,14 @@ def read_claude_usage() -> dict | None:
     return {"plan": oauth.get("subscriptionType"), "windows": windows}
 
 
-def kimi_runtime(home: Path) -> tuple[str, str, Path] | None:
+def kimi_runtime(home: Path, env: dict[str, str] | None = None) -> tuple[str, str, Path] | None:
     """Resolve a Kimi Code account's OAuth host, API base URL and credential
     file. The install's config.toml lists several service base URLs, so only
     the account's coding endpoint counts; the environment may pin a region and
     the mainland hosts apply otherwise. None when the resolved region is not
     one of the two known Kimi hosts — the refresh token is posted to the OAuth
     host, so an unknown value is refused rather than trusted."""
+    env = os.environ if env is None else env
     text = ""
     config = home / "config.toml"
     if config.exists():
@@ -3066,11 +3080,11 @@ def kimi_runtime(home: Path) -> tuple[str, str, Path] | None:
     account_base = next(
         (value for value in configured if value in (KIMI_MAINLAND_BASE_URL, KIMI_GLOBAL_BASE_URL)), ""
     )
-    base_url = (os.environ.get("KIMI_CODE_BASE_URL") or account_base).strip().rstrip("/")
+    base_url = (env.get("KIMI_CODE_BASE_URL") or account_base).strip().rstrip("/")
     oauth_setting = re.search(r'(?m)^\s*oauthHost\s*=\s*"([^"]+)"', text)
     oauth_host = (
-        os.environ.get("KIMI_CODE_OAUTH_HOST")
-        or os.environ.get("KIMI_OAUTH_HOST")
+        env.get("KIMI_CODE_OAUTH_HOST")
+        or env.get("KIMI_OAUTH_HOST")
         or (oauth_setting.group(1) if oauth_setting else "")
     ).strip().rstrip("/")
     if not base_url:
@@ -3161,11 +3175,11 @@ def kimi_quota_window(window_id: str, label: str, quota: dict) -> dict | None:
     }
 
 
-def read_kimi_usage(home: Path) -> dict | None:
+def read_kimi_usage(home: Path, env: dict[str, str] | None = None) -> dict | None:
     """Read one Kimi Code account's quota. Kimi rotates short-lived file
     tokens, so an expired or rejected token is refreshed once (and persisted)
     before the usage read is retried."""
-    runtime = kimi_runtime(home)
+    runtime = kimi_runtime(home, env)
     if runtime is None:
         return None
     oauth_host, base_url, credentials_path = runtime
@@ -3224,7 +3238,7 @@ def read_provider_usage(target: dict) -> dict | None:
     if provider == "claude":
         return read_claude_usage()
     if provider == "kimi" and home is not None:
-        return read_kimi_usage(home)
+        return read_kimi_usage(home, target.get("env"))
     return None
 
 
@@ -3240,7 +3254,7 @@ def usage_target_ready(target: dict) -> bool:
         oauth = auth.get("claudeAiOauth") if isinstance(auth.get("claudeAiOauth"), dict) else {}
         return bool(oauth.get("accessToken"))
     if provider == "kimi" and home is not None:
-        runtime = kimi_runtime(home)
+        runtime = kimi_runtime(home, target.get("env"))
         if runtime is None:
             return False
         auth = usage_read_json(runtime[2]) or {}
@@ -3268,15 +3282,28 @@ def usage_targets(conn: sqlite3.Connection) -> list[dict]:
         },
     ]
     display = {"codex": "Codex", "kimi": "Kimi"}
-    for row in conn.execute("SELECT name, provider, home FROM accounts ORDER BY name").fetchall():
+    for row in conn.execute("SELECT * FROM accounts ORDER BY name").fetchall():
         provider = row["provider"]
-        if provider not in display or not row["home"]:
+        if provider not in display:
             continue
+        launch_env = account_env(row)
+        home = (launch_env.get("CODEX_HOME") if provider == "codex" else
+                launch_env.get("KIMI_CODE_HOME") or launch_env.get("KIMI_HOME"))
+        if not home:
+            continue
+        kimi_env = {}
+        if provider == "kimi":
+            for key in ("KIMI_CODE_BASE_URL", "KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST"):
+                if key in launch_env:
+                    kimi_env[key] = launch_env[key]
+                elif key in os.environ:
+                    kimi_env[key] = os.environ[key]
         targets.append(
             {
                 "label": f"{display[provider]} · {row['name']}",
                 "provider": provider,
-                "home": Path(row["home"]).expanduser(),
+                "home": Path(home).expanduser(),
+                **({"env": kimi_env} if provider == "kimi" else {}),
             }
         )
     return [target for target in targets if usage_target_ready(target)]

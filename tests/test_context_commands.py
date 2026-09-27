@@ -223,7 +223,7 @@ class ContextCommandsTest(RadioTestCase):
         self.assertGreater(agent["age_seconds"], 300)
         self.assertTrue(agent["stale"])
 
-    def test_json_command_contains_no_local_team_roles_or_icons(self):
+    def test_json_command_omits_handle_role(self):
         self.bind()
         output = io.StringIO()
         args = radio.build_parser().parse_args(["tools", "context", "--json"])
@@ -231,8 +231,7 @@ class ContextCommandsTest(RadioTestCase):
             self.assertEqual(radio.cmd_tools_context(self.conn, args), 0)
         result = json.loads(output.getvalue())
         self.assertNotIn("role", result["agents"][0])
-        for forbidden in ("Local custom role", "CONTROL", "WORKER", "REVIEW", "⚙", "👤", "🔎"):
-            self.assertNotIn(forbidden, output.getvalue())
+        self.assertNotIn("Local custom role", output.getvalue())
 
     def test_default_and_explicit_table_are_one_shot(self):
         self.bind()
@@ -266,7 +265,7 @@ class ContextReadonlyTest(RadioTestCase):
 
     def test_old_schema_is_rejected_without_migration(self):
         old = self.tmp / "old.db"
-        with sqlite3.connect(old) as conn:
+        with contextlib.closing(sqlite3.connect(old)) as conn:
             conn.execute("CREATE TABLE marker(id INTEGER)")
             conn.execute("PRAGMA user_version=1")
         before = old.read_bytes()

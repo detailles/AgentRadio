@@ -3237,6 +3237,51 @@ class UsageToolsTest(RadioTestCase):
         with patch.object(radio, "claude_credentials", return_value={"claudeAiOauth": {"accessToken": "token"}}):
             self.assertTrue(radio.usage_target_ready({"provider": "claude", "home": None}))
 
+    def test_named_usage_uses_the_account_launch_home_and_region(self):
+        """Quota reads must follow each account's launch overrides, not the observer's."""
+        codex_home = self.tmp / "codex-actual"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(json.dumps({"tokens": {
+            "access_token": "fixture", "account_id": "fixture"
+        }}), encoding="utf-8")
+        kimi_home = self.tmp / "kimi-actual"
+        kimi_home.mkdir()
+        kimi_env = {
+            "KIMI_CODE_HOME": str(kimi_home),
+            "KIMI_CODE_BASE_URL": radio.KIMI_GLOBAL_BASE_URL,
+            "KIMI_CODE_OAUTH_HOST": radio.KIMI_GLOBAL_OAUTH_HOST,
+            "PRIVATE_TOKEN": "must-not-enter-target",
+        }
+        credential = radio.kimi_runtime(kimi_home, kimi_env)[2]
+        credential.parent.mkdir()
+        credential.write_text(json.dumps({"access_token": "fixture"}), encoding="utf-8")
+        for name, provider, home, env in (
+            ("work", "codex", self.tmp / "codex-stored", {"CODEX_HOME": str(codex_home)}),
+            ("global", "kimi", self.tmp / "kimi-stored", kimi_env),
+        ):
+            self.conn.execute(
+                "INSERT INTO accounts(name, provider, home, env, created_at) VALUES (?,?,?,?,?)",
+                (name, provider, str(home), json.dumps(env), radio.now()),
+            )
+        self.conn.commit()
+        radio.usage_target_ready = self._ready
+        observer_env = {
+            "CODEX_HOME": str(self.tmp / "codex-observer"),
+            "KIMI_CODE_HOME": str(self.tmp / "kimi-observer"),
+            "KIMI_CODE_BASE_URL": radio.KIMI_MAINLAND_BASE_URL,
+            "KIMI_CODE_OAUTH_HOST": radio.KIMI_MAINLAND_OAUTH_HOST,
+        }
+        with patch.dict(os.environ, observer_env), patch.object(radio, "claude_credentials", return_value=None):
+            targets = {target["label"]: target for target in radio.usage_targets(self.conn)}
+        self.assertEqual(targets["Codex · work"]["home"], codex_home)
+        self.assertEqual(targets["Kimi · global"]["home"], kimi_home)
+        self.assertNotIn("PRIVATE_TOKEN", targets["Kimi · global"]["env"])
+        calls = []
+        with patch.object(radio, "usage_http_get_json", side_effect=lambda url, headers: (
+                calls.append(url) or 200, {"usage": {"limit": 100, "used": 10}})):
+            radio.read_provider_usage(targets["Kimi · global"])
+        self.assertEqual(calls, [radio.KIMI_GLOBAL_BASE_URL + "/usages"])
+
     def test_global_forecast_is_a_separate_line_and_json_field(self):
         """An announced community reset stays distinct from account quota windows."""
         radio.refresh_reset_forecast = lambda: "Possible Global Codex Reset: by end of Friday (2d0h, 50%)"

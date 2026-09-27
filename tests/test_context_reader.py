@@ -71,6 +71,17 @@ class ContextReaderTests(unittest.TestCase):
         self.write(self.meta("another-session"), self.turn(), self.sample())
         self.assert_empty(self.read(), "session_mismatch")
 
+    def test_forked_session_accepts_only_its_immediate_parent_meta(self):
+        parent = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        child = self.meta()
+        child["payload"]["forked_from_id"] = parent
+        self.write(child, self.meta(parent), self.turn(), self.sample())
+        self.assertEqual(self.read()["context_tokens"], 24000)
+        self.write(child, self.turn(), self.meta(parent), self.sample())
+        self.assert_empty(self.read(), "session_mismatch")
+        self.write(child, self.meta("another-session"), self.turn(), self.sample())
+        self.assert_empty(self.read(), "session_mismatch")
+
     def test_records_before_session_meta_are_never_consumed(self):
         self.write(self.turn(), self.sample(), self.meta())
         self.assert_empty(self.read(), None)
