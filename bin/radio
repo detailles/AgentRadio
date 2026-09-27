@@ -3244,22 +3244,36 @@ def read_provider_usage(target: dict) -> dict | None:
 
 def usage_target_ready(target: dict) -> bool:
     """Include only local logins with credentials that can support a quota read."""
+    return usage_target_identity(target) is not None
+
+
+def usage_target_identity(target: dict) -> str | None:
+    """Fingerprint a quota login without storing its token or account ID."""
     provider, home = target["provider"], target["home"]
     if provider == "codex" and home is not None:
         auth = usage_read_json(home / "auth.json") or {}
         tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
-        return bool(tokens.get("access_token") and tokens.get("account_id"))
-    if provider == "claude":
+        if not (tokens.get("access_token") and tokens.get("account_id")):
+            return None
+        source = f"{home}\0{tokens['account_id']}"
+    elif provider == "claude":
         auth = claude_credentials() or {}
         oauth = auth.get("claudeAiOauth") if isinstance(auth.get("claudeAiOauth"), dict) else {}
-        return bool(oauth.get("accessToken"))
-    if provider == "kimi" and home is not None:
+        if not oauth.get("accessToken"):
+            return None
+        source = str(oauth["accessToken"])
+    elif provider == "kimi" and home is not None:
         runtime = kimi_runtime(home, target.get("env"))
         if runtime is None:
-            return False
+            return None
         auth = usage_read_json(runtime[2]) or {}
-        return bool(auth.get("access_token") or auth.get("refresh_token"))
-    return False
+        token = auth.get("refresh_token") or auth.get("access_token")
+        if not token:
+            return None
+        source = f"{runtime[2]}\0{token}"
+    else:
+        return None
+    return hashlib.sha256(f"{provider}\0{source}".encode("utf-8")).hexdigest()
 
 
 def usage_targets(conn: sqlite3.Connection) -> list[dict]:
@@ -3306,7 +3320,12 @@ def usage_targets(conn: sqlite3.Connection) -> list[dict]:
                 **({"env": kimi_env} if provider == "kimi" else {}),
             }
         )
-    return [target for target in targets if usage_target_ready(target)]
+    ready = []
+    for target in targets:
+        identity = usage_target_identity(target)
+        if identity is not None:
+            ready.append({**target, "cacheIdentity": identity})
+    return ready
 
 
 def usage_timestamp(value) -> float:
@@ -3351,8 +3370,14 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
     stamped too: a provider that is down or logged out must not be read again
     on every call — that is a poll and can trip its rate limit."""
     targets = usage_targets(conn)
-    labels = {target["label"] for target in targets}
-    entries = {label: entry for label, entry in load_usage_cache().items() if label in labels}
+    identities = {target["label"]: target["cacheIdentity"] for target in targets}
+
+    def matching_entries() -> dict:
+        """Discard quota values from a different login sharing the same label."""
+        return {label: entry for label, entry in load_usage_cache().items()
+                if label in identities and entry.get("cacheIdentity") == identities[label]}
+
+    entries = matching_entries()
     now_ts = time.time()
 
     def fresh(entry) -> bool:
@@ -3372,25 +3397,30 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
         return entries
     with open(lock_path, "a+", encoding="utf-8") as lock_fd:
         if not relay_lock(lock_fd):
-            return {label: entry for label, entry in load_usage_cache().items() if label in labels}
-        entries = {label: entry for label, entry in load_usage_cache().items() if label in labels}
+            return matching_entries()
+        entries = matching_entries()
         for target in stale:
             previous = entries.get(target["label"])
             if fresh(previous):
                 continue
             value = read_provider_usage(target)
+            identity = (usage_target_identity(target) if target["provider"] == "kimi" else None)
+            identity = identity or target["cacheIdentity"]
             if value is not None:
-                entries[target["label"]] = {**value, "provider": target["provider"], "observedAt": now_ts}
+                entries[target["label"]] = {**value, "provider": target["provider"],
+                                            "observedAt": now_ts, "cacheIdentity": identity}
             elif isinstance(previous, dict) and previous.get("windows"):
                 # Keep the last data on display — it will read as stale — but
                 # stamp the attempt so the provider is asked again in the next
                 # window, not on every call.
-                entries[target["label"]] = {**previous, "attemptedAt": now_ts}
+                entries[target["label"]] = {**previous, "attemptedAt": now_ts,
+                                            "cacheIdentity": identity}
             else:
                 entries[target["label"]] = {
                     "provider": target["provider"],
                     "observedAt": now_ts,
                     "attemptedAt": now_ts,
+                    "cacheIdentity": identity,
                     "detail": "credentials or endpoint unavailable",
                     "windows": [],
                 }

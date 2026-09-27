@@ -3142,9 +3142,9 @@ class UsageToolsTest(RadioTestCase):
         super().setUp()
         self._read = radio.read_provider_usage
         self.addCleanup(setattr, radio, "read_provider_usage", self._read)
-        self._ready = radio.usage_target_ready
-        self.addCleanup(setattr, radio, "usage_target_ready", self._ready)
-        radio.usage_target_ready = lambda target: True
+        self._identity = radio.usage_target_identity
+        self.addCleanup(setattr, radio, "usage_target_identity", self._identity)
+        radio.usage_target_identity = lambda target: "fixture:" + target["label"]
         self._forecast = radio.refresh_reset_forecast
         self.addCleanup(setattr, radio, "refresh_reset_forecast", self._forecast)
         radio.refresh_reset_forecast = lambda: ""
@@ -3207,7 +3207,9 @@ class UsageToolsTest(RadioTestCase):
 
     def test_missing_local_login_is_omitted_with_its_old_cache(self):
         """A machine without Kimi does not display or probe its former row."""
-        radio.usage_target_ready = lambda target: target["provider"] == "codex"
+        radio.usage_target_identity = lambda target: (
+            "fixture:" + target["label"] if target["provider"] == "codex" else None
+        )
         radio.save_usage_cache({"Kimi": {"provider": "kimi", "observedAt": time.time(), "windows": []}})
         self.install()
         entries = radio.refresh_usage_cache(self.conn)
@@ -3216,7 +3218,7 @@ class UsageToolsTest(RadioTestCase):
 
     def test_local_credentials_select_readable_accounts(self):
         """Codex and Kimi need tokens, while Claude needs its shared OAuth login."""
-        radio.usage_target_ready = self._ready
+        radio.usage_target_identity = self._identity
         home = self.tmp / "codex"
         home.mkdir()
         target = {"provider": "codex", "home": home}
@@ -3264,7 +3266,7 @@ class UsageToolsTest(RadioTestCase):
                 (name, provider, str(home), json.dumps(env), radio.now()),
             )
         self.conn.commit()
-        radio.usage_target_ready = self._ready
+        radio.usage_target_identity = self._identity
         observer_env = {
             "CODEX_HOME": str(self.tmp / "codex-observer"),
             "KIMI_CODE_HOME": str(self.tmp / "kimi-observer"),
@@ -3290,7 +3292,7 @@ class UsageToolsTest(RadioTestCase):
         self.assertIn("\nPossible Global Codex Reset:", line)
         payload = json.loads(self.run_usage(json=True))
         self.assertTrue(payload["globalCodexReset"].startswith("Possible Global Codex Reset:"))
-        radio.usage_target_ready = lambda target: False
+        radio.usage_target_identity = lambda target: None
         self.assertIn("Global Codex Reset", self.run_usage(once=True))
 
     def test_refresh_reads_once_per_window(self):
@@ -3304,6 +3306,43 @@ class UsageToolsTest(RadioTestCase):
         self.backdate_cache()
         radio.refresh_usage_cache(self.conn)
         self.assertEqual(len(self.reads), first * 2)
+
+    def test_switching_codex_login_refreshes_quota_inside_ttl(self):
+        """A new login in the same home must not inherit the previous account's quota."""
+        radio.usage_target_identity = self._identity
+        home = self.tmp / "codex"
+        home.mkdir()
+
+        def login(account):
+            """Replace the local Codex login without changing its home path."""
+            (home / "auth.json").write_text(json.dumps({"tokens": {
+                "access_token": "token-" + account, "account_id": "account-" + account,
+            }}), encoding="utf-8")
+
+        def read(target):
+            """Return a distinct quota for each credential observed by the reader."""
+            account = json.loads((target["home"] / "auth.json").read_text(encoding="utf-8"))[
+                "tokens"]["account_id"]
+            self.reads.append(account)
+            return self.entry(20.0 if account == "account-A" else 80.0)
+
+        radio.read_provider_usage = read
+        with patch.dict(os.environ, {"CODEX_HOME": str(home),
+                                     "KIMI_CODE_HOME": str(self.tmp / "missing")}), \
+                patch.object(radio, "claude_credentials", return_value=None):
+            login("A")
+            first = radio.refresh_usage_cache(self.conn)
+            self.assertEqual(first["Codex"]["windows"][0]["remainingPercent"], 20.0)
+            login("B")
+            second = radio.refresh_usage_cache(self.conn)
+            self.assertEqual(second["Codex"]["windows"][0]["remainingPercent"], 80.0)
+            radio.refresh_usage_cache(self.conn)
+        self.assertEqual(self.reads, ["account-A", "account-B"])
+        cached = radio.usage_cache_path().read_text(encoding="utf-8")
+        self.assertNotIn("account-A", cached)
+        self.assertNotIn("account-B", cached)
+        self.assertNotIn("token-A", cached)
+        self.assertNotIn("token-B", cached)
 
     def test_failed_read_keeps_the_previous_value_and_is_not_retried(self):
         """A provider failure keeps the cached value, stamps the attempt, and
@@ -3336,14 +3375,14 @@ class UsageToolsTest(RadioTestCase):
     def test_line_table_and_json_render_the_cache(self):
         """The three renderers read the same cache entries."""
         entries = {
-            "Codex": {"provider": "codex", "observedAt": time.time(), "windows": [
+            "Codex": {"provider": "codex", "cacheIdentity": "fixture:Codex", "observedAt": time.time(), "windows": [
                 {"id": "primary", "label": "5h", "remainingPercent": 98.0, "resetsAt": None},
                 {"id": "secondary", "label": "Week", "remainingPercent": 61.0, "resetsAt": None},
             ]},
-            "Claude": {"provider": "claude", "observedAt": time.time(), "windows": [
+            "Claude": {"provider": "claude", "cacheIdentity": "fixture:Claude", "observedAt": time.time(), "windows": [
                 {"id": "seven_day", "label": "Week", "remainingPercent": 85.0, "resetsAt": None},
             ]},
-            "Kimi": {"provider": "kimi", "observedAt": time.time(),
+            "Kimi": {"provider": "kimi", "cacheIdentity": "fixture:Kimi", "observedAt": time.time(),
                      "detail": "credentials or endpoint unavailable", "windows": []},
         }
         radio.save_usage_cache(entries)
