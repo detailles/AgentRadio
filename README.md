@@ -17,7 +17,8 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#providers">Providers</a> ·
-  <a href="#design-decisions">Design decisions</a>
+  <a href="#design-decisions">Design decisions</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
