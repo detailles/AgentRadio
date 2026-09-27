@@ -52,7 +52,7 @@ MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
-VERSION = "0.6.1"  # keep in sync with herdr-plugin.toml
+VERSION = "0.7.0"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pane workspace.
 
 # Provider usage: each provider's own quota endpoint is read here, in Python,
@@ -2632,6 +2632,144 @@ def relay_loop(args: argparse.Namespace, lock_fd) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Agent context: read only numeric/model metadata from a verified local rollout.
+# No transcript, credentials, or incremental raw-text cache is retained.
+CONTEXT_MAX_FILE_BYTES = 64 * 1024 * 1024
+CONTEXT_MAX_LINE_BYTES = 2 * 1024 * 1024
+
+
+def _empty_codex_context(error: str | None = None) -> dict:
+    return dict(model=None, effort=None, context_tokens=None,
+                context_window=None, observed_at=None, error=error)
+
+
+def _context_label(value, limit: int):
+    if (isinstance(value, str) and 0 < len(value) <= limit
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]*", value)):
+        return value
+    return None
+
+
+def _context_timestamp(value):
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        pass
+    return None
+
+
+def _context_counter(value, minimum: int = 0):
+    return value if type(value) is int and minimum <= value <= 2**63 - 1 else None
+
+
+def _clear_codex_sample(values: dict, error: str | None = None) -> None:
+    values.update(context_tokens=None, context_window=None, observed_at=None, error=error)
+    if error in ("line_too_large", "invalid_record"):
+        values.update(model=None, effort=None)
+
+
+def _context_file_identity(stat) -> tuple:
+    # Windows stat/fstat can disagree about ctime (creation vs change time).
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def read_codex_context(path: Path, expected_session_id: str) -> dict:
+    """Return sanitized last-response context metadata, never cumulative usage.
+
+    Read a bounded snapshot, require the embedded session id, and fail closed
+    if its file changes while being read. A partial final line is not a record.
+    Counts are approximate input to presentation code, not provider quota.
+    """
+    if _context_label(expected_session_id, 128) is None:
+        return _empty_codex_context("invalid_session_id")
+    values = _empty_codex_context()
+    verified = False
+    try:
+        path = Path(path)
+        with path.open("rb") as stream:
+            initial = os.fstat(stream.fileno())
+            if initial.st_size > CONTEXT_MAX_FILE_BYTES:
+                return _empty_codex_context("file_too_large")
+            remaining = initial.st_size
+            while remaining:
+                line = stream.readline(min(remaining, CONTEXT_MAX_LINE_BYTES + 1))
+                if not line:
+                    return _empty_codex_context("file_changed")
+                remaining -= len(line)
+                if len(line) > CONTEXT_MAX_LINE_BYTES:
+                    # Large image/tool payloads are normal. Skip that record in
+                    # bounded chunks; it could hide compaction or a model change,
+                    # so discard old metadata until later records replace it.
+                    _clear_codex_sample(values, "line_too_large")
+                    while not line.endswith(b"\n") and remaining:
+                        line = stream.readline(min(remaining, CONTEXT_MAX_LINE_BYTES + 1))
+                        if not line:
+                            return _empty_codex_context("file_changed")
+                        remaining -= len(line)
+                    continue
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    event = json.loads(line)
+                except (UnicodeError, ValueError, RecursionError):
+                    _clear_codex_sample(values, "invalid_record")
+                    continue
+                if not isinstance(event, dict):
+                    _clear_codex_sample(values, "invalid_record")
+                    continue
+                kind, payload = event.get("type"), event.get("payload")
+                if kind == "session_meta":
+                    if not isinstance(payload, dict) or payload.get("id") != expected_session_id:
+                        return _empty_codex_context("session_mismatch")
+                    verified = True
+                    continue
+                if not verified:
+                    continue
+                if kind == "compacted" or (kind == "event_msg" and isinstance(payload, dict)
+                        and payload.get("type") in ("context_compacted", "contextCompaction")):
+                    _clear_codex_sample(values)
+                    continue
+                if not isinstance(payload, dict):
+                    _clear_codex_sample(values, "invalid_record")
+                    continue
+                if kind == "turn_context":
+                    model = _context_label(payload.get("model"), 128)
+                    if model != values["model"]:
+                        _clear_codex_sample(values)
+                    values.update(model=model, effort=_context_label(payload.get("effort"), 32))
+                elif kind == "event_msg" and payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    if info is None:
+                        continue  # Rate-limit-only event: no context sample to replace.
+                    _clear_codex_sample(values)
+                    if not isinstance(info, dict):
+                        values["error"] = "invalid_sample"
+                        continue
+                    last = info.get("last_token_usage")
+                    if not isinstance(last, dict):
+                        values["error"] = "invalid_sample"
+                        continue
+                    tokens = _context_counter(last.get("total_tokens"))
+                    stamp = _context_timestamp(event.get("timestamp"))
+                    if tokens is None or stamp is None:
+                        values["error"] = "invalid_sample"
+                        continue
+                    values.update(context_tokens=tokens,
+                                  context_window=_context_counter(info.get("model_context_window"), 1),
+                                  observed_at=stamp)
+            if (_context_file_identity(os.fstat(stream.fileno())) != _context_file_identity(initial)
+                    or _context_file_identity(path.stat()) != _context_file_identity(initial)):
+                return _empty_codex_context("file_changed")
+    except (OSError, ValueError, TypeError):
+        return _empty_codex_context("file_unavailable")
+    return values if verified else _empty_codex_context("session_unverified")
+
+
+# ---------------------------------------------------------------------------
 # Provider usage
 #
 # Every credential path and endpoint below is read here, in Python, from the
@@ -3514,6 +3652,154 @@ def cmd_tools_calm(args: argparse.Namespace) -> int:
     return 0
 
 
+def context_connect() -> sqlite3.Connection:
+    """Inspect an existing ledger without creating files, migrating or writing."""
+    conn = None
+    try:
+        if not DB_PATH.exists():
+            conn = sqlite3.connect(":memory:")
+            conn.executescript(SCHEMA)
+            conn.execute("ALTER TABLE handles ADD COLUMN account TEXT")
+        else:
+            conn = sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                raise SystemExit("context requires the current Radio ledger schema; update Radio first")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+    except (sqlite3.Error, OSError, SystemExit) as exc:
+        if conn is not None:
+            conn.close()
+        if isinstance(exc, SystemExit):
+            raise
+        raise SystemExit("could not read the Radio ledger") from None
+
+
+def context_home(conn: sqlite3.Connection, row) -> Path | None:
+    """Resolve the configured Codex home; never guess a missing named login."""
+    if row["account"]:
+        account = resolve_account(conn, row["account"])
+        if not account or account["provider"] != "codex":
+            return None
+        value = account_env(account).get("CODEX_HOME")
+        if value is not None and not value.strip():
+            return None
+    else:
+        value = None
+    home = Path(value or os.environ.get("CODEX_HOME") or DEFAULT_HOMES["codex"]).expanduser()
+    # A relative launch override cannot be resolved against this observer's cwd.
+    return home if home.is_absolute() else None
+
+
+def context_session_file(home: Path, session: str) -> Path | None:
+    """Find only this UUID's rollout; no unrelated transcript is opened."""
+    if not isinstance(session, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", session):
+        return None
+    try:
+        matches = list((home / "sessions").glob(f"*/*/*/rollout-*-{session}.jsonl"))
+        return matches[0] if len(matches) == 1 and matches[0].is_file() else None
+    except OSError:
+        return None
+
+
+def context_snapshot(conn: sqlite3.Connection, args: argparse.Namespace) -> dict:
+    """Read current scoped bindings; stale/reused panes cannot inherit counts."""
+    scope = current_scope(conn)
+    if args.workspace:
+        requested = resolve_workspace_spec(args.workspace, conn)
+        check_scope_access(scope, requested)
+        scope = requested
+    if scope:
+        rows = conn.execute("SELECT * FROM handles WHERE workspace=? ORDER BY name", (scope,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM handles WHERE workspace NOT LIKE 'freq.%' ORDER BY workspace,name"
+        ).fetchall()
+    snapshot_at = datetime.now(timezone.utc)
+    agents = []
+    for row in rows:
+        item = dict(workspace=row["workspace"], pane_workspace=scope_workspace(row),
+                    handle=row["name"], pane=pane_id_of(row["session_ref"]),
+                    provider=row["agent"], session=row["agent_session"], account=row["account"],
+                    state=None, model=None, effort=None, context_tokens=None, context_window=None,
+                    context_percent=None, observed_at=None, age_seconds=None, stale=None, error=None)
+        agents.append(item)
+        if row["agent"] != "codex":
+            item["error"] = "unsupported_provider"
+            continue
+        if not row["agent_session"]:
+            item["error"] = "session_missing"
+            continue
+        pane = fetch_pane(item["pane"]) if item["pane"] else None
+        if not pane:
+            item["error"] = "pane_unavailable"
+            continue
+        if (pane.get("agent") != row["agent"]
+                or (pane.get("agent_session") or {}).get("value") != row["agent_session"]
+                or pane.get("label") != pane_label(row["name"], row["workspace"])
+                or not scope_workspace(row)
+                or pane.get("workspace_id") != scope_workspace(row)):
+            item["error"] = "pane_mismatch"
+            continue
+        item["state"] = pane.get("agent_status")
+        home = context_home(conn, row)
+        if home is None:
+            item["error"] = "account_unavailable"
+            continue
+        path = context_session_file(home, row["agent_session"])
+        if path is None:
+            item["error"] = "session_unavailable"
+            continue
+        item.update(read_codex_context(path, row["agent_session"]))
+        # A session could be replaced while its rollout was being read.
+        current = fetch_pane(item["pane"])
+        if not current or any(current.get(k) != pane.get(k) for k in
+                              ("agent", "agent_session", "workspace_id", "label")):
+            item.update(model=None, effort=None, context_tokens=None, context_window=None,
+                        observed_at=None, state=None, error="pane_mismatch")
+            continue
+        used, capacity = item["context_tokens"], item["context_window"]
+        if item["observed_at"]:
+            sampled_at = datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
+            item["age_seconds"] = max(0, int((snapshot_at - sampled_at).total_seconds()))
+            item["stale"] = item["age_seconds"] >= 300
+        if used is not None and capacity is not None and item["observed_at"]:
+            item["context_percent"] = round(min(100, 100 * used / capacity), 1)
+    return {"observed_at": snapshot_at.isoformat(), "approximate": True, "agents": agents}
+
+
+def render_context_table(payload: dict) -> str:
+    """Plain provider-neutral columns: roles and icons belong to the consumer."""
+    def text(value, width):
+        clean = "".join(c for c in str(value if value is not None else "-") if c.isprintable())
+        return f"{clean[:width]:<{width}}"
+
+    lines = ["Agent context (approximate last-response snapshot; not account quota)",
+             f'{"scope/handle":<30} {"provider":<10} {"model":<20} {"context":<9} {"age":<9} status']
+    for item in payload["agents"]:
+        name = f'{item["workspace"] or "global"}/{item["handle"]}'
+        percent = item["context_percent"]
+        context = "-" if percent is None else f"~{percent:g}%"
+        seconds = item["age_seconds"]
+        age = "-" if seconds is None else usage_age_text(seconds)
+        status = item["error"] or ("stale" if item["stale"] else item["state"] or "unknown")
+        if percent is None and not item["error"]:
+            status = "no sample"
+        lines.append(f'{text(name,30)} {text(item["provider"],10)} {text(item["model"],20)} '
+                     f'{text(context,9)} {text(age,9)} {text(status,24).rstrip()}')
+    if not payload["agents"]:
+        lines.append("no handles in this scope")
+    return "\n".join(lines)
+
+
+def cmd_tools_context(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    payload = context_snapshot(conn, args)
+    print(json.dumps(payload, ensure_ascii=True) if args.json else render_context_table(payload))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI parser: one subcommand per ledger operation, plus relay/view."""
     parser = argparse.ArgumentParser(prog="radio", description=__doc__)
@@ -3620,6 +3906,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_tools_usage)
     cp = tools.add_parser("calm", help="a quiet terminal animation (q quits)")
     cp.set_defaults(func=cmd_tools_calm)
+    ctx = tools.add_parser("context", help="one-shot per-agent context snapshot (Codex)")
+    output = ctx.add_mutually_exclusive_group()
+    output.add_argument("--table", action="store_true", help="print an aligned table (default)")
+    output.add_argument("--json", action="store_true", help="print machine-readable metadata")
+    ctx.add_argument("--workspace", help="workspace id/label; same scope rules as handles")
+    ctx.set_defaults(func=cmd_tools_context)
 
     return parser
 
@@ -3865,6 +4157,9 @@ def main() -> int:
         return cmd_repair(args)
     if args.command == "tools" and getattr(args, "tools_command", None) == "calm":
         return cmd_tools_calm(args)
+    if args.command == "tools" and getattr(args, "tools_command", None) == "context":
+        with closing(context_connect()) as conn:
+            return cmd_tools_context(conn, args)
     with closing(connect()) as conn:
         handler = {
             "join": cmd_join,
