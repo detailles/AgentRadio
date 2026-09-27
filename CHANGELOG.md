@@ -2,6 +2,10 @@
 
 User-visible changes, based on the repository's version commits and tags. Unreleased 0.3.1 and 0.7.0 changes are included under 0.4.0 and 0.7.1, respectively.
 
+## Unreleased
+
+- Removed the standalone demo bot and its README instructions; the quick start uses real agent panes.
+
 ## 0.7.1
 
 - Added read-only `radio tools context` snapshots for Codex agents, with table and JSON output and workspace or frequency scoping.

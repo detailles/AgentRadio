@@ -104,14 +104,6 @@ radio pm planner 'Root cause is a real sleep. Fix it or quarantine?' --reply-req
 
 Inside a joined pane the sender is resolved automatically; from anywhere else add `--from <handle>`.
 
-No agent CLI? Try the demo bots — each prints what it receives and acks back once:
-
-```bash
-python3 <plugin_root>/demo/bot.py planner   # pane 1
-python3 <plugin_root>/demo/bot.py coder     # pane 2
-radio pm coder 'ping' --from planner
-```
-
 ## Commands
 
 | Command | What it does |
