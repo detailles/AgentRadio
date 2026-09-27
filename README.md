@@ -7,7 +7,7 @@
   Agents join by name, talk in direct messages, and get every reply pushed straight into their pane.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.1-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.7.0-7dcfff?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/python-3.10%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux%20%7C%20windows-e0af68?style=flat-square" alt="platform">
@@ -164,16 +164,18 @@ Sender resolution: `--from`, else `$RADIO_HANDLE`, else the handle bound to the 
 
 Any number of logins per provider can share the bus.
 
-- `radio account add work --provider codex --home ~/.codex-work` registers a login. The default home follows the provider's convention (`codex2` → `~/.codex-account-2`), and `--env NAME=VALUE` (repeatable) adds launch-time environment.
-- `radio join coder --account work` launches that login and records it on the handle, so `radio restore coder` brings the same login back.
-- The account is a property, never part of the name: the roster shows it as a separate `account:` field.
-- `radio account move coder --to personal` copies the session files into the target home (codex, claude, kimi and pi) and switches the handle over; the old account keeps its data.
-- `radio account list` shows each home, its extra environment (names by default; `--show-env` for values) and auth state; removing an account a handle still uses is refused.
+- Register each login under a different account name and give each its own config home. For two Codex logins, run `radio account add work --provider codex --home ~/.codex-work` and `radio account add personal --provider codex --home ~/.codex-personal`. Sign in to Codex separately in each home; `account add` creates the directory but does not authenticate it. Without `--home`, names follow the provider's convention (`codex2` → `~/.codex-account-2`); repeat `--env NAME=VALUE` for extra launch settings.
+- Join a different handle for each active login: `radio join coder-work --account work` and `radio join coder-personal --account personal`. The account sets `CODEX_HOME` for that agent process. Handles remain separate even though both run Codex; `radio handles` shows each handle's account, and `radio restore` uses its recorded account and session. The account is a property of the handle, not part of its identity.
+- To change an existing handle's login while keeping its session, use `radio account move coder-work --to personal`; it copies the session into the target home and switches the handle. `radio join coder-work --account personal` switches without copying and starts fresh. The old home keeps its data.
+- `radio account list` shows registered homes and auth state, with extra environment names by default (`--show-env` reveals values). An account in use cannot be removed.
+- `tools usage` reads Codex and Kimi quota separately from each authenticated home. Claude Code's quota reader uses its one shared login, so named Claude homes do not create separate usage rows.
+
+To sign in to the two example Codex homes, run `CODEX_HOME="$HOME/.codex-work" codex login` and `CODEX_HOME="$HOME/.codex-personal" codex login` on macOS/Linux. In PowerShell use `$env:CODEX_HOME="$HOME\.codex-work"; codex login`, then set `CODEX_HOME` to `$HOME\.codex-personal` and run `codex login` again.
 
 ## Provider usage and calm
 
-- **`radio tools usage`** — quota per account (Codex, Claude, Kimi) as a ticker; `--table`, `--once` and `--json` for one-shot reads, `--interval <seconds>` for the ticker pace (default 30). It reads each provider's own quota endpoint in-process and caches the result, and every pane shares one cache and one lock, so a ticker or several dashboards cannot poll a provider or trip its rate limit. An account is read at most once per ten-minute window, failed reads included — a provider that is down or logged out is not polled either.
-- **`radio tools calm`** — a quiet terminal animation: slow colour currents, twinkling stars and drifting motes; `q` quits.
+- **`radio tools usage`** — quota for local logins with credentials (Codex, Claude, Kimi) as a ticker; `--table`, `--once` and `--json` for one-shot reads, `--interval <seconds>` for the ticker pace (default 30). Missing providers and unlogged accounts are omitted. It reads each provider's own quota endpoint in-process and caches the result, and every pane shares one cache and one lock, so a ticker or several dashboards cannot poll a provider or trip its rate limit. An account is read at most once per ten-minute window, failed reads included. When [codex-reset.com](https://codex-reset.com/) announces a global Codex reset window, a separate community forecast line appears below the account quotas; it is cached for an hour and disappears when the window expires. It is a forecast, not an account quota reset time.
+- **`radio tools calm`** — a quiet terminal animation: slow colour currents, twinkling stars and drifting motes; `q` quits. It uses curses on macOS/Linux and the Windows console on PowerShell.
 
 ## Named frequencies
 

@@ -3142,6 +3142,12 @@ class UsageToolsTest(RadioTestCase):
         super().setUp()
         self._read = radio.read_provider_usage
         self.addCleanup(setattr, radio, "read_provider_usage", self._read)
+        self._ready = radio.usage_target_ready
+        self.addCleanup(setattr, radio, "usage_target_ready", self._ready)
+        radio.usage_target_ready = lambda target: True
+        self._forecast = radio.refresh_reset_forecast
+        self.addCleanup(setattr, radio, "refresh_reset_forecast", self._forecast)
+        radio.refresh_reset_forecast = lambda: ""
         self.reads = []
 
     def entry(self, remaining=61.0):
@@ -3198,6 +3204,49 @@ class UsageToolsTest(RadioTestCase):
         self.assertIn("Codex · work", labels)
         self.assertIn("Kimi · personal", labels)
         self.assertNotIn("Claude · alt", labels)
+
+    def test_missing_local_login_is_omitted_with_its_old_cache(self):
+        """A machine without Kimi does not display or probe its former row."""
+        radio.usage_target_ready = lambda target: target["provider"] == "codex"
+        radio.save_usage_cache({"Kimi": {"provider": "kimi", "observedAt": time.time(), "windows": []}})
+        self.install()
+        entries = radio.refresh_usage_cache(self.conn)
+        self.assertEqual(list(entries), ["Codex"])
+        self.assertEqual(self.reads, ["Codex"])
+
+    def test_local_credentials_select_readable_accounts(self):
+        """Codex and Kimi need tokens, while Claude needs its shared OAuth login."""
+        radio.usage_target_ready = self._ready
+        home = self.tmp / "codex"
+        home.mkdir()
+        target = {"provider": "codex", "home": home}
+        self.assertFalse(radio.usage_target_ready(target))
+        (home / "auth.json").write_text(json.dumps({"tokens": {
+            "access_token": "token", "account_id": "account"
+        }}), encoding="utf-8")
+        self.assertTrue(radio.usage_target_ready(target))
+        kimi = self.tmp / "kimi"
+        kimi.mkdir()
+        self.assertFalse(radio.usage_target_ready({"provider": "kimi", "home": kimi}))
+        credentials = kimi / "credentials" / "kimi-code.json"
+        credentials.parent.mkdir()
+        credentials.write_text(json.dumps({"refresh_token": "token"}), encoding="utf-8")
+        self.assertTrue(radio.usage_target_ready({"provider": "kimi", "home": kimi}))
+        with patch.object(radio, "claude_credentials", return_value=None):
+            self.assertFalse(radio.usage_target_ready({"provider": "claude", "home": None}))
+        with patch.object(radio, "claude_credentials", return_value={"claudeAiOauth": {"accessToken": "token"}}):
+            self.assertTrue(radio.usage_target_ready({"provider": "claude", "home": None}))
+
+    def test_global_forecast_is_a_separate_line_and_json_field(self):
+        """An announced community reset stays distinct from account quota windows."""
+        radio.refresh_reset_forecast = lambda: "Possible Global Codex Reset: by end of Friday (2d0h, 50%)"
+        self.install()
+        line = self.run_usage(once=True)
+        self.assertIn("\nPossible Global Codex Reset:", line)
+        payload = json.loads(self.run_usage(json=True))
+        self.assertTrue(payload["globalCodexReset"].startswith("Possible Global Codex Reset:"))
+        radio.usage_target_ready = lambda target: False
+        self.assertIn("Global Codex Reset", self.run_usage(once=True))
 
     def test_refresh_reads_once_per_window(self):
         """A second refresh inside the TTL reads nothing; an aged cache reads again."""
@@ -3425,8 +3474,46 @@ class ToolsCalmTest(RadioTestCase):
         self.assertTrue(all(mote.glyph in radio.CALM_MOTE_GLYPHS for mote in motes))
 
 
+class ResetForecastTest(RadioTestCase):
+    """The public reset forecast is optional, time-bounded and shared by panes."""
+
+    def test_parse_announced_window_and_ignore_missing_window(self):
+        """A forecast needs all announced fields; historical reset dates alone do not show."""
+        weekday = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%A")
+        markup = (
+            '<span id="forecast-commitment-chance">70%</span>'
+            f'<span id="forecast-commitment-chance-note">chance by end of {weekday}</span>'
+            '<time data-reset-at="2026-09-26T18:17:00Z"></time>'
+        )
+        line, deadline = radio.parse_reset_forecast(markup)
+        self.assertIn(f"Probable Global Codex Reset: by end of {weekday}", line)
+        self.assertIn("last Sep 26 18:17 UTC", line)
+        self.assertIsNotNone(deadline)
+        self.assertEqual(radio.parse_reset_forecast('<time data-reset-at="2026-09-26T18:17:00Z">'), ("", None))
+
+    def test_forecast_cache_is_hourly_and_expires_with_its_window(self):
+        """One public fetch serves repeat callers, and an expired forecast is hidden."""
+        deadline = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        reads = []
+
+        def fetch():
+            """Count forecast fetches without using the public site."""
+            reads.append(1)
+            return "Possible Global Codex Reset: by end of Friday (2d0h, 50%)", deadline
+
+        with patch.object(radio, "fetch_reset_forecast", side_effect=fetch):
+            self.assertIn("Global Codex Reset", radio.refresh_reset_forecast())
+            self.assertIn("Global Codex Reset", radio.refresh_reset_forecast())
+        self.assertEqual(len(reads), 1)
+        path = radio.reset_forecast_cache_path()
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        cached["deadline"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        path.write_text(json.dumps(cached), encoding="utf-8")
+        with patch.object(radio, "fetch_reset_forecast", return_value=None) as failed:
+            self.assertEqual(radio.refresh_reset_forecast(), "")
+            self.assertEqual(radio.refresh_reset_forecast(), "")
+            self.assertEqual(failed.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-

@@ -9,6 +9,7 @@ plugin state dir (when running as a Herdr plugin command), $RADIO_HOME, or
 from __future__ import annotations
 
 import argparse
+import html
 import hashlib
 import json
 import math
@@ -38,9 +39,9 @@ try:  # Windows only: byte-range file lock, the relay's single-instance primitiv
     import msvcrt
 except ImportError:
     msvcrt = None
-try:  # POSIX only: the calm animation's terminal control.
+try:  # POSIX terminal control; Windows uses an ANSI console renderer below.
     import curses
-except ImportError:  # Windows: `radio tools calm` reports it is unavailable.
+except ImportError:
     curses = None
 
 # Split timeouts: one wedged herdr must not stall the relay daemon — a
@@ -52,7 +53,7 @@ MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
-VERSION = "0.6.1"  # keep in sync with herdr-plugin.toml
+VERSION = "0.7.0"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pane workspace.
 
 # Provider usage: each provider's own quota endpoint is read here, in Python,
@@ -63,6 +64,8 @@ SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pan
 USAGE_CACHE_TTL_S = 600.0
 USAGE_HTTP_TIMEOUT_S = 12.0
 USAGE_MAX_BODY_BYTES = 512 * 1024
+RESET_FORECAST_URL = "https://codex-reset.com/"
+RESET_FORECAST_TTL_S = 3600.0
 CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/codex/usage"
 CLAUDE_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
@@ -3087,10 +3090,28 @@ def read_provider_usage(target: dict) -> dict | None:
     return None
 
 
+def usage_target_ready(target: dict) -> bool:
+    """Include only local logins with credentials that can support a quota read."""
+    provider, home = target["provider"], target["home"]
+    if provider == "codex" and home is not None:
+        auth = usage_read_json(home / "auth.json") or {}
+        tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+        return bool(tokens.get("access_token") and tokens.get("account_id"))
+    if provider == "claude":
+        auth = claude_credentials() or {}
+        oauth = auth.get("claudeAiOauth") if isinstance(auth.get("claudeAiOauth"), dict) else {}
+        return bool(oauth.get("accessToken"))
+    if provider == "kimi" and home is not None:
+        runtime = kimi_runtime(home)
+        if runtime is None:
+            return False
+        auth = usage_read_json(runtime[2]) or {}
+        return bool(auth.get("access_token") or auth.get("refresh_token"))
+    return False
+
+
 def usage_targets(conn: sqlite3.Connection) -> list[dict]:
-    """Every provider account the ledger knows, plus each provider's default
-    login. Claude Code keeps one shared login per user, so its named accounts
-    are not separately readable and the shared entry covers them."""
+    """Authenticated default and named logins; Claude has one shared quota reader."""
     targets = [
         {
             "label": "Codex",
@@ -3120,7 +3141,7 @@ def usage_targets(conn: sqlite3.Connection) -> list[dict]:
                 "home": Path(row["home"]).expanduser(),
             }
         )
-    return targets
+    return [target for target in targets if usage_target_ready(target)]
 
 
 def usage_timestamp(value) -> float:
@@ -3164,8 +3185,9 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
     display degrades to stale instead of polling the provider. The attempt is
     stamped too: a provider that is down or logged out must not be read again
     on every call — that is a poll and can trip its rate limit."""
-    entries = load_usage_cache()
     targets = usage_targets(conn)
+    labels = {target["label"] for target in targets}
+    entries = {label: entry for label, entry in load_usage_cache().items() if label in labels}
     now_ts = time.time()
 
     def fresh(entry) -> bool:
@@ -3185,8 +3207,8 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
         return entries
     with open(lock_path, "a+", encoding="utf-8") as lock_fd:
         if not relay_lock(lock_fd):
-            return load_usage_cache()
-        entries = load_usage_cache()
+            return {label: entry for label, entry in load_usage_cache().items() if label in labels}
+        entries = {label: entry for label, entry in load_usage_cache().items() if label in labels}
         for target in stale:
             previous = entries.get(target["label"])
             if fresh(previous):
@@ -3209,6 +3231,113 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
                 }
         save_usage_cache(entries)
     return entries
+
+
+def reset_forecast_cache_path() -> Path:
+    """Keep the public reset forecast separate from private account quota data."""
+    return STATE_DIR / "codex-reset-cache.json"
+
+
+def parse_reset_forecast(markup: str) -> tuple[str, str | None]:
+    """Read the announced global Codex reset window, if the page has one."""
+    def field(pattern: str) -> str:
+        """Extract one server-rendered HTML value without treating markup as text."""
+        match = re.search(pattern, markup, re.DOTALL)
+        return html.unescape(match.group(1)).strip() if match else ""
+
+    chance_text = field(r'id="forecast-commitment-chance"[^>]*>\s*([^<]+)')
+    note = field(r'id="forecast-commitment-chance-note"[^>]*>\s*([^<]+)')
+    last_text = field(r'data-reset-at="([^"]+)"')
+    if not (chance_text and note and last_text):
+        return "", None
+    try:
+        chance = int(chance_text.removesuffix("%"))
+        last = datetime.fromisoformat(last_text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return "", None
+    window = note.removeprefix("chance ")
+    weekday = window.removeprefix("by end of ")
+    weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    if window == weekday or weekday.lower() not in weekdays:
+        return "", None
+    current = datetime.now(timezone.utc)
+    days_ahead = (weekdays.index(weekday.lower()) - current.weekday()) % 7
+    deadline = (current + timedelta(days=days_ahead + 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if deadline <= current:
+        return "", None
+    hours = math.ceil((deadline - current).total_seconds() / 3600)
+    wait = f"{hours}h" if hours < 24 else f"{hours // 24}d{hours % 24}h"
+    qualifier = "Probable" if chance >= 70 else "Possible" if chance >= 40 else "Unlikely"
+    last_label = f"{last.strftime('%b')} {last.day} {last.strftime('%H:%M')} UTC"
+    return f"{qualifier} Global Codex Reset: {window} ({wait}, {chance_text}) · last {last_label}", deadline.isoformat()
+
+
+def fetch_reset_forecast() -> tuple[str, str | None] | None:
+    """Read the bounded public forecast page; None means the read failed."""
+    request = urllib.request.Request(RESET_FORECAST_URL, headers={"User-Agent": USAGE_USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                return None
+            body = response.read(USAGE_MAX_BODY_BYTES + 1)
+    except OSError:
+        return None
+    if len(body) > USAGE_MAX_BODY_BYTES:
+        return None
+    return parse_reset_forecast(body.decode("utf-8", "replace"))
+
+
+def refresh_reset_forecast() -> str:
+    """Show only a current public forecast; refresh it at most hourly across panes."""
+    path = reset_forecast_cache_path()
+
+    def current(entry: dict | None) -> bool:
+        """Reject old cache formats and forecasts whose announced window passed."""
+        if not entry or entry.get("version") != 1:
+            return False
+        if not isinstance(entry.get("line"), str):
+            return False
+        if not entry.get("line"):
+            return entry.get("deadline") is None
+        deadline = usage_reset_iso(entry.get("deadline"))
+        return bool(deadline and datetime.fromisoformat(deadline) > datetime.now(timezone.utc))
+
+    def fresh(entry: dict | None) -> bool:
+        """A failed fetch also starts a cache window, so the site is not polled."""
+        return current(entry) and time.time() - max(
+            usage_timestamp(entry.get("observedAt")), usage_timestamp(entry.get("attemptedAt"))
+        ) < RESET_FORECAST_TTL_S
+
+    def save(entry: dict) -> None:
+        """Replace the one-record forecast cache while the usage lock is held."""
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+
+    cached = usage_read_json(path)
+    if fresh(cached):
+        return cached["line"]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(usage_lock_path(), "a+", encoding="utf-8") as lock_fd:
+            if not relay_lock(lock_fd):
+                return cached["line"] if current(cached) else ""
+            cached = usage_read_json(path)
+            if fresh(cached):
+                return cached["line"]
+            fetched = fetch_reset_forecast()
+            if fetched is None:
+                previous = cached if current(cached) else {
+                    "version": 1, "observedAt": 0, "line": "", "deadline": None
+                }
+                save({**previous, "attemptedAt": time.time()})
+                return previous["line"]
+            line, deadline = fetched
+            replacement = {"version": 1, "observedAt": time.time(), "line": line, "deadline": deadline}
+            save(replacement)
+            return line
+    except OSError:
+        return cached["line"] if current(cached) else ""
 
 
 def usage_primary_window(entry: dict) -> dict | None:
@@ -3265,14 +3394,15 @@ def render_usage_table(entries: dict) -> str:
     return "\n".join(lines)
 
 
-def usage_payload(entries: dict) -> dict:
-    """The machine-readable snapshot: every account, window and observation time."""
+def usage_payload(entries: dict, reset_forecast: str = "") -> dict:
+    """The machine-readable account snapshot and optional public forecast."""
     newest = max((usage_timestamp(entry.get("observedAt")) for entry in entries.values()), default=0.0)
     age = max(time.time() - newest, 0.0) if newest else None
     return {
         "observedAt": datetime.fromtimestamp(newest, timezone.utc).isoformat() if newest else None,
         "ageSeconds": None if age is None else round(age, 1),
         "stale": bool(age is not None and age > USAGE_CACHE_TTL_S),
+        "globalCodexReset": reset_forecast or None,
         "accounts": [
             {
                 "label": label,
@@ -3307,7 +3437,13 @@ def cmd_tools_usage(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     def snapshot() -> tuple[str, str, dict]:
         entries = refresh_usage_cache(conn)
-        return render_usage_line(entries), render_usage_table(entries), usage_payload(entries)
+        forecast = refresh_reset_forecast()
+        line = render_usage_line(entries)
+        table = render_usage_table(entries)
+        if forecast:
+            line += "\n" + forecast
+            table += "\n" + forecast
+        return line, table, usage_payload(entries, forecast)
 
     if args.json:
         _, _, payload = snapshot()
@@ -3498,17 +3634,83 @@ def calm_render(screen) -> None:
         time.sleep(1 / CALM_FPS)
 
 
+def calm_render_windows() -> None:
+    """Draw the calm scene with Windows console ANSI support and msvcrt keys."""
+    import ctypes
+
+    console = ctypes.windll.kernel32
+    handle = msvcrt.get_osfhandle(sys.stdout.fileno())
+    mode = ctypes.c_ulong()
+    console.GetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    console.GetConsoleMode.restype = ctypes.c_int
+    console.SetConsoleMode.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+    console.SetConsoleMode.restype = ctypes.c_int
+    if not console.GetConsoleMode(handle, ctypes.byref(mode)) or not console.SetConsoleMode(handle, mode.value | 0x0004):
+        raise SystemExit("calm needs a Windows terminal with ANSI support")
+    old_size = (0, 0)
+    stars: list[CalmStar] = []
+    motes: list[CalmMote] = []
+    started = time.monotonic()
+    try:
+        sys.stdout.write("\x1b[?25l\x1b[2J")
+        while True:
+            if msvcrt.kbhit() and msvcrt.getwch() in ("q", "Q", "\x1b", "\x03"):
+                return
+            width, height = shutil.get_terminal_size(fallback=(80, 24))
+            if (width, height) != old_size:
+                stars = calm_stars(width, height)
+                motes = calm_motes(width, height)
+                old_size = (width, height)
+            now = time.monotonic() - started
+            rows = [[" "] * max(width - 1, 0) for _ in range(max(height - 1, 0))]
+            if width >= 12 and height >= 5:
+                usable = height - 2
+                for band in range(3):
+                    center = usable * (0.30 + band * 0.20)
+                    amplitude = max(1.0, usable * (0.045 + band * 0.008))
+                    for x in range(0, width - 1, 2):
+                        wave = math.sin(x * 0.055 + now * (0.11 + band * 0.025) + band * 2.1)
+                        drift = math.sin(x * 0.016 - now * 0.055 + band) * amplitude * 0.55
+                        y = int(center + wave * amplitude + drift)
+                        if 0 <= y < usable:
+                            rows[y][x] = "." if (x + band) % 6 else "~"
+                for star in stars:
+                    x = min(width - 2, int(star.x * (width - 1)))
+                    y = min(usable - 1, int(star.y * usable))
+                    glow = (math.sin(star.phase + now * star.speed) + 1) / 2
+                    rows[y][x] = "." if glow < 0.5 else "*"
+                for mote in motes:
+                    x = int(((mote.x + now * mote.speed) % 1) * (width - 1))
+                    y = min(usable - 1, max(0, int(mote.y * usable + math.sin(mote.phase + now * 0.16))))
+                    rows[y][x] = "o"
+                hint = " q: quit "
+                start = max(0, width - len(hint) - 2)
+                rows[-1][start:start + len(hint)] = list(hint)
+            colors = ("\x1b[38;5;67m", "\x1b[38;5;74m", "\x1b[38;5;104m")
+            frame = "\n".join(colors[index % 3] + "".join(row) for index, row in enumerate(rows))
+            sys.stdout.write("\x1b[H" + frame + "\x1b[0m")
+            sys.stdout.flush()
+            time.sleep(1 / CALM_FPS)
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+        sys.stdout.flush()
+        console.SetConsoleMode(handle, mode.value)
+
+
 def cmd_tools_calm(args: argparse.Namespace) -> int:
     """Run the calm animation in the current terminal.
 
     Self-contained and read-only: it touches neither the ledger nor any user
     script, and needs nothing but a terminal."""
-    if curses is None:
-        raise SystemExit("calm needs a POSIX terminal (curses is unavailable here)")
     if not sys.stdout.isatty():
         raise SystemExit("calm needs a terminal; run it in a pane")
     try:
-        curses.wrapper(calm_render)
+        if curses is not None:
+            curses.wrapper(calm_render)
+        elif msvcrt is not None:
+            calm_render_windows()
+        else:
+            raise SystemExit("calm needs a supported terminal")
     except KeyboardInterrupt:
         pass
     return 0
