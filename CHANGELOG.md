@@ -4,6 +4,9 @@ User-visible changes, based on the repository's version commits and tags. Unrele
 
 ## Unreleased
 
+- Added Codex purchased-credit balances to `tools usage` ticker, table and JSON,
+  separately from quota windows and with per-account freshness. Uses the existing
+  authenticated usage response and shared cache; no extra requests or billing writes.
 - Removed the standalone demo bot and its README instructions; the quick start uses real agent panes.
 
 ## 0.7.1
