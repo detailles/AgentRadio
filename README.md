@@ -7,7 +7,7 @@
   Agents join by name, talk in direct messages, and get every reply pushed straight into their pane.
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.1-7dcfff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.0-7dcfff?style=flat-square" alt="version">
   <img src="https://img.shields.io/badge/python-3.10%2B%20stdlib-bb9af7?style=flat-square" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square" alt="license">
   <img src="https://img.shields.io/badge/platform-macos%20%7C%20linux%20%7C%20windows-e0af68?style=flat-square" alt="platform">
@@ -114,7 +114,7 @@ Inside a joined pane the sender is resolved automatically; from anywhere else ad
 | `radio handles` | This project's roster: live, gone, or pull. Outside Herdr: every project, grouped |
 | `radio role <h> 'text'` | Set, print, or `--clear` a handle's role paragraph; it rides the next briefing |
 | `radio account <add\|list\|remove\|move>` | Named provider accounts: a config home plus launch environment per login; `move` carries a session to another account |
-| `radio tools usage` | Provider quota per account (Codex, Claude, Kimi): a ticker by default, `--table` / `--once` / `--json` for one-shot reads |
+| `radio tools usage` | Provider quota per account (Codex, Claude, Kimi) and Codex credit balances: a ticker by default, `--table` / `--once` / `--json` for one-shot reads |
 | `radio tools context` | One-shot per-agent context snapshot (Codex): default table, `--json` for other dashboards; same workspace/frequency scope as `handles` |
 | `radio tools calm` | A quiet terminal animation — slow colour currents and twinkling stars; `q` quits |
 | `radio inbox` | Index of your messages: ids, senders, status. Nothing consumed |
@@ -170,6 +170,14 @@ To sign in to the two example Codex homes, run `CODEX_HOME="$HOME/.codex-work" c
 
 - **`radio tools usage`** — quota for local logins with credentials (Codex, Claude, Kimi) as a ticker; `--table`, `--once` and `--json` for one-shot reads, `--interval <seconds>` for the ticker pace (default 30). Missing providers and unlogged accounts are omitted. It reads each provider's own quota endpoint in-process and caches the result, and every pane shares one cache and one lock, so a ticker or several dashboards cannot poll a provider or trip its rate limit. An account is read at most once per ten-minute window, failed reads included. When [codex-reset.com](https://codex-reset.com/) announces a global Codex reset window, a separate community forecast line appears below the account quotas; it is cached for an hour and disappears when the window expires. It is a forecast, not an account quota reset time.
 - **`radio tools calm`** — a quiet terminal animation: slow colour currents, twinkling stars and drifting motes; `q` quits. It uses curses on macOS/Linux and the Windows console on PowerShell.
+
+Codex purchased credits appear separately from the included quota percentage,
+for example `Week 1% · 62,495 credits`. The balance comes from the same authenticated
+usage response, with no additional endpoint or requests. Zero, unlimited and
+unavailable balances are distinct. Account-specific stale balances are marked;
+`--json` adds nullable `credits` (`hasCredits`, `unlimited`, `balance`) and
+per-account freshness fields. The decimal balance remains a string to preserve
+precision. No credit purchase or automatic-reload settings are changed.
 
 ### Agent context
 

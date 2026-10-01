@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 try:  # POSIX only: the relay's flock and the raw-key menu.
@@ -53,7 +54,7 @@ MAX_DELIVERY_ATTEMPTS = 5
 RETRY_AFTER_S = 30.0
 FOCUS_HOLD_S = 30.0          # hold pushes to a focused pane; after this, ask the composer
 COMPOSER_CHECK_INTERVAL_S = 3.0  # how often the visible composer may be re-read per pane
-VERSION = "0.7.1"  # keep in sync with herdr-plugin.toml
+VERSION = "0.8.0"  # keep in sync with herdr-plugin.toml
 SCHEMA_VERSION = 2  # Named frequencies separate logical scope from physical pane workspace.
 
 # Provider usage: each provider's own quota endpoint is read here, in Python,
@@ -2926,7 +2927,31 @@ def usage_age_text(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
-def read_codex_usage(home: Path) -> dict | None:
+def usage_credit_balance(value) -> str | None:
+    """A bounded decimal string; absent or malformed balances are never zero."""
+    if not isinstance(value, str) or not 0 < len(value) <= 128:
+        return None
+    value = value.strip()
+    if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value):
+        return None
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        return None
+    if not amount.is_finite() or abs(amount.adjusted()) > 64 or abs(amount.as_tuple().exponent) > 64:
+        return None
+    return value
+
+
+def usage_credit_snapshot(value) -> dict | None:
+    """Validate normalized credit metadata, including older or edited caches."""
+    if not isinstance(value, dict) or type(value.get("hasCredits")) is not bool or type(value.get("unlimited")) is not bool:
+        return None
+    return {"hasCredits": value["hasCredits"], "unlimited": value["unlimited"],
+            "balance": usage_credit_balance(value.get("balance"))}
+
+
+def read_codex_usage(home: Path, expected_identity: str | None = None) -> dict | None:
     """Read one Codex account's quota: its OAuth token in auth.json, then the
     account usage endpoint. None means credentials or the read are unavailable."""
     credentials = usage_read_json(home / "auth.json") or {}
@@ -2934,6 +2959,9 @@ def read_codex_usage(home: Path) -> dict | None:
     token = str(tokens.get("access_token") or "").strip()
     account = str(tokens.get("account_id") or "").strip()
     if not token or not account:
+        return None
+    identity = hashlib.sha256(f"codex\0{home}\0{account}".encode("utf-8")).hexdigest()
+    if expected_identity is not None and identity != expected_identity:
         return None
     status, payload = usage_http_get_json(
         CODEX_USAGE_ENDPOINT,
@@ -2976,7 +3004,13 @@ def read_codex_usage(home: Path) -> dict | None:
                             "resetsAt": usage_reset_iso(window.get("reset_at")),
                         }
                     )
-    return {"plan": payload.get("plan_type"), "windows": windows}
+    raw_credits = payload.get("credits")
+    credits = usage_credit_snapshot({
+        "hasCredits": raw_credits.get("has_credits"),
+        "unlimited": raw_credits.get("unlimited"),
+        "balance": raw_credits.get("balance"),
+    }) if isinstance(raw_credits, dict) else None
+    return {"plan": payload.get("plan_type"), "windows": windows, "credits": credits}
 
 
 def claude_credentials() -> dict | None:
@@ -3234,7 +3268,7 @@ def read_provider_usage(target: dict) -> dict | None:
     """Read one account's quota through its provider reader; None on failure."""
     provider, home = target["provider"], target["home"]
     if provider == "codex" and home is not None:
-        return read_codex_usage(home)
+        return read_codex_usage(home, target.get("cacheIdentity"))
     if provider == "claude":
         return read_claude_usage()
     if provider == "kimi" and home is not None:
@@ -3332,8 +3366,12 @@ def usage_timestamp(value) -> float:
     """A cache timestamp as a float; a malformed value reads as 0 (never
     observed) so one bad entry can never break the display."""
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        timestamp = float(value)
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return 0.0
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        return timestamp
+    except (TypeError, ValueError, OverflowError, OSError):
         return 0.0
 
 
@@ -3404,12 +3442,17 @@ def refresh_usage_cache(conn: sqlite3.Connection) -> dict:
             if fresh(previous):
                 continue
             value = read_provider_usage(target)
+            if target["provider"] == "codex" and usage_target_identity(target) != target["cacheIdentity"]:
+                # A login can change between target discovery and the response.
+                # Discard the ambiguous balance; never attach it to another login.
+                entries.pop(target["label"], None)
+                continue
             identity = (usage_target_identity(target) if target["provider"] == "kimi" else None)
             identity = identity or target["cacheIdentity"]
             if value is not None:
                 entries[target["label"]] = {**value, "provider": target["provider"],
                                             "observedAt": now_ts, "cacheIdentity": identity}
-            elif isinstance(previous, dict) and previous.get("windows"):
+            elif isinstance(previous, dict) and (previous.get("windows") or usage_credit_snapshot(previous.get("credits")) is not None):
                 # Keep the last data on display — it will read as stale — but
                 # stamp the attempt so the provider is asked again in the next
                 # window, not on every call.
@@ -3545,13 +3588,44 @@ def usage_primary_window(entry: dict) -> dict | None:
     return windows[0] if windows else None
 
 
+def usage_entry_age(entry: dict) -> dict:
+    """Per-account freshness; another fresh login cannot freshen this balance."""
+    observed = usage_timestamp(entry.get("observedAt"))
+    age = max(time.time() - observed, 0.0) if observed else None
+    return {"observedAt": datetime.fromtimestamp(observed, timezone.utc).isoformat() if observed else None,
+            "ageSeconds": None if age is None else round(age, 1),
+            "stale": age is None or age > USAGE_CACHE_TTL_S}
+
+
+def usage_credit_text(entry: dict) -> str:
+    """Purchased credits are separate from included quota percentages."""
+    credits = usage_credit_snapshot(entry.get("credits"))
+    if credits is None:
+        return "credits unavailable"
+    if credits["unlimited"]:
+        text = "unlimited credits"
+    elif credits["balance"] is not None:
+        balance = format(Decimal(credits["balance"]), ",f")
+        if "." in balance:
+            balance = balance.rstrip("0").rstrip(".")
+        text = f"{balance} credits"
+    else:
+        return "credits unavailable"
+    freshness = usage_entry_age(entry)
+    if freshness["stale"]:
+        age = freshness["ageSeconds"]
+        text += f" (stale {usage_age_text(age)})" if age is not None else " (age unknown)"
+    return text
+
+
 def render_usage_line(entries: dict) -> str:
     """The compact ticker line: one segment per account, usage-style."""
     segments = []
     for label, entry in entries.items():
         window = usage_primary_window(entry)
         if window is None:
-            segments.append(f"{label}: unavailable")
+            segments.append(f"{label}: {usage_credit_text(entry)}" if entry.get("provider") == "codex"
+                            else f"{label}: unavailable")
             continue
         remaining = window.get("remainingPercent")
         percent = f"{int(remaining)}%" if isinstance(remaining, (int, float)) else "-"
@@ -3559,6 +3633,8 @@ def render_usage_line(entries: dict) -> str:
         countdown = usage_countdown(window.get("resetsAt"))
         if countdown:
             segment += f" ({countdown})"
+        if entry.get("provider") == "codex":
+            segment += f" · {usage_credit_text(entry)}"
         segments.append(segment)
     return " - ".join(segments) if segments else "no usage accounts"
 
@@ -3577,7 +3653,8 @@ def render_usage_table(entries: dict) -> str:
     for label, entry in entries.items():
         windows = [window for window in entry.get("windows", []) if isinstance(window, dict)]
         if not windows:
-            lines.append(f"  {label:<{label_width}}  {entry.get('detail') or 'unavailable'}")
+            detail = usage_credit_text(entry) if entry.get("provider") == "codex" else entry.get("detail") or 'unavailable'
+            lines.append(f"  {label:<{label_width}}  {detail}")
             continue
         window_width = max(len(str(window.get("label") or "")) for window in windows)
         for index, window in enumerate(windows):
@@ -3586,6 +3663,8 @@ def render_usage_table(entries: dict) -> str:
             name = label if index == 0 else ""
             line = f"  {name:<{label_width}}  {str(window.get('label') or '-'):<{window_width}}  {percent:>8}"
             lines.append(f"{line}  {usage_reset_text(window.get('resetsAt'))}".rstrip())
+        if entry.get("provider") == "codex":
+            lines.append(f"  {'':<{label_width}}  {usage_credit_text(entry)}")
     return "\n".join(lines)
 
 
@@ -3604,6 +3683,8 @@ def usage_payload(entries: dict, reset_forecast: str = "") -> dict:
                 "provider": entry.get("provider"),
                 "plan": entry.get("plan"),
                 "detail": entry.get("detail"),
+                "credits": usage_credit_snapshot(entry.get("credits")) if entry.get("provider") == "codex" else None,
+                **usage_entry_age(entry),
                 "windows": [
                     {
                         "id": window.get("id"),
