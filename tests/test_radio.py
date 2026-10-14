@@ -197,8 +197,76 @@ class LaunchArgvTest(RadioTestCase):
         self.assertEqual(radio.launch_argv("pi", "h", "sid"),
                          ["pi", "--session", "sid", "--name", "h"])
 
+        argv = radio.launch_argv("omp", "h", None)
+        self.assertEqual(argv[0], "omp")
+        self.assertIn("--append-system-prompt", argv)
+        self.assertIn("You are on Radio", argv[argv.index("--append-system-prompt") + 1])
+        argv = radio.launch_argv("omp", "h", "sid")
+        self.assertEqual(argv[-2:], ["--resume", "sid"])
+
         with self.assertRaises(SystemExit):
             radio.launch_argv("emacs", "h", None)
+
+
+class OmpProviderTest(RadioTestCase):
+    """The omp provider's on-disk knowledge: its agent dir, its auth probe,
+    and the saved-session search by title."""
+
+    def omp_home(self, name: str) -> Path:
+        """A fake omp agent dir, the way omp lays one out (created on demand)."""
+        home = radio.STATE_DIR / name
+        home.mkdir(parents=True, exist_ok=True)
+        return home
+
+    def write_session(self, agent_dir: Path, slug: str, stamp: str, sid: str,
+                      title: str, cwd: str) -> Path:
+        """One omp session file: the session record, then its title line."""
+        path = agent_dir / "sessions" / slug / f"{stamp}_{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            {"type": "session", "version": 3, "id": sid, "timestamp": stamp, "cwd": cwd},
+            {"type": "title", "v": 1, "title": title, "source": "auto"},
+        ]
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+        return path
+
+    def test_home_is_the_config_root_and_the_agent_dir_its_subdir(self):
+        """~/.omp is the config root; sessions and config live in its agent/."""
+        self.assertEqual(radio.DEFAULT_HOMES["omp"], "~/.omp")
+        self.assertEqual(radio.provider_home("omp"), Path("~/.omp").expanduser() / "agent")
+        # A named account's home is the agent dir itself: join exports it as
+        # PI_CODING_AGENT_DIR, which names the agent dir, not the root.
+        self.assertEqual(radio.ACCOUNT_ENV["omp"], ("PI_CODING_AGENT_DIR",))
+        self.assertEqual(radio.default_account_home("omp", "omp"),
+                         Path("~/.omp").expanduser() / "agent")
+        self.assertEqual(radio.default_account_home("omp", "omp-work"),
+                         Path("~/.omp-account-work").expanduser())
+
+    def test_auth_status_probes_the_agent_config(self):
+        """Auth is omp's config.yml inside the agent dir."""
+        home = self.omp_home("omp-auth")
+        self.assertIn("config.yml missing", radio.auth_status("omp", home))
+        (home / "config.yml").write_text("modelRoles: {}\n", encoding="utf-8")
+        self.assertEqual(radio.auth_status("omp", home), "configured")
+
+    def test_find_named_session_matches_the_title(self):
+        """The newest session titled with the handle is the named one, and its
+        recorded cwd comes along."""
+        home = self.omp_home("omp-sessions")
+        older = self.write_session(home, "-Projects-zylosync", "2026-10-14T03-44-25-207Z",
+                                   "01a13882-e677-7361-9d97-b9cdc2aa1f43", "scout",
+                                   "/home/khan/Projects/zylosync")
+        newer = self.write_session(home, "-Projects-zylosync", "2026-10-14T07-31-57-362Z",
+                                   "01a13953-3732-7606-b4d6-0e9e9a339678", "Scout",
+                                   "/home/khan/Projects/zylosync")
+        self.write_session(home, "-other-project", "2026-10-14T08-00-00-000Z",
+                           "01a13960-dead-beef-cafe-000000000000", "other", "/home/khan/other")
+        os.utime(older, (1000, 1000))
+        os.utime(newer, (2000, 2000))
+        found = radio.find_named_session("omp", "scout", home=home)
+        self.assertEqual(found["id"], "01a13953-3732-7606-b4d6-0e9e9a339678")
+        self.assertEqual(found["cwd"], "/home/khan/Projects/zylosync")
+        self.assertIsNone(radio.find_named_session("omp", "absent", home=home))
 
 
 class EnqueueDeliveryTest(RadioTestCase):
