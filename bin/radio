@@ -360,16 +360,20 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
         if prompted.returncode == 0:
             return True, None
         prompt_err = (prompted.stderr or prompted.stdout or "").strip()
-        if "blocked" in prompt_err:
-            # A modal dialog is up — never fall back to raw typing, the text
-            # would land in the dialog. Caller defers and retries next tick.
-            return False, "agent_blocked"
+        # Match herdr's error tokens, never a word from its prose. A stall
+        # reports "no observed working or blocked state", so a stall — where
+        # the text WAS submitted — read as agent_blocked, where nothing was,
+        # and the caller retried it with no attempt cap.
         if "stalled" in prompt_err or "timeout" in prompt_err:
             # --wait watches agent lifecycle state AFTER submission, so a
             # timeout can mean the prompt was already delivered. The state is
             # unknowable from here — the caller must not resubmit (duplicate
             # risk) and must not blind-type (composer stranding).
             return False, "delivery_unconfirmed"
+        if "agent_blocked" in prompt_err:
+            # A modal dialog is up — never fall back to raw typing, the text
+            # would land in the dialog. Caller defers and retries next tick.
+            return False, "agent_blocked"
         # Not an agent pane: type into the shell. Flatten newlines — an
         # embedded newline submits the line early and drops the rest — and
         # escape shell metacharacters, so a message can never execute or

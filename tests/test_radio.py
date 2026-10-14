@@ -741,6 +741,13 @@ class DeliveryUnconfirmedTest(RadioTestCase):
         self.assertEqual(len(self.push_calls), 1)
 
 
+def herdr_error(code: str, message: str) -> str:
+    """herdr's stderr for a rejected call: a JSON envelope whose code carries
+    the error token (agent_blocked, agent_prompt_stalled, timeout, …) and whose
+    message renders it as prose."""
+    return json.dumps({"error": {"code": code, "message": message}, "id": "cli:agent:prompt"})
+
+
 class PushToPaneTest(RadioTestCase):
     """push_to_pane: the error contract the relay switches on, and the shell
     escaping that keeps a typed message inert."""
@@ -775,11 +782,27 @@ class PushToPaneTest(RadioTestCase):
         self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "delivery_unconfirmed"))
 
     def test_blocked_and_stalled_map_to_their_sentinels(self):
-        """herdr's stderr wording maps to the contract the relay switches on."""
-        self.install(returncode=1, stderr="agent is blocked by a dialog")
+        """herdr's error tokens map to the contract the relay switches on."""
+        self.install(returncode=1, stderr=herdr_error("agent_blocked", "pane is at a dialog"))
         self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "agent_blocked"))
-        self.install(returncode=1, stderr="prompt stalled after 6s")
+        self.install(returncode=1, stderr=herdr_error("timeout", "timed out after 6000ms"))
         self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "delivery_unconfirmed"))
+
+    def test_a_stall_is_unconfirmed_despite_saying_blocked(self):
+        """agent_prompt_stalled's message reads "no observed working or blocked
+        state" and a stall means the text WAS submitted; read as agent_blocked
+        (nothing submitted) the relay resubmitted it with no attempt cap."""
+        self.install(returncode=1, stderr=herdr_error(
+            "agent_prompt_stalled",
+            "agent prompt produced no observed working or blocked state within 5000ms",
+        ))
+        self.assertEqual(radio.push_to_pane("w1:p1", "hi"), (False, "delivery_unconfirmed"))
+
+    def test_a_pane_without_an_agent_falls_back_to_typing(self):
+        """agent_not_found is not a rejection: the message is typed instead."""
+        self.install(returncode=1, stderr=herdr_error("agent_not_found", "agent target w1:p1 not found"))
+        radio.push_to_pane("w1:p1", "hi")
+        self.assertEqual(self.shell_calls()[0][2:], ("w1:p1", "hi"))
 
     def test_agent_pane_gets_the_raw_text(self):
         """A detected agent receives the message untouched."""
