@@ -231,6 +231,7 @@ The bus layer is provider-agnostic. `radio join` can launch an agent CLI into th
 | kimi | UserPromptSubmit hook | `--session <id>` | tested |
 | qwen | `--append-system-prompt` | `--resume <id>` | written, untested |
 | pi | — | `--session <id>` | written, untested |
+| omp | `--append-system-prompt` | `--resume <id>` | written, untested |
 
 For gemini and qwen, join assigns the session id itself, so resume is exact. The gemini and kimi briefing hooks are installed on macOS/Linux only.
 

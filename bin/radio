@@ -360,16 +360,20 @@ def push_to_pane(pane_id: str, text: str) -> tuple[bool, str | None]:
         if prompted.returncode == 0:
             return True, None
         prompt_err = (prompted.stderr or prompted.stdout or "").strip()
-        if "blocked" in prompt_err:
-            # A modal dialog is up — never fall back to raw typing, the text
-            # would land in the dialog. Caller defers and retries next tick.
-            return False, "agent_blocked"
+        # Match herdr's error tokens, never a word from its prose. A stall
+        # reports "no observed working or blocked state", so a stall — where
+        # the text WAS submitted — read as agent_blocked, where nothing was,
+        # and the caller retried it with no attempt cap.
         if "stalled" in prompt_err or "timeout" in prompt_err:
             # --wait watches agent lifecycle state AFTER submission, so a
             # timeout can mean the prompt was already delivered. The state is
             # unknowable from here — the caller must not resubmit (duplicate
             # risk) and must not blind-type (composer stranding).
             return False, "delivery_unconfirmed"
+        if "agent_blocked" in prompt_err:
+            # A modal dialog is up — never fall back to raw typing, the text
+            # would land in the dialog. Caller defers and retries next tick.
+            return False, "agent_blocked"
         # Not an agent pane: type into the shell. Flatten newlines — an
         # embedded newline submits the line early and drops the rest — and
         # escape shell metacharacters, so a message can never execute or
@@ -707,7 +711,7 @@ def enqueue_delivery(conn: sqlite3.Connection, message_id: int, target: str,
 # a session named after a handle, and how to launch/resume. Radio itself only
 # records the user's choice on the handle row.
 
-PROVIDERS = ("claude", "codex", "kimi", "pi", "gemini", "qwen", "opencode")
+PROVIDERS = ("claude", "codex", "kimi", "pi", "gemini", "qwen", "opencode", "omp")
 
 # Named accounts: several logins of one provider on the same machine. Each
 # account is a config home; launching with the account exports the provider's
@@ -721,6 +725,7 @@ ACCOUNT_ENV: dict[str, tuple[str, ...]] = {
     "qwen": ("QWEN_HOME",),
     "pi": ("PI_CODING_AGENT_DIR",),
     "opencode": ("XDG_DATA_HOME",),
+    "omp": ("PI_CODING_AGENT_DIR",),
 }
 DEFAULT_HOMES: dict[str, str] = {
     "codex": "~/.codex",
@@ -730,7 +735,12 @@ DEFAULT_HOMES: dict[str, str] = {
     "qwen": "~/.qwen",
     "pi": "~/.pi/agent",
     "opencode": "~/.local/share",
+    "omp": "~/.omp",
 }
+# A provider whose home variable names a directory inside its default home
+# rather than the home itself: omp's PI_CODING_AGENT_DIR names the agent dir
+# (sessions, config.yml, agent.db) that its config root keeps one level down.
+ACCOUNT_ENV_SUBDIR: dict[str, str] = {"omp": "agent"}
 
 
 def default_account_home(provider: str, name: str) -> Path:
@@ -738,7 +748,10 @@ def default_account_home(provider: str, name: str) -> Path:
     the name is the provider itself, else ~/.<provider>-account-<suffix>.
     Only a default — `--home` and `--env` express anything else."""
     if name == provider:
-        return Path(DEFAULT_HOMES[provider]).expanduser()
+        # The provider's default home, as its own variable names it (omp's
+        # PI_CODING_AGENT_DIR points at the agent dir, not the config root).
+        default = Path(DEFAULT_HOMES[provider]).expanduser()
+        return default / ACCOUNT_ENV_SUBDIR[provider] if provider in ACCOUNT_ENV_SUBDIR else default
     suffix = name[len(provider):].lstrip("-_") if name.startswith(provider) else name
     return Path(f"~/.{provider}-account-{suffix}").expanduser()
 
@@ -781,12 +794,14 @@ def account_env(account: sqlite3.Row) -> dict[str, str]:
 
 def provider_home(provider: str, account: sqlite3.Row | None = None) -> Path:
     """The config home for a provider launch/session search: the account's home
-    when one is set, else the provider's default home."""
+    when one is set, else the provider's default home — the directory that
+    provider's own variable names, where it differs from DEFAULT_HOMES."""
     if account:
         home = account_home(account)
         if home:
             return home
-    return Path(DEFAULT_HOMES.get(provider, "~")).expanduser()
+    default = Path(DEFAULT_HOMES.get(provider, "~")).expanduser()
+    return default / ACCOUNT_ENV_SUBDIR[provider] if provider in ACCOUNT_ENV_SUBDIR else default
 
 
 def auth_status(provider: str, home: Path | None = None) -> str:
@@ -826,6 +841,13 @@ def auth_status(provider: str, home: Path | None = None) -> str:
         if (base / "opencode" / "auth.json").exists():
             return "logged in"
         return "not logged in — run `opencode auth login`"
+    if provider == "omp":
+        base = home or Path(
+            os.environ.get("PI_CODING_AGENT_DIR") or provider_home("omp")
+        ).expanduser()
+        if (base / "config.yml").exists():
+            return "configured"
+        return f"not configured — {base}/config.yml missing"
     return "auth unknown"
 
 
@@ -1020,6 +1042,35 @@ def find_named_session(provider: str, handle: str, home: Path | None = None) -> 
             if sid and name.casefold() == wanted:
                 rows.append({"id": sid, "cwd": "", "updated": updated})
         return _named(rows)
+    if provider == "omp":
+        # An omp session's own name is its title: there is no separate name
+        # field, and a rename lands in the same title line. Titles are
+        # auto-generated sentences, so one equal to the handle was named for it.
+        base = home or Path(
+            os.environ.get("PI_CODING_AGENT_DIR") or provider_home("omp")
+        ).expanduser()
+        rows = []
+        for path in (base / "sessions").glob("*/*.jsonl"):
+            sid, title, cwd = "", "", ""
+            try:
+                with path.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        if '"title' not in line and '"session"' not in line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if row.get("type") == "session":
+                            sid = str(row.get("id") or "")
+                            cwd = str(row.get("cwd") or "")
+                        elif row.get("type") in ("title", "title_change") and row.get("title"):
+                            title = str(row["title"])
+            except OSError:
+                continue
+            if sid and title.casefold() == wanted:
+                rows.append({"id": sid, "cwd": cwd, "updated": path.stat().st_mtime})
+        return _named(rows)
     return None
 
 
@@ -1081,6 +1132,12 @@ def launch_argv(
         # Briefing rides a per-handle OPENCODE_CONFIG file (instructions) —
         # see cmd_join. Session ids are server-generated; resume only.
         return ["opencode"] + (["--session", session_id] if session_id else [])
+    if provider == "omp":
+        # omp appends the briefing to its own system prompt and resumes by
+        # session id (or id prefix); its sessions/ layout is read by
+        # find_named_session above.
+        argv = ["omp", "--append-system-prompt", briefing]
+        return argv + (["--resume", session_id] if session_id else [])
     raise SystemExit(f"unknown provider: {provider}")
 
 
